@@ -228,9 +228,9 @@ impl PeerClient {
     }
 
     #[cfg(feature = "ucx")]
-    pub fn ensure_server_ep(&self, peer_id: &str, peer_worker_addr: &[u8]) -> Result<()> {
+    pub fn update_peer(&self, peer_id: &str, peer_worker_addr: &[u8]) -> Result<()> {
         match self {
-            Self::Rdma(c) => c.ensure_server_ep(peer_id, peer_worker_addr),
+            Self::Rdma(c) => c.update_peer(peer_id, peer_worker_addr),
             Self::Tcp(_) => Ok(()),
         }
     }

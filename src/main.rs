@@ -142,6 +142,7 @@ fn main() -> anyhow::Result<()> {
                         cache.clone(),
                         transport_addr,
                         stats.peer_stats.clone(),
+                        node_id.clone(),
                     )
                     .context("start RDMA peer service")?;
                 let encoded = BASE64_STANDARD.encode(worker_addr_blob.as_slice());
@@ -193,7 +194,7 @@ fn main() -> anyhow::Result<()> {
     #[cfg(feature = "ucx")]
     if matches!(cfg.transport.kind.as_str(), "rdma") {
         let peers_for_hook = peers.clone();
-        membership.set_rdma_server_ep_hook(move |node| {
+        membership.set_rdma_peer_update_hook(move |node| {
             let Some(encoded) = &node.ucx_worker_addr_b64 else {
                 return;
             };
@@ -204,8 +205,8 @@ fn main() -> anyhow::Result<()> {
                     return;
                 }
             };
-            if let Err(e) = peers_for_hook.ensure_server_ep(&node.id, &decoded) {
-                tracing::warn!(peer = %node.id, error = %e, "failed to ensure RDMA server endpoint from gossip");
+            if let Err(e) = peers_for_hook.update_peer(&node.id, &decoded) {
+                tracing::warn!(peer = %node.id, error = %e, "failed to update RDMA peer address from gossip");
             }
         });
     }
