@@ -245,9 +245,6 @@ examples/
 
 - **Read-only**. Writes are not implemented; the FUSE handler returns
   `EROFS`-style errors on write-open paths.
-- **No per-chunk singleflight**. If N concurrent FUSE reads land on the
-  same uncached chunk before the first finishes, all N issue independent
-  fetches. Correctness preserved; just wastes bandwidth.
 - **TCP-only transport** v1. The pod spec already requests `rdma/ib: 1`
   and `/dev/infiniband/uverbs*` is exposed inside the container; an RDMA
   backend can be slotted behind the existing `PeerClient` shape without
