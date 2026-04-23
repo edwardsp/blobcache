@@ -226,6 +226,14 @@ impl PeerClient {
             }
         }
     }
+
+    #[cfg(feature = "ucx")]
+    pub fn ensure_server_ep(&self, peer_id: &str, peer_worker_addr: &[u8]) -> Result<()> {
+        match self {
+            Self::Rdma(c) => c.ensure_server_ep(peer_id, peer_worker_addr),
+            Self::Tcp(_) => Ok(()),
+        }
+    }
 }
 
 fn json_ok(v: serde_json::Value) -> Response<Full<Bytes>> {

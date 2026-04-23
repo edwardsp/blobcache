@@ -92,6 +92,10 @@ enum RdmaCmd {
         peer_addr_blob: Vec<u8>,
         reply: oneshot::Sender<Result<()>>,
     },
+    EnsureServerEp {
+        peer_id: String,
+        peer_addr_blob: Vec<u8>,
+    },
 }
 
 impl RdmaPeerService {
@@ -151,6 +155,15 @@ impl RdmaPeerService {
 }
 
 impl RdmaPeerClient {
+    pub fn ensure_server_ep(&self, peer_id: &str, peer_addr_blob: &[u8]) -> Result<()> {
+        self.cmd_tx
+            .send(RdmaCmd::EnsureServerEp {
+                peer_id: peer_id.to_string(),
+                peer_addr_blob: peer_addr_blob.to_vec(),
+            })
+            .map_err(|_| BcError::Peer("ucx runtime thread gone".into()))
+    }
+
     pub async fn fetch_chunk(
         &self,
         peer_id: &str,
@@ -244,7 +257,7 @@ async fn run_runtime(
                 if let Err(e) = poll_ready_endpoints(state.clone(), cache.clone(), stats.clone()) {
                     break Err(e);
                 }
-                if let Err(e) = reap_broken_client_eps(state.clone()).await {
+                if let Err(e) = reap_broken_eps(state.clone()).await {
                     break Err(e);
                 }
             }
@@ -253,7 +266,7 @@ async fn run_runtime(
 
     progress.abort();
     let _ = progress.await;
-    let shutdown_result = close_all_client_eps(state.clone()).await;
+    let shutdown_result = close_all_endpoints(state.clone()).await;
     unsafe {
         ucp_worker_release_address(ucx.worker, worker_addr);
     }
@@ -282,6 +295,14 @@ fn dispatch_cmd(state: SharedRuntimeState, cmd: RdmaCmd) {
                 let result = client_health(state.clone(), &peer_id, &peer_addr_blob).await;
                 let _ = reply.send(result);
             }
+            RdmaCmd::EnsureServerEp {
+                peer_id,
+                peer_addr_blob,
+            } => {
+                if let Err(e) = ensure_server_ep(state.clone(), &peer_id, &peer_addr_blob).await {
+                    tracing::warn!(peer = %peer_id, error = %e, "failed to ensure UCX server endpoint");
+                }
+            }
         }
     });
 }
@@ -309,7 +330,9 @@ fn poll_ready_endpoints(
             if polled.ep.is_null() {
                 continue;
             }
-            if runtime.active_server_eps.insert(polled.ep) {
+            if runtime.active_server_eps.contains(&polled.ep)
+                && runtime.serving_server_eps.insert(polled.ep)
+            {
                 to_serve.push(polled.ep);
             }
         }
@@ -323,27 +346,44 @@ fn poll_ready_endpoints(
             let result = serve_one_inner(ep, cache, stats).await;
             if let Err(e) = &result {
                 tracing::debug!(error = %e, "ucx serve_one_inner ended");
-                let _ = close_ep_force(ep).await;
+                state.borrow_mut().mark_server_ep_broken(ep);
             }
-            state.borrow_mut().active_server_eps.remove(&ep);
+            state.borrow_mut().serving_server_eps.remove(&ep);
         });
     }
 
     Ok(())
 }
 
-async fn reap_broken_client_eps(state: SharedRuntimeState) -> Result<()> {
+async fn reap_broken_eps(state: SharedRuntimeState) -> Result<()> {
     let stale = state.borrow_mut().take_broken_client_eps();
     for stale_ep in stale {
         let _ = close_ep_force(stale_ep.ep).await;
         release_callback_arg(stale_ep.callback_arg);
     }
+
+    let stale_server = state.borrow_mut().take_broken_server_eps();
+    for (peer_id, peer_addr_blob, stale_ep) in stale_server {
+        let _ = close_ep_force(stale_ep.ep).await;
+        release_callback_arg(stale_ep.callback_arg);
+        ensure_server_ep(state.clone(), &peer_id, &peer_addr_blob).await?;
+    }
     Ok(())
 }
 
-async fn close_all_client_eps(state: SharedRuntimeState) -> Result<()> {
+async fn close_all_endpoints(state: SharedRuntimeState) -> Result<()> {
     let all = state.borrow_mut().take_all_client_eps();
     for slot in all {
+        let _ = if slot.broken.load(Ordering::SeqCst) {
+            close_ep_force(slot.ep).await
+        } else {
+            close_ep(slot.ep).await
+        };
+        release_callback_arg(slot.callback_arg);
+    }
+
+    let server = state.borrow_mut().take_all_server_eps();
+    for (_, _, slot) in server {
         let _ = if slot.broken.load(Ordering::SeqCst) {
             close_ep_force(slot.ep).await
         } else {
@@ -450,8 +490,15 @@ struct RuntimeState {
     worker: ucp_worker_h,
     peer_stats: Arc<crate::stats::PeerStats>,
     client_pools: HashMap<String, EndpointPool>,
+    server_eps: HashMap<String, ServerEndpointState>,
     active_server_eps: HashSet<ucp_ep_h>,
+    serving_server_eps: HashSet<ucp_ep_h>,
     lane_verified: bool,
+}
+
+struct ServerEndpointState {
+    slot: EndpointSlot,
+    peer_addr_blob: Vec<u8>,
 }
 
 struct EndpointPool {
@@ -478,14 +525,80 @@ struct RemovedEndpoint {
     callback_arg: *mut Arc<AtomicBool>,
 }
 
+impl RemovedEndpoint {
+    fn from_slot(slot: EndpointSlot) -> Self {
+        Self {
+            ep: slot.ep,
+            broken: slot.broken,
+            callback_arg: slot.callback_arg,
+        }
+    }
+}
+
 impl RuntimeState {
     fn new(worker: ucp_worker_h, peer_stats: Arc<crate::stats::PeerStats>) -> Self {
         Self {
             worker,
             peer_stats,
             client_pools: HashMap::new(),
+            server_eps: HashMap::new(),
             active_server_eps: HashSet::new(),
+            serving_server_eps: HashSet::new(),
             lane_verified: false,
+        }
+    }
+
+    fn take_broken_server_eps(&mut self) -> Vec<(String, Vec<u8>, RemovedEndpoint)> {
+        let mut removed = Vec::new();
+        let peer_ids: Vec<String> = self
+            .server_eps
+            .iter()
+            .filter_map(|(peer_id, server_ep)| {
+                server_ep
+                    .slot
+                    .broken
+                    .load(Ordering::SeqCst)
+                    .then(|| peer_id.clone())
+            })
+            .collect();
+
+        for peer_id in peer_ids {
+            if let Some(server_ep) = self.server_eps.remove(&peer_id) {
+                self.active_server_eps.remove(&server_ep.slot.ep);
+                self.serving_server_eps.remove(&server_ep.slot.ep);
+                removed.push((
+                    peer_id,
+                    server_ep.peer_addr_blob,
+                    RemovedEndpoint::from_slot(server_ep.slot),
+                ));
+            }
+        }
+        removed
+    }
+
+    fn take_all_server_eps(&mut self) -> Vec<(String, Vec<u8>, RemovedEndpoint)> {
+        let mut removed = Vec::new();
+        let all_server_eps = std::mem::take(&mut self.server_eps);
+        self.active_server_eps.clear();
+        self.serving_server_eps.clear();
+        for (peer_id, server_ep) in all_server_eps {
+            removed.push((
+                peer_id,
+                server_ep.peer_addr_blob,
+                RemovedEndpoint::from_slot(server_ep.slot),
+            ));
+        }
+        removed
+    }
+
+    fn mark_server_ep_broken(&mut self, ep: ucp_ep_h) {
+        self.active_server_eps.remove(&ep);
+        self.serving_server_eps.remove(&ep);
+        for server_ep in self.server_eps.values_mut() {
+            if server_ep.slot.ep == ep {
+                server_ep.slot.broken.store(true, Ordering::SeqCst);
+                break;
+            }
         }
     }
 
@@ -715,6 +828,53 @@ fn create_pooled_ep(worker: ucp_worker_h, peer_addr_blob: &[u8]) -> Result<Endpo
         callback_arg,
         busy: false,
     })
+}
+
+async fn ensure_server_ep(
+    state: SharedRuntimeState,
+    peer_id: &str,
+    peer_addr_blob: &[u8],
+) -> Result<()> {
+    let existing = {
+        let mut runtime = state.borrow_mut();
+        if let Some(server_ep) = runtime.server_eps.remove(peer_id) {
+            if server_ep.peer_addr_blob == peer_addr_blob
+                && !server_ep.slot.broken.load(Ordering::SeqCst)
+            {
+                runtime.active_server_eps.insert(server_ep.slot.ep);
+                runtime.server_eps.insert(peer_id.to_string(), server_ep);
+                return Ok(());
+            }
+            runtime.active_server_eps.remove(&server_ep.slot.ep);
+            runtime.serving_server_eps.remove(&server_ep.slot.ep);
+            Some(RemovedEndpoint::from_slot(server_ep.slot))
+        } else {
+            None
+        }
+    };
+
+    if let Some(existing) = existing {
+        let _ = close_ep_force(existing.ep).await;
+        release_callback_arg(existing.callback_arg);
+    }
+
+    let worker = state.borrow().worker;
+    let slot = create_pooled_ep(worker, peer_addr_blob)?;
+    {
+        let mut runtime = state.borrow_mut();
+        runtime.verify_lane_once(slot.ep);
+        runtime.active_server_eps.insert(slot.ep);
+        runtime.server_eps.insert(
+            peer_id.to_string(),
+            ServerEndpointState {
+                slot,
+                peer_addr_blob: peer_addr_blob.to_vec(),
+            },
+        );
+    }
+
+    tracing::debug!(peer = %peer_id, "ensured UCX server endpoint for peer");
+    Ok(())
 }
 
 fn release_callback_arg(callback_arg: *mut Arc<AtomicBool>) {

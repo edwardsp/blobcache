@@ -169,7 +169,8 @@ fn main() -> anyhow::Result<()> {
         state: NodeState::Alive,
         incarnation: 1,
     };
-    let membership = Membership::new(me, stats.cluster_stats.clone());
+    #[allow(unused_mut)]
+    let mut membership = Membership::new(me, stats.cluster_stats.clone());
 
     let peers: Arc<crate::transport::PeerClient> = match cfg.transport.kind.as_str() {
         "tcp" => Arc::new(crate::transport::PeerClient::tcp()),
@@ -188,6 +189,27 @@ fn main() -> anyhow::Result<()> {
         }
         other => anyhow::bail!("unknown transport.kind {other:?}"),
     };
+
+    #[cfg(feature = "ucx")]
+    if matches!(cfg.transport.kind.as_str(), "rdma") {
+        let peers_for_hook = peers.clone();
+        membership.set_rdma_server_ep_hook(move |node| {
+            let Some(encoded) = &node.ucx_worker_addr_b64 else {
+                return;
+            };
+            let decoded = match BASE64_STANDARD.decode(encoded) {
+                Ok(decoded) => decoded,
+                Err(e) => {
+                    tracing::warn!(peer = %node.id, error = %e, "invalid UCX worker address in gossip payload");
+                    return;
+                }
+            };
+            if let Err(e) = peers_for_hook.ensure_server_ep(&node.id, &decoded) {
+                tracing::warn!(peer = %node.id, error = %e, "failed to ensure RDMA server endpoint from gossip");
+            }
+        });
+    }
+
     tracing::info!(kind = %cfg.transport.kind, "peer transport client initialised");
 
     let fetcher = Arc::new(Fetcher::new(

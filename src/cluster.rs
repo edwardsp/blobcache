@@ -55,6 +55,7 @@ pub struct Membership {
     me_incarnation: Arc<AtomicU64>,
     inner: Arc<RwLock<Inner>>,
     pub stats: Arc<crate::stats::ClusterStats>,
+    rdma_server_ep_hook: Option<Arc<dyn Fn(&NodeInfo) + Send + Sync>>,
 }
 
 struct Inner {
@@ -72,7 +73,16 @@ impl Membership {
             me_incarnation,
             inner: Arc::new(RwLock::new(Inner { members: m })),
             stats,
+            rdma_server_ep_hook: None,
         }
+    }
+
+    #[cfg(feature = "ucx")]
+    pub fn set_rdma_server_ep_hook<F>(&mut self, hook: F)
+    where
+        F: Fn(&NodeInfo) + Send + Sync + 'static,
+    {
+        self.rdma_server_ep_hook = Some(Arc::new(hook));
     }
 
     pub fn me_snapshot(&self) -> NodeInfo {
@@ -106,6 +116,7 @@ impl Membership {
     // misconfigured node forwarding members from another cluster).
     pub fn merge(&self, incoming: &[NodeInfo]) {
         let now = unix_now();
+        let mut ensure_server_ep = Vec::new();
         let mut g = self.inner.write();
         for n in incoming {
             if n.id == self.me_id {
@@ -140,14 +151,26 @@ impl Membership {
                         && n.state == existing.state
                         && n.last_seen_unix > existing.last_seen_unix;
                     if inc_better || same_inc_more_severe || same_state_fresher {
+                        let should_ensure = existing.ucx_worker_addr_b64 != n.ucx_worker_addr_b64;
                         g.members.insert(n.id.clone(), n.clone());
+                        if should_ensure {
+                            ensure_server_ep.push(n.clone());
+                        }
                     }
                 }
                 None => {
                     g.members.insert(n.id.clone(), n.clone());
                     self.stats.joins.inc();
                     tracing::info!(id=%n.id, url=%n.transport_url, "peer joined");
+                    ensure_server_ep.push(n.clone());
                 }
+            }
+        }
+        drop(g);
+
+        if let Some(hook) = &self.rdma_server_ep_hook {
+            for peer in ensure_server_ep {
+                hook(&peer);
             }
         }
     }
