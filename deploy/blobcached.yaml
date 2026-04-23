@@ -127,7 +127,11 @@ spec:
             # Storage Blob Data Contributor on myaccount.
             - { name: AZURE_CLIENT_ID, value: "00000000-0000-0000-0000-000000000000" }
             - { name: UCX_NET_DEVICES, value: "mlx5_0:1" }
-            - { name: UCX_TLS, value: "rc,sm,self" }
+            - { name: UCX_TLS, value: "rc,ud,sm,self" }
+            - { name: UCX_IB_ADDR_TYPE, value: "gid" }
+            - { name: UCX_RNDV_THRESH, value: "64K" }
+            - { name: UCX_ZCOPY_THRESH, value: "64K" }
+            - { name: UCX_LOG_LEVEL, value: "info" }
           volumeMounts:
             - { name: nvme,    mountPath: /mnt/nvme, mountPropagation: HostToContainer }
             - { name: fuse,    mountPath: /dev/fuse }
