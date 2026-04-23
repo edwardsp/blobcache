@@ -5,9 +5,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::SystemTime;
 
-use crate::error::{BcError, Result};
+use crate::error::Result;
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct ChunkKey {
@@ -88,43 +87,42 @@ impl DiskCache {
     }
 
     fn scan_existing(self: &Arc<Self>) -> Result<()> {
-        let mut total = 0u64;
-        let entries: Vec<_> = std::fs::read_dir(&self.root)?
-            .filter_map(|e| e.ok())
-            .filter_map(|e| {
-                let m = e.metadata().ok()?;
-                if !m.is_file() {
-                    return None;
-                }
-                let mtime = m
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
-                    .map(|d| d.as_micros() as u64)
-                    .unwrap_or(0);
-                Some((e.file_name().into_string().ok()?, m.len(), mtime))
-            })
-            .collect();
-        let mut g = self.inner.lock();
-        for (name, size, mtime) in entries {
-            let key = ChunkKey {
-                mount: format!("__legacy__{name}"),
-                blob: name.clone(),
-                offset: 0,
+        // Chunk filenames are sha256(mount, blob, offset) - there is no reverse
+        // mapping back to a ChunkKey, so any file already on disk at startup is
+        // unreachable through normal lookup. Delete them rather than carry them
+        // as orphans that count against the byte budget but can never be hit.
+        let mut purged = 0u64;
+        let mut purged_bytes = 0u64;
+        for e in std::fs::read_dir(&self.root)?.flatten() {
+            let m = match e.metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
             };
-            g.seq = g.seq.max(mtime);
-            g.entries.insert(
-                key.clone(),
-                Entry {
-                    size,
-                    last_access_seq: mtime,
-                },
-            );
-            g.lru.insert(mtime, key);
-            total += size;
+            if !m.is_file() {
+                continue;
+            }
+            let name = match e.file_name().into_string() {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            if name.starts_with(".tmp.") {
+                let _ = std::fs::remove_file(e.path());
+                continue;
+            }
+            let _ = std::fs::remove_file(e.path());
+            purged += 1;
+            purged_bytes += m.len();
         }
-        g.bytes = total;
-        self.stats.bytes_in_use.store(total, Ordering::Relaxed);
+        if purged > 0 {
+            tracing::info!(
+                files = purged,
+                bytes = purged_bytes,
+                "purged orphaned cache files at startup"
+            );
+        }
+        let mut g = self.inner.lock();
+        g.bytes = 0;
+        self.stats.bytes_in_use.store(0, Ordering::Relaxed);
         Ok(())
     }
 
@@ -133,6 +131,18 @@ impl DiskCache {
     }
 
     pub fn try_get(self: &Arc<Self>, key: &ChunkKey) -> Option<Bytes> {
+        // Take the lock first and check tracking. A file on disk that we don't
+        // track is treated as a miss - resurrecting it here would race with
+        // concurrent eviction (which removes the entry then the file) and
+        // could double-count bytes_in_use or revive a file scheduled for
+        // deletion.
+        {
+            let g = self.inner.lock();
+            if !g.entries.contains_key(key) {
+                self.stats.misses.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+        }
         let path = self.path_for(key);
         let data = match std::fs::read(&path) {
             Ok(d) => d,
@@ -142,31 +152,23 @@ impl DiskCache {
             }
         };
         let mut g = self.inner.lock();
-        let exists = g.entries.contains_key(key);
-        if exists {
-            let prev_seq = g.entries.get(key).map(|e| e.last_access_seq).unwrap_or(0);
-            g.lru.remove(&prev_seq);
-            g.seq += 1;
-            let new_seq = g.seq;
-            if let Some(entry) = g.entries.get_mut(key) {
-                entry.last_access_seq = new_seq;
+        let prev_seq = match g.entries.get(key) {
+            Some(e) => e.last_access_seq,
+            None => {
+                // Entry was evicted between our two locks; treat as miss
+                // rather than re-insert (which would orphan the on-disk file
+                // bookkeeping if eviction's remove_file already fired).
+                self.stats.misses.fetch_add(1, Ordering::Relaxed);
+                return None;
             }
-            g.lru.insert(new_seq, key.clone());
-        } else {
-            g.seq += 1;
-            let seq = g.seq;
-            let size = data.len() as u64;
-            g.entries.insert(
-                key.clone(),
-                Entry {
-                    size,
-                    last_access_seq: seq,
-                },
-            );
-            g.lru.insert(seq, key.clone());
-            g.bytes += size;
-            self.stats.bytes_in_use.store(g.bytes, Ordering::Relaxed);
+        };
+        g.lru.remove(&prev_seq);
+        g.seq += 1;
+        let new_seq = g.seq;
+        if let Some(entry) = g.entries.get_mut(key) {
+            entry.last_access_seq = new_seq;
         }
+        g.lru.insert(new_seq, key.clone());
         self.stats.hits.fetch_add(1, Ordering::Relaxed);
         Some(Bytes::from(data))
     }
@@ -220,6 +222,18 @@ impl DiskCache {
             }
         }
         self.stats.bytes_in_use.store(g.bytes, Ordering::Relaxed);
+    }
+
+    pub fn remove(self: &Arc<Self>, key: &ChunkKey) -> Result<()> {
+        let path = self.path_for(key);
+        let _ = std::fs::remove_file(&path);
+        let mut g = self.inner.lock();
+        if let Some(e) = g.entries.remove(key) {
+            g.lru.remove(&e.last_access_seq);
+            g.bytes = g.bytes.saturating_sub(e.size);
+            self.stats.bytes_in_use.store(g.bytes, Ordering::Relaxed);
+        }
+        Ok(())
     }
 
     pub fn local_path(&self, key: &ChunkKey) -> Option<PathBuf> {
