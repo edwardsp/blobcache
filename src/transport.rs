@@ -179,24 +179,46 @@ impl PeerClient {
     }
 
     #[cfg(feature = "ucx")]
-    pub fn rdma() -> Result<Self> {
-        Ok(Self::Rdma(crate::transport_ucx::RdmaPeerClient::new()?))
+    pub fn rdma(client: crate::transport_ucx::RdmaPeerClient) -> Self {
+        Self::Rdma(client)
     }
 
-    pub async fn fetch_chunk(&self, peer_url: &str, key: &ChunkKey, length: u32) -> Result<Bytes> {
+    pub async fn fetch_chunk(
+        &self,
+        _peer_id: &str,
+        peer_url: &str,
+        _peer_worker_addr: Option<&[u8]>,
+        key: &ChunkKey,
+        _length: u32,
+    ) -> Result<Bytes> {
         match self {
             Self::Tcp(c) => c.fetch_chunk(peer_url, key).await,
             #[cfg(feature = "ucx")]
-            Self::Rdma(c) => c.fetch_chunk(peer_url, key, length).await,
+            Self::Rdma(c) => {
+                let worker_addr = peer_worker_addr.ok_or_else(|| {
+                    BcError::Peer(format!("missing ucx worker address for peer {peer_id}"))
+                })?;
+                c.fetch_chunk(peer_id, worker_addr, key, length).await
+            }
         }
     }
 
     #[allow(dead_code)]
-    pub async fn health(&self, peer_url: &str) -> Result<()> {
+    pub async fn health(
+        &self,
+        _peer_id: &str,
+        peer_url: &str,
+        _peer_worker_addr: Option<&[u8]>,
+    ) -> Result<()> {
         match self {
             Self::Tcp(c) => c.health(peer_url).await.map(|_| ()),
             #[cfg(feature = "ucx")]
-            Self::Rdma(c) => c.health(peer_url).await,
+            Self::Rdma(c) => {
+                let worker_addr = peer_worker_addr.ok_or_else(|| {
+                    BcError::Peer(format!("missing ucx worker address for peer {peer_id}"))
+                })?;
+                c.health(peer_id, worker_addr).await
+            }
         }
     }
 }

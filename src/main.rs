@@ -1,4 +1,6 @@
 use anyhow::Context;
+#[cfg(feature = "ucx")]
+use base64::prelude::{Engine as _, BASE64_STANDARD};
 use clap::Parser;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -122,11 +124,44 @@ fn main() -> anyhow::Result<()> {
         }
     });
 
+    #[cfg(feature = "ucx")]
+    let mut rdma_bootstrap = None;
+
+    let ucx_worker_addr_b64 = match cfg.transport.kind.as_str() {
+        "tcp" => None,
+        "rdma" => {
+            #[cfg(feature = "ucx")]
+            {
+                let transport_addr: std::net::SocketAddr = cfg
+                    .transport
+                    .bind
+                    .parse()
+                    .context(format!("parse transport.bind {}", cfg.transport.bind))?;
+                let (service, client, worker_addr_blob) =
+                    crate::transport_ucx::RdmaPeerService::start(
+                        cache.clone(),
+                        transport_addr,
+                        stats.peer_stats.clone(),
+                    )
+                    .context("start RDMA peer service")?;
+                let encoded = BASE64_STANDARD.encode(worker_addr_blob.as_slice());
+                rdma_bootstrap = Some((service, client));
+                Some(encoded)
+            }
+            #[cfg(not(feature = "ucx"))]
+            {
+                anyhow::bail!("transport.kind=\"rdma\" requires --features ucx at build time");
+            }
+        }
+        other => anyhow::bail!("unknown transport.kind {other:?}"),
+    };
+
     let me = NodeInfo {
         id: node_id.clone(),
         transport_url: advertise.clone(),
         gossip_url: gossip_advertise.clone(),
         cluster_hash: cluster_hash_hex.clone(),
+        ucx_worker_addr_b64,
         last_seen_unix: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -141,7 +176,10 @@ fn main() -> anyhow::Result<()> {
         "rdma" => {
             #[cfg(feature = "ucx")]
             {
-                Arc::new(crate::transport::PeerClient::rdma().context("init RDMA peer client")?)
+                let (_service, client) = rdma_bootstrap
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("missing RDMA bootstrap state"))?;
+                Arc::new(crate::transport::PeerClient::rdma(client.clone()))
             }
             #[cfg(not(feature = "ucx"))]
             {
@@ -193,13 +231,7 @@ fn main() -> anyhow::Result<()> {
         "rdma" => {
             #[cfg(feature = "ucx")]
             {
-                let _rdma_svc = crate::transport_ucx::RdmaPeerService::start(
-                    cache.clone(),
-                    transport_addr,
-                    stats.peer_stats.clone(),
-                )
-                .context("start RDMA peer service")?;
-                std::mem::forget(_rdma_svc);
+                let _ = transport_addr;
             }
             #[cfg(not(feature = "ucx"))]
             {
@@ -255,6 +287,8 @@ fn main() -> anyhow::Result<()> {
     rt.block_on(wait_signal());
     tracing::info!("shutting down");
     drop(sessions);
+    #[cfg(feature = "ucx")]
+    drop(rdma_bootstrap);
     Ok(())
 }
 

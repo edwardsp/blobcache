@@ -35,6 +35,8 @@ pub struct NodeInfo {
     pub transport_url: String,
     pub gossip_url: String,
     pub cluster_hash: String,
+    #[serde(default)]
+    pub ucx_worker_addr_b64: Option<String>,
     pub last_seen_unix: u64,
     pub state: NodeState,
     pub incarnation: u64,

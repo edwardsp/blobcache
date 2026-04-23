@@ -1,3 +1,4 @@
+use base64::prelude::{Engine as _, BASE64_STANDARD};
 use bytes::Bytes;
 use parking_lot::Mutex;
 use rand::seq::SliceRandom;
@@ -206,9 +207,41 @@ impl Fetcher {
         let mut shuffled = alive;
         shuffled.shuffle(&mut rand::thread_rng());
         for peer in shuffled.iter().take(3) {
+            let worker_addr = match &peer.ucx_worker_addr_b64 {
+                Some(encoded) => match BASE64_STANDARD.decode(encoded) {
+                    Ok(decoded) => Some(decoded),
+                    Err(e) => {
+                        tracing::warn!(
+                            peer = %peer.id,
+                            transport = %peer.transport_url,
+                            error = %e,
+                            "peer advertised invalid UCX worker address; skipping"
+                        );
+                        continue;
+                    }
+                },
+                None => match &*self.peers {
+                    PeerClient::Tcp(_) => None,
+                    #[cfg(feature = "ucx")]
+                    PeerClient::Rdma(_) => {
+                        tracing::warn!(
+                            peer = %peer.id,
+                            transport = %peer.transport_url,
+                            "rdma peer missing UCX worker address; skipping"
+                        );
+                        continue;
+                    }
+                },
+            };
             match self
                 .peers
-                .fetch_chunk(&peer.transport_url, key, expected_len as u32)
+                .fetch_chunk(
+                    &peer.id,
+                    &peer.transport_url,
+                    worker_addr.as_deref(),
+                    key,
+                    expected_len as u32,
+                )
                 .await
             {
                 Ok(data) => {
