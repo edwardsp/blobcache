@@ -16,6 +16,7 @@ pub struct Stats {
     pub peer_fetch_bytes: IntCounter,
     pub fuse_reads: IntCounter,
     pub fuse_read_bytes: IntCounter,
+    pub singleflight_waits: IntCounter,
     pub peer_stats: Arc<PeerStats>,
     pub cluster_stats: Arc<ClusterStats>,
     pub members_alive: IntGauge,
@@ -49,6 +50,7 @@ impl Stats {
         let peer_fetch_bytes = IntCounter::new("blobcache_peer_fetch_bytes_total", "peer fetched bytes").unwrap();
         let fuse_reads = IntCounter::new("blobcache_fuse_reads_total", "fuse read calls").unwrap();
         let fuse_read_bytes = IntCounter::new("blobcache_fuse_read_bytes_total", "fuse read bytes").unwrap();
+        let singleflight_waits = IntCounter::new("blobcache_singleflight_waits_total", "fetches deduped via singleflight").unwrap();
         let chunk_requests = IntCounter::new("blobcache_peer_chunk_requests_total", "chunk requests served").unwrap();
         let chunk_bytes_served = IntCounter::new("blobcache_peer_chunk_bytes_served_total", "chunk bytes served").unwrap();
         let gossip_rounds = IntCounter::new("blobcache_cluster_gossip_rounds_total", "gossip rounds").unwrap();
@@ -60,7 +62,7 @@ impl Stats {
 
         for m in [&cache_hits, &cache_misses, &cache_evictions, &cache_inserts, &blob_fetches, &blob_fetch_bytes,
                   &peer_fetches_ok, &peer_fetches_miss, &peer_fetches_err, &peer_fetch_bytes,
-                  &fuse_reads, &fuse_read_bytes, &chunk_requests, &chunk_bytes_served,
+                  &fuse_reads, &fuse_read_bytes, &singleflight_waits, &chunk_requests, &chunk_bytes_served,
                   &gossip_rounds, &joins, &failures, &config_mismatches] {
             r.register(Box::new(m.clone())).unwrap();
         }
@@ -73,7 +75,7 @@ impl Stats {
             cache_hits, cache_misses, cache_evictions, cache_inserts, cache_bytes,
             blob_fetches, blob_fetch_bytes,
             peer_fetches_ok, peer_fetches_miss, peer_fetches_err, peer_fetch_bytes,
-            fuse_reads, fuse_read_bytes,
+            fuse_reads, fuse_read_bytes, singleflight_waits,
             members_alive, members_dead,
             peer_stats: Arc::new(PeerStats { chunk_requests, chunk_bytes_served }),
             cluster_stats: Arc::new(ClusterStats { gossip_rounds, joins, failures, config_mismatches }),

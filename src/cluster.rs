@@ -3,6 +3,7 @@ use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -13,6 +14,12 @@ const GOSSIP_INTERVAL_MS: u64 = 1500;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum NodeState { Alive, Suspect, Dead }
+
+impl NodeState {
+    fn rank(&self) -> u8 {
+        match self { NodeState::Alive => 0, NodeState::Suspect => 1, NodeState::Dead => 2 }
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NodeInfo {
@@ -33,7 +40,9 @@ pub struct GossipPayload {
 
 #[derive(Clone)]
 pub struct Membership {
-    pub me: NodeInfo,
+    pub me_id: String,
+    pub me_template: NodeInfo,
+    me_incarnation: Arc<AtomicU64>,
     inner: Arc<RwLock<Inner>>,
     pub stats: Arc<crate::stats::ClusterStats>,
 }
@@ -46,13 +55,30 @@ impl Membership {
     pub fn new(me: NodeInfo, stats: Arc<crate::stats::ClusterStats>) -> Self {
         let mut m = HashMap::new();
         m.insert(me.id.clone(), me.clone());
-        Self { me, inner: Arc::new(RwLock::new(Inner { members: m })), stats }
+        let me_incarnation = Arc::new(AtomicU64::new(me.incarnation.max(1)));
+        Self {
+            me_id: me.id.clone(),
+            me_template: me,
+            me_incarnation,
+            inner: Arc::new(RwLock::new(Inner { members: m })),
+            stats,
+        }
+    }
+
+    pub fn me_snapshot(&self) -> NodeInfo {
+        let mut me = self.me_template.clone();
+        me.incarnation = self.me_incarnation.load(Ordering::Relaxed);
+        me.last_seen_unix = unix_now();
+        me.state = NodeState::Alive;
+        me
     }
 
     pub fn members_alive(&self) -> Vec<NodeInfo> {
         let g = self.inner.read();
         g.members.values()
-            .filter(|n| n.state == NodeState::Alive && n.id != self.me.id)
+            .filter(|n| n.state == NodeState::Alive
+                     && n.id != self.me_id
+                     && n.cluster_hash == self.me_template.cluster_hash)
             .cloned().collect()
     }
 
@@ -60,19 +86,43 @@ impl Membership {
         self.inner.read().members.values().cloned().collect()
     }
 
+    // Merge with SWIM-like precedence: higher (incarnation, state-rank) wins,
+    // where state rank Dead > Suspect > Alive disambiguates same incarnation.
+    // Mismatched cluster_hash entries are dropped (defence-in-depth against a
+    // misconfigured node forwarding members from another cluster).
     pub fn merge(&self, incoming: &[NodeInfo]) {
         let now = unix_now();
         let mut g = self.inner.write();
         for n in incoming {
-            if n.id == self.me.id { continue; }
+            if n.id == self.me_id {
+                let our_inc = self.me_incarnation.load(Ordering::Relaxed);
+                let claims_we_are_down = n.state != NodeState::Alive;
+                if n.incarnation > our_inc || (n.incarnation == our_inc && claims_we_are_down) {
+                    let new_inc = n.incarnation.max(our_inc) + 1;
+                    self.me_incarnation.store(new_inc, Ordering::Relaxed);
+                    tracing::info!(peer_inc = n.incarnation, new_inc, "refuting suspicion; bumped incarnation");
+                }
+                let mut me = self.me_template.clone();
+                me.incarnation = self.me_incarnation.load(Ordering::Relaxed);
+                me.last_seen_unix = now;
+                me.state = NodeState::Alive;
+                g.members.insert(self.me_id.clone(), me);
+                continue;
+            }
+            if n.cluster_hash != self.me_template.cluster_hash {
+                self.stats.config_mismatches.inc();
+                continue;
+            }
             match g.members.get(&n.id) {
                 Some(existing) => {
-                    if n.incarnation > existing.incarnation
-                       || (n.incarnation == existing.incarnation && n.last_seen_unix > existing.last_seen_unix)
-                    {
-                        let mut nn = n.clone();
-                        nn.last_seen_unix = nn.last_seen_unix.max(existing.last_seen_unix);
-                        g.members.insert(n.id.clone(), nn);
+                    let inc_better = n.incarnation > existing.incarnation;
+                    let same_inc_more_severe = n.incarnation == existing.incarnation
+                        && n.state.rank() > existing.state.rank();
+                    let same_state_fresher = n.incarnation == existing.incarnation
+                        && n.state == existing.state
+                        && n.last_seen_unix > existing.last_seen_unix;
+                    if inc_better || same_inc_more_severe || same_state_fresher {
+                        g.members.insert(n.id.clone(), n.clone());
                     }
                 }
                 None => {
@@ -82,10 +132,6 @@ impl Membership {
                 }
             }
         }
-        let mut me = g.members.get(&self.me.id).cloned().unwrap_or_else(|| self.me.clone());
-        me.last_seen_unix = now;
-        me.state = NodeState::Alive;
-        g.members.insert(self.me.id.clone(), me);
     }
 
     pub fn touch_peer(&self, id: &str) {
@@ -104,7 +150,7 @@ impl Membership {
         let now = unix_now();
         let mut g = self.inner.write();
         for (id, n) in g.members.iter_mut() {
-            if id == &self.me.id { continue; }
+            if id == &self.me_id { continue; }
             let age = now.saturating_sub(n.last_seen_unix);
             let new_state = if age > HEARTBEAT_TIMEOUT_SECS * 2 { NodeState::Dead }
                             else if age > HEARTBEAT_TIMEOUT_SECS { NodeState::Suspect }
@@ -153,20 +199,26 @@ impl GossipServer {
                         let resp = match (req.method(), req.uri().path()) {
                             (&Method::POST, "/cluster/sync") => {
                                 let body = req.collect().await.map(|b| b.to_bytes()).unwrap_or_default();
+                                if body.len() > MAX_GOSSIP_BODY_BYTES {
+                                    return Ok::<_, Infallible>(Response::builder().status(413)
+                                        .body(Full::new(HBytes::from_static(b"too large"))).unwrap());
+                                }
                                 match serde_json::from_slice::<GossipPayload>(&body) {
                                     Ok(payload) => {
                                         let from_id = payload.from.id.clone();
-                                        let mut all = payload.members;
-                                        all.push(payload.from);
-                                        if me.me.cluster_hash != all.iter().find(|n| n.id == from_id).map(|n| n.cluster_hash.as_str()).unwrap_or("") {
+                                        if payload.from.cluster_hash != me.me_template.cluster_hash {
                                             me.stats.config_mismatches.inc();
                                             tracing::warn!(peer=%from_id, "cluster_hash mismatch — refusing merge");
-                                        } else {
-                                            me.merge(&all);
-                                            me.touch_peer(&from_id);
+                                            return Ok::<_, Infallible>(Response::builder().status(409)
+                                                .header("content-type", "application/json")
+                                                .body(Full::new(HBytes::from_static(b"{\"error\":\"cluster_hash mismatch\"}"))).unwrap());
                                         }
+                                        let mut all = payload.members;
+                                        all.push(payload.from);
+                                        me.merge(&all);
+                                        me.touch_peer(&from_id);
                                         let response_payload = GossipPayload {
-                                            from: me.me.clone(),
+                                            from: me.me_snapshot(),
                                             members: me.members_all(),
                                         };
                                         let body = serde_json::to_vec(&response_payload).unwrap();
@@ -188,12 +240,14 @@ impl GossipServer {
     }
 }
 
+const MAX_GOSSIP_BODY_BYTES: usize = 1024 * 1024;
+
 pub async fn run_gossip_loop(membership: Membership, seeds: Vec<String>) {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .build().expect("client");
     let mut interval = tokio::time::interval(Duration::from_millis(GOSSIP_INTERVAL_MS));
-    let me_id = membership.me.id.clone();
+    let me_id = membership.me_id.clone();
 
     for seed in &seeds {
         if let Err(e) = gossip_with(&client, &membership, seed).await {
@@ -222,7 +276,7 @@ pub async fn run_gossip_loop(membership: Membership, seeds: Vec<String>) {
 
 async fn gossip_with(client: &reqwest::Client, m: &Membership, peer_url: &str) -> Result<()> {
     let payload = GossipPayload {
-        from: NodeInfo { last_seen_unix: unix_now(), state: NodeState::Alive, ..m.me.clone() },
+        from: m.me_snapshot(),
         members: m.members_all(),
     };
     let url = format!("{}/cluster/sync", peer_url.trim_end_matches('/'));
@@ -234,6 +288,10 @@ async fn gossip_with(client: &reqwest::Client, m: &Membership, peer_url: &str) -
     let body = resp.bytes().await?;
     let reply: GossipPayload = serde_json::from_slice(&body)
         .map_err(|e| BcError::Cluster(format!("decode reply: {e}")))?;
+    if reply.from.cluster_hash != m.me_template.cluster_hash {
+        m.stats.config_mismatches.inc();
+        return Err(BcError::Cluster(format!("reply cluster_hash mismatch from {}", reply.from.id)));
+    }
     let from_id = reply.from.id.clone();
     let mut all = reply.members;
     all.push(reply.from);
