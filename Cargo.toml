@@ -1,0 +1,64 @@
+[package]
+name = "blobcache"
+version = "0.1.0"
+edition = "2021"
+description = "Distributed FUSE-backed cache for Azure Blob Storage with peer-to-peer fetch"
+
+[[bin]]
+name = "blobcached"
+path = "src/main.rs"
+
+[dependencies]
+# Runtime + HTTP
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "blocking", "json"] }
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+http-body-util = "0.1"
+bytes = "1"
+url = "2"
+percent-encoding = "2"
+
+# Azure (lifted from azcp)
+hmac = "0.12"
+sha2 = "0.10"
+base64 = "0.22"
+chrono = "0.4"
+quick-xml = { version = "0.36", features = ["serialize"] }
+
+# Cluster (HTTP push-pull gossip; sufficient for ~20-node clusters)
+rand = "0.8"
+
+# FUSE
+fuser = { version = "0.15", default-features = false, features = ["abi-7-31"] }
+libc = "0.2"
+
+# Serde / config
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Errors / logging / misc
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive", "env"] }
+parking_lot = "0.12"
+dashmap = "6"
+
+# Stats
+prometheus = { version = "0.13", default-features = false }
+
+# Network interface enumeration (multi-NIC)
+pnet_datalink = "0.35"
+
+[features]
+default = []
+# UCX backend (requires libucx-dev installed; not enabled by default)
+ucx = []
+
+[profile.release]
+debug = 1
+lto = "thin"
+codegen-units = 1
