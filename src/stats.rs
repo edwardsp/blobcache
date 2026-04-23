@@ -26,6 +26,8 @@ pub struct Stats {
 pub struct PeerStats {
     pub chunk_requests: IntCounter,
     pub chunk_bytes_served: IntCounter,
+    #[cfg(feature = "ucx")]
+    pub rdma_non_rdma_lane: IntCounter,
 }
 pub struct ClusterStats {
     pub gossip_rounds: IntCounter,
@@ -73,6 +75,12 @@ impl Stats {
             "chunk bytes served",
         )
         .unwrap();
+        #[cfg(feature = "ucx")]
+        let rdma_non_rdma_lane = IntCounter::new(
+            "blobcache_rdma_non_rdma_lane_total",
+            "rdma endpoints that resolved to non-RDMA lanes",
+        )
+        .unwrap();
         let gossip_rounds =
             IntCounter::new("blobcache_cluster_gossip_rounds_total", "gossip rounds").unwrap();
         let joins =
@@ -104,6 +112,8 @@ impl Stats {
             &singleflight_waits,
             &chunk_requests,
             &chunk_bytes_served,
+            #[cfg(feature = "ucx")]
+            &rdma_non_rdma_lane,
             &gossip_rounds,
             &joins,
             &failures,
@@ -136,6 +146,8 @@ impl Stats {
             peer_stats: Arc::new(PeerStats {
                 chunk_requests,
                 chunk_bytes_served,
+                #[cfg(feature = "ucx")]
+                rdma_non_rdma_lane,
             }),
             cluster_stats: Arc::new(ClusterStats {
                 gossip_rounds,

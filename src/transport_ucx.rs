@@ -13,6 +13,8 @@
 extern "C" {}
 
 use bytes::Bytes;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;
 use std::future::Future;
 use std::mem::{self, MaybeUninit};
@@ -21,8 +23,11 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::os::raw::{c_char, c_void};
 use std::pin::Pin;
 use std::ptr;
-use std::sync::Arc;
+use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
+use std::time::Duration;
 use tokio::io::unix::AsyncFd;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -36,13 +41,59 @@ const STATUS_OK: u8 = 0;
 const STATUS_MISS: u8 = 1;
 const STATUS_ERR: u8 = 2;
 const MAX_RESPONSE_BYTES: u32 = 64 * 1024 * 1024;
+const MAX_POLLED_EPS: usize = 16;
+const POOL_SIZE_PER_PEER: usize = 4;
+const TRANSPORT_QUERY_CAPACITY: usize = 8;
+
+type SharedRuntimeState = Rc<RefCell<RuntimeState>>;
 
 // ============================================================================
-// Server
+// Server + shared runtime bootstrap
 // ============================================================================
 
 pub struct RdmaPeerService {
-    shutdown: Option<oneshot::Sender<()>>,
+    _shared: Arc<RdmaRuntimeShared>,
+}
+
+#[derive(Clone)]
+pub struct RdmaPeerClient {
+    _shared: Arc<RdmaRuntimeShared>,
+    cmd_tx: mpsc::UnboundedSender<RdmaCmd>,
+}
+
+struct RdmaRuntimeShared {
+    shutdown: Mutex<Option<oneshot::Sender<()>>>,
+    thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+impl Drop for RdmaRuntimeShared {
+    fn drop(&mut self) {
+        if let Ok(mut shutdown) = self.shutdown.lock() {
+            if let Some(tx) = shutdown.take() {
+                let _ = tx.send(());
+            }
+        }
+        if let Ok(mut thread) = self.thread.lock() {
+            if let Some(handle) = thread.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+}
+
+enum RdmaCmd {
+    Fetch {
+        peer_id: String,
+        peer_addr_blob: Vec<u8>,
+        key: ChunkKey,
+        length: u32,
+        reply: oneshot::Sender<Result<Bytes>>,
+    },
+    Health {
+        peer_id: String,
+        peer_addr_blob: Vec<u8>,
+        reply: oneshot::Sender<Result<()>>,
+    },
 }
 
 impl RdmaPeerService {
@@ -50,12 +101,13 @@ impl RdmaPeerService {
         cache: Arc<DiskCache>,
         addr: SocketAddr,
         stats: Arc<crate::stats::PeerStats>,
-    ) -> Result<Self> {
-        let (started_tx, started_rx) = std::sync::mpsc::sync_channel::<Result<()>>(1);
+    ) -> Result<(Self, RdmaPeerClient, Vec<u8>)> {
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<RdmaCmd>();
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel::<Result<Vec<u8>>>(1);
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
-        std::thread::Builder::new()
-            .name("ucx-server".into())
+        let thread = std::thread::Builder::new()
+            .name("ucx-runtime".into())
             .spawn(move || {
                 let rt = match tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -69,37 +121,79 @@ impl RdmaPeerService {
                 };
                 let local = tokio::task::LocalSet::new();
                 local.block_on(&rt, async move {
-                    if let Err(e) = run_server(cache, addr, stats, started_tx, shutdown_rx).await {
-                        tracing::error!(error=%e, "ucx server thread exited with error");
+                    if let Err(e) = run_runtime(cache, stats, cmd_rx, started_tx, shutdown_rx).await
+                    {
+                        tracing::error!(error = %e, "ucx runtime thread exited with error");
                     }
                 });
             })
-            .map_err(|e| BcError::Peer(format!("ucx-server thread: {e}")))?;
+            .map_err(|e| BcError::Peer(format!("ucx-runtime thread: {e}")))?;
 
-        started_rx
+        let worker_addr_blob = started_rx
             .recv()
-            .map_err(|_| BcError::Peer("ucx-server startup channel closed".into()))??;
-        tracing::info!(%addr, "ucx peer transport listening");
-        Ok(Self {
-            shutdown: Some(shutdown_tx),
-        })
+            .map_err(|_| BcError::Peer("ucx runtime startup channel closed".into()))??;
+
+        let shared = Arc::new(RdmaRuntimeShared {
+            shutdown: Mutex::new(Some(shutdown_tx)),
+            thread: Mutex::new(Some(thread)),
+        });
+        let client = RdmaPeerClient {
+            _shared: shared.clone(),
+            cmd_tx,
+        };
+
+        tracing::info!(
+            %addr,
+            worker_addr_len = worker_addr_blob.len(),
+            "ucx peer transport ready via worker-address wireup"
+        );
+
+        Ok((Self { _shared: shared }, client, worker_addr_blob))
     }
 }
 
-impl Drop for RdmaPeerService {
-    fn drop(&mut self) {
-        if let Some(tx) = self.shutdown.take() {
-            let _ = tx.send(());
-        }
+impl RdmaPeerClient {
+    pub async fn fetch_chunk(
+        &self,
+        peer_id: &str,
+        peer_addr_blob: &[u8],
+        key: &ChunkKey,
+        length: u32,
+    ) -> Result<Bytes> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(RdmaCmd::Fetch {
+                peer_id: peer_id.to_string(),
+                peer_addr_blob: peer_addr_blob.to_vec(),
+                key: key.clone(),
+                length,
+                reply: tx,
+            })
+            .map_err(|_| BcError::Peer("ucx runtime thread gone".into()))?;
+        rx.await
+            .map_err(|_| BcError::Peer("ucx fetch reply dropped".into()))?
+    }
+
+    pub async fn health(&self, peer_id: &str, peer_addr_blob: &[u8]) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(RdmaCmd::Health {
+                peer_id: peer_id.to_string(),
+                peer_addr_blob: peer_addr_blob.to_vec(),
+                reply: tx,
+            })
+            .map_err(|_| BcError::Peer("ucx runtime thread gone".into()))?;
+        rx.await
+            .map_err(|_| BcError::Peer("ucx health reply dropped".into()))?
     }
 }
 
-async fn run_server(
+async fn run_runtime(
     cache: Arc<DiskCache>,
-    addr: SocketAddr,
     stats: Arc<crate::stats::PeerStats>,
-    started_tx: std::sync::mpsc::SyncSender<Result<()>>,
-    shutdown_rx: oneshot::Receiver<()>,
+    mut cmd_rx: mpsc::UnboundedReceiver<RdmaCmd>,
+    started_tx: std::sync::mpsc::SyncSender<Result<Vec<u8>>>,
+    mut shutdown_rx: oneshot::Receiver<()>,
 ) -> Result<()> {
     let ucx = match UcxRuntime::new() {
         Ok(ucx) => ucx,
@@ -110,94 +204,159 @@ async fn run_server(
         }
     };
 
-    let progress = spawn_progress_task(ucx.worker, ucx.async_fd.clone());
-
-    let (conn_tx, mut conn_rx) = mpsc::unbounded_channel::<ucp_conn_request_h>();
-    let conn_tx_ptr = Box::into_raw(Box::new(conn_tx));
-
-    let sockaddr = SockAddr::from(addr);
-    let mut listener: ucp_listener_h = ptr::null_mut();
-    let mut listener_params: ucp_listener_params_t = unsafe { mem::zeroed() };
-    listener_params.field_mask =
-        (ucp_listener_params_field::UCP_LISTENER_PARAM_FIELD_SOCK_ADDR.0 as u64)
-            | (ucp_listener_params_field::UCP_LISTENER_PARAM_FIELD_CONN_HANDLER.0 as u64);
-    listener_params.sockaddr = sockaddr.as_ucs_sock_addr();
-    listener_params.conn_handler.cb = Some(server_conn_handler_cb);
-    listener_params.conn_handler.arg = conn_tx_ptr.cast::<c_void>();
-    let status = unsafe { ucp_listener_create(ucx.worker, &listener_params, &mut listener) };
-    if let Err(e) = check_status("ucp_listener_create", status) {
-        progress.abort();
-        unsafe {
-            drop(Box::from_raw(conn_tx_ptr));
-        }
+    let mut worker_addr: *mut ucp_address_t = ptr::null_mut();
+    let mut worker_addr_len = 0usize;
+    let worker_addr_status =
+        unsafe { ucp_worker_get_address(ucx.worker, &mut worker_addr, &mut worker_addr_len) };
+    if let Err(e) = check_status("ucp_worker_get_address", worker_addr_status) {
         let msg = e.to_string();
-        let _ = started_tx.send(Err(BcError::Peer(msg)));
+        let _ = started_tx.send(Err(BcError::Peer(msg.clone())));
         return Err(e);
     }
 
-    let _ = started_tx.send(Ok(()));
+    let worker_addr_blob =
+        unsafe { std::slice::from_raw_parts(worker_addr.cast::<u8>(), worker_addr_len).to_vec() };
+    let progress = spawn_progress_task(ucx.worker, ucx.async_fd.clone());
+    let state = Rc::new(RefCell::new(RuntimeState::new(ucx.worker, stats.clone())));
 
-    let mut shutdown_rx = shutdown_rx;
+    if started_tx.send(Ok(worker_addr_blob.clone())).is_err() {
+        progress.abort();
+        let _ = progress.await;
+        unsafe {
+            ucp_worker_release_address(ucx.worker, worker_addr);
+        }
+        return Err(BcError::Peer("ucx runtime startup receiver dropped".into()));
+    }
+
+    let mut poll_tick = tokio::time::interval(Duration::from_millis(5));
     let result = loop {
         tokio::select! {
             _ = &mut shutdown_rx => {
-                tracing::info!("ucx server shutting down");
+                tracing::info!("ucx runtime shutting down");
                 break Ok(());
             }
-            maybe_conn = conn_rx.recv() => {
-                let Some(conn_request) = maybe_conn else {
-                    break Err(BcError::Peer("ucx conn request channel closed".into()));
+            maybe_cmd = cmd_rx.recv() => {
+                let Some(cmd) = maybe_cmd else {
+                    break Ok(());
                 };
-                let cache = cache.clone();
-                let stats = stats.clone();
-                let worker = ucx.worker;
-                tokio::task::spawn_local(async move {
-                    match accept_connection(worker, conn_request) {
-                        Ok(ep) => {
-                            if let Err(e) = serve_one(ep, cache, stats).await {
-                                tracing::debug!(error=%e, "ucx serve_one ended");
-                            }
-                        }
-                        Err(e) => tracing::warn!(error=%e, "ucx accept failed"),
-                    }
-                });
+                dispatch_cmd(state.clone(), cmd);
+            }
+            _ = poll_tick.tick() => {
+                if let Err(e) = poll_ready_endpoints(state.clone(), cache.clone(), stats.clone()) {
+                    break Err(e);
+                }
+                if let Err(e) = reap_broken_client_eps(state.clone()).await {
+                    break Err(e);
+                }
             }
         }
     };
 
     progress.abort();
     let _ = progress.await;
+    let shutdown_result = close_all_client_eps(state.clone()).await;
     unsafe {
-        ucp_listener_destroy(listener);
-        drop(Box::from_raw(conn_tx_ptr));
+        ucp_worker_release_address(ucx.worker, worker_addr);
     }
-    result
+    result.and(shutdown_result)
 }
 
-fn accept_connection(worker: ucp_worker_h, conn_request: ucp_conn_request_h) -> Result<ucp_ep_h> {
-    let mut ep: ucp_ep_h = ptr::null_mut();
-    let mut ep_params: ucp_ep_params_t = unsafe { mem::zeroed() };
-    ep_params.field_mask = (ucp_ep_params_field::UCP_EP_PARAM_FIELD_CONN_REQUEST.0 as u64)
-        | (ucp_ep_params_field::UCP_EP_PARAM_FIELD_ERR_HANDLER.0 as u64)
-        | (ucp_ep_params_field::UCP_EP_PARAM_FIELD_ERR_HANDLING_MODE.0 as u64);
-    ep_params.conn_request = conn_request;
-    ep_params.err_mode = ucp_err_handling_mode_t::UCP_ERR_HANDLING_MODE_PEER;
-    ep_params.err_handler.cb = Some(endpoint_error_cb);
-    ep_params.err_handler.arg = ptr::null_mut();
-    let status = unsafe { ucp_ep_create(worker, &ep_params, &mut ep) };
-    check_status("ucp_ep_create(server)", status)?;
-    Ok(ep)
+fn dispatch_cmd(state: SharedRuntimeState, cmd: RdmaCmd) {
+    tokio::task::spawn_local(async move {
+        match cmd {
+            RdmaCmd::Fetch {
+                peer_id,
+                peer_addr_blob,
+                key,
+                length,
+                reply,
+            } => {
+                let result =
+                    client_fetch(state.clone(), &peer_id, &peer_addr_blob, &key, length).await;
+                let _ = reply.send(result);
+            }
+            RdmaCmd::Health {
+                peer_id,
+                peer_addr_blob,
+                reply,
+            } => {
+                let result = client_health(state.clone(), &peer_id, &peer_addr_blob).await;
+                let _ = reply.send(result);
+            }
+        }
+    });
 }
 
-async fn serve_one(
-    ep: ucp_ep_h,
+fn poll_ready_endpoints(
+    state: SharedRuntimeState,
     cache: Arc<DiskCache>,
     stats: Arc<crate::stats::PeerStats>,
 ) -> Result<()> {
-    let result = serve_one_inner(ep, cache, stats).await;
-    let _ = close_ep(ep).await;
-    result
+    let worker = state.borrow().worker;
+    let mut polled_eps: [ucp_stream_poll_ep_t; MAX_POLLED_EPS] = unsafe { mem::zeroed() };
+    let ready =
+        unsafe { ucp_stream_worker_poll(worker, polled_eps.as_mut_ptr(), MAX_POLLED_EPS, 0) };
+    if ready < 0 {
+        return Err(BcError::Peer(format!(
+            "ucp_stream_worker_poll failed: {ready}"
+        )));
+    }
+
+    let mut to_serve = Vec::new();
+    {
+        let mut runtime = state.borrow_mut();
+        for polled in polled_eps.iter().take(ready as usize) {
+            if polled.ep.is_null() {
+                continue;
+            }
+            if runtime.active_server_eps.insert(polled.ep) {
+                to_serve.push(polled.ep);
+            }
+        }
+    }
+
+    for ep in to_serve {
+        let state = state.clone();
+        let cache = cache.clone();
+        let stats = stats.clone();
+        tokio::task::spawn_local(async move {
+            let result = serve_one_inner(ep, cache, stats).await;
+            if let Err(e) = &result {
+                tracing::debug!(error = %e, "ucx serve_one_inner ended");
+                let _ = close_ep_force(ep).await;
+            }
+            state.borrow_mut().active_server_eps.remove(&ep);
+        });
+    }
+
+    Ok(())
 }
+
+async fn reap_broken_client_eps(state: SharedRuntimeState) -> Result<()> {
+    let stale = state.borrow_mut().take_broken_client_eps();
+    for stale_ep in stale {
+        let _ = close_ep_force(stale_ep.ep).await;
+        release_callback_arg(stale_ep.callback_arg);
+    }
+    Ok(())
+}
+
+async fn close_all_client_eps(state: SharedRuntimeState) -> Result<()> {
+    let all = state.borrow_mut().take_all_client_eps();
+    for slot in all {
+        let _ = if slot.broken.load(Ordering::SeqCst) {
+            close_ep_force(slot.ep).await
+        } else {
+            close_ep(slot.ep).await
+        };
+        release_callback_arg(slot.callback_arg);
+    }
+    Ok(())
+}
+
+// ============================================================================
+// Server data-plane
+// ============================================================================
 
 async fn serve_one_inner(
     ep: ucp_ep_h,
@@ -284,145 +443,201 @@ async fn read_request(ep: ucp_ep_h) -> Result<ChunkKey> {
 }
 
 // ============================================================================
-// Client
+// Client data-plane + pooled endpoints
 // ============================================================================
 
-#[derive(Clone)]
-pub struct RdmaPeerClient {
-    cmd_tx: mpsc::UnboundedSender<RdmaCmd>,
+struct RuntimeState {
+    worker: ucp_worker_h,
+    peer_stats: Arc<crate::stats::PeerStats>,
+    client_pools: HashMap<String, EndpointPool>,
+    active_server_eps: HashSet<ucp_ep_h>,
+    lane_verified: bool,
 }
 
-enum RdmaCmd {
-    Fetch {
-        peer_addr: SocketAddr,
-        key: ChunkKey,
-        length: u32,
-        reply: oneshot::Sender<Result<Bytes>>,
-    },
-    Health {
-        peer_addr: SocketAddr,
-        reply: oneshot::Sender<Result<()>>,
-    },
+struct EndpointPool {
+    slots: Vec<Option<EndpointSlot>>,
+    next: AtomicUsize,
 }
 
-impl RdmaPeerClient {
-    pub fn new() -> Result<Self> {
-        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<RdmaCmd>();
-        let (started_tx, started_rx) = std::sync::mpsc::sync_channel::<Result<()>>(1);
-
-        std::thread::Builder::new()
-            .name("ucx-client".into())
-            .spawn(move || {
-                let rt = match tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                {
-                    Ok(rt) => rt,
-                    Err(e) => {
-                        let _ = started_tx.send(Err(BcError::Peer(format!("rt: {e}"))));
-                        return;
-                    }
-                };
-                let local = tokio::task::LocalSet::new();
-                local.block_on(&rt, async move {
-                    if let Err(e) = run_client(cmd_rx, started_tx).await {
-                        tracing::error!(error=%e, "ucx client thread exited");
-                    }
-                });
-            })
-            .map_err(|e| BcError::Peer(format!("ucx-client thread: {e}")))?;
-
-        started_rx
-            .recv()
-            .map_err(|_| BcError::Peer("ucx-client startup channel closed".into()))??;
-        tracing::info!("ucx peer client ready");
-        Ok(Self { cmd_tx })
-    }
-
-    pub async fn fetch_chunk(&self, peer_url: &str, key: &ChunkKey, length: u32) -> Result<Bytes> {
-        let peer_addr = parse_peer_addr(peer_url)?;
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(RdmaCmd::Fetch {
-                peer_addr,
-                key: key.clone(),
-                length,
-                reply: tx,
-            })
-            .map_err(|_| BcError::Peer("ucx client thread gone".into()))?;
-        rx.await
-            .map_err(|_| BcError::Peer("ucx fetch reply dropped".into()))?
-    }
-
-    pub async fn health(&self, peer_url: &str) -> Result<()> {
-        let peer_addr = parse_peer_addr(peer_url)?;
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(RdmaCmd::Health {
-                peer_addr,
-                reply: tx,
-            })
-            .map_err(|_| BcError::Peer("ucx client thread gone".into()))?;
-        rx.await
-            .map_err(|_| BcError::Peer("ucx health reply dropped".into()))?
-    }
+struct EndpointSlot {
+    ep: ucp_ep_h,
+    broken: Arc<AtomicBool>,
+    callback_arg: *mut Arc<AtomicBool>,
+    busy: bool,
 }
 
-fn parse_peer_addr(peer_url: &str) -> Result<SocketAddr> {
-    let s = peer_url
-        .trim_start_matches("http://")
-        .trim_start_matches("https://")
-        .trim_start_matches("rdma://")
-        .trim_end_matches('/');
-    s.parse::<SocketAddr>()
-        .map_err(|e| BcError::Peer(format!("peer addr {peer_url:?}: {e}")))
+struct CheckedOutEndpoint {
+    peer_id: String,
+    slot_idx: usize,
+    ep: ucp_ep_h,
 }
 
-async fn run_client(
-    mut rx: mpsc::UnboundedReceiver<RdmaCmd>,
-    started_tx: std::sync::mpsc::SyncSender<Result<()>>,
-) -> Result<()> {
-    let ucx = match UcxRuntime::new() {
-        Ok(ucx) => ucx,
-        Err(e) => {
-            let msg = e.to_string();
-            let _ = started_tx.send(Err(BcError::Peer(msg.clone())));
-            return Err(e);
+struct RemovedEndpoint {
+    ep: ucp_ep_h,
+    broken: Arc<AtomicBool>,
+    callback_arg: *mut Arc<AtomicBool>,
+}
+
+impl RuntimeState {
+    fn new(worker: ucp_worker_h, peer_stats: Arc<crate::stats::PeerStats>) -> Self {
+        Self {
+            worker,
+            peer_stats,
+            client_pools: HashMap::new(),
+            active_server_eps: HashSet::new(),
+            lane_verified: false,
         }
-    };
+    }
 
-    let progress = spawn_progress_task(ucx.worker, ucx.async_fd.clone());
-    let _ = started_tx.send(Ok(()));
+    fn checkout_endpoint(
+        &mut self,
+        peer_id: &str,
+        peer_addr_blob: &[u8],
+    ) -> Result<CheckedOutEndpoint> {
+        let mut verify_ep = None;
+        let mut selected = None;
+        {
+            let pool = self
+                .client_pools
+                .entry(peer_id.to_string())
+                .or_insert_with(EndpointPool::new);
+            let start = pool.next.fetch_add(1, Ordering::Relaxed) % POOL_SIZE_PER_PEER;
 
-    while let Some(cmd) = rx.recv().await {
-        let worker = ucx.worker;
-        tokio::task::spawn_local(async move {
-            match cmd {
-                RdmaCmd::Fetch {
-                    peer_addr,
-                    key,
-                    length,
-                    reply,
-                } => {
-                    let r = client_fetch(worker, peer_addr, &key, length).await;
-                    let _ = reply.send(r);
+            for offset in 0..POOL_SIZE_PER_PEER {
+                let idx = (start + offset) % POOL_SIZE_PER_PEER;
+                let slot = &mut pool.slots[idx];
+
+                let should_create = match slot {
+                    Some(existing) => existing.broken.load(Ordering::SeqCst),
+                    None => true,
+                };
+                if should_create {
+                    *slot = Some(create_pooled_ep(self.worker, peer_addr_blob)?);
+                    if verify_ep.is_none() {
+                        verify_ep = slot.as_ref().map(|created| created.ep);
+                    }
                 }
-                RdmaCmd::Health { peer_addr, reply } => {
-                    let r = client_health(worker, peer_addr).await;
-                    let _ = reply.send(r);
+
+                if let Some(existing) = slot.as_mut() {
+                    if existing.broken.load(Ordering::SeqCst) || existing.busy {
+                        continue;
+                    }
+                    existing.busy = true;
+                    selected = Some((idx, existing.ep));
+                    break;
                 }
             }
-        });
+        }
+
+        if let Some(ep) = verify_ep {
+            self.verify_lane_once(ep);
+        }
+        if let Some((slot_idx, ep)) = selected {
+            return Ok(CheckedOutEndpoint {
+                peer_id: peer_id.to_string(),
+                slot_idx,
+                ep,
+            });
+        }
+
+        Err(BcError::Peer(format!(
+            "all UCX pooled endpoints are busy for peer {peer_id}"
+        )))
     }
 
-    progress.abort();
-    let _ = progress.await;
-    Ok(())
+    fn release_endpoint(&mut self, checked_out: CheckedOutEndpoint) -> Option<RemovedEndpoint> {
+        let pool = self.client_pools.get_mut(&checked_out.peer_id)?;
+        let slot = pool.slots.get_mut(checked_out.slot_idx)?;
+        let existing = slot.as_mut()?;
+        existing.busy = false;
+        if existing.broken.load(Ordering::SeqCst) {
+            let removed = slot.take()?;
+            return Some(RemovedEndpoint {
+                ep: removed.ep,
+                broken: removed.broken,
+                callback_arg: removed.callback_arg,
+            });
+        }
+        None
+    }
+
+    fn take_broken_client_eps(&mut self) -> Vec<RemovedEndpoint> {
+        let mut removed = Vec::new();
+        for pool in self.client_pools.values_mut() {
+            for slot in &mut pool.slots {
+                let should_remove = slot
+                    .as_ref()
+                    .map(|entry| entry.broken.load(Ordering::SeqCst) && !entry.busy)
+                    .unwrap_or(false);
+                if should_remove {
+                    if let Some(entry) = slot.take() {
+                        removed.push(RemovedEndpoint {
+                            ep: entry.ep,
+                            broken: entry.broken,
+                            callback_arg: entry.callback_arg,
+                        });
+                    }
+                }
+            }
+        }
+        removed
+    }
+
+    fn take_all_client_eps(&mut self) -> Vec<RemovedEndpoint> {
+        let mut removed = Vec::new();
+        for pool in self.client_pools.values_mut() {
+            for slot in &mut pool.slots {
+                if let Some(entry) = slot.take() {
+                    removed.push(RemovedEndpoint {
+                        ep: entry.ep,
+                        broken: entry.broken,
+                        callback_arg: entry.callback_arg,
+                    });
+                }
+            }
+        }
+        removed
+    }
+
+    fn verify_lane_once(&mut self, ep: ucp_ep_h) {
+        if self.lane_verified {
+            return;
+        }
+        self.lane_verified = true;
+
+        match query_endpoint_transports(ep) {
+            Ok(summary) => {
+                let lane_summary = summary.join(", ");
+                tracing::info!(transport = %lane_summary, "ucx endpoint transport selected");
+                let lower = lane_summary.to_ascii_lowercase();
+                if !lower.contains("rc") && !lower.contains("dc") {
+                    tracing::error!(
+                        transport = %lane_summary,
+                        "ucx endpoint resolved to non-RDMA transport"
+                    );
+                    self.peer_stats.rdma_non_rdma_lane.inc();
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to query ucx endpoint transport");
+            }
+        }
+    }
+}
+
+impl EndpointPool {
+    fn new() -> Self {
+        Self {
+            slots: (0..POOL_SIZE_PER_PEER).map(|_| None).collect(),
+            next: AtomicUsize::new(0),
+        }
+    }
 }
 
 async fn client_fetch(
-    worker: ucp_worker_h,
-    peer_addr: SocketAddr,
+    state: SharedRuntimeState,
+    peer_id: &str,
+    peer_addr_blob: &[u8],
     key: &ChunkKey,
     length: u32,
 ) -> Result<Bytes> {
@@ -430,9 +645,16 @@ async fn client_fetch(
         return Err(BcError::Peer(format!("bad chunk length {length}")));
     }
 
-    let ep = connect_socket(worker, peer_addr)?;
+    let checked_out = state
+        .borrow_mut()
+        .checkout_endpoint(peer_id, peer_addr_blob)?;
+    let ep = checked_out.ep;
     let result = client_fetch_inner(ep, key, length).await;
-    let _ = close_ep(ep).await;
+    let removed = state.borrow_mut().release_endpoint(checked_out);
+    if let Some(removed) = removed {
+        let _ = close_ep_force(removed.ep).await;
+        release_callback_arg(removed.callback_arg);
+    }
     result
 }
 
@@ -461,31 +683,85 @@ async fn client_fetch_inner(ep: ucp_ep_h, key: &ChunkKey, length: u32) -> Result
     }
 }
 
-async fn client_health(worker: ucp_worker_h, peer_addr: SocketAddr) -> Result<()> {
-    let ep = connect_socket(worker, peer_addr)?;
-    let result = close_ep(ep).await;
-    match result {
-        Ok(()) => Ok(()),
-        Err(e) => Err(e),
+async fn client_health(
+    state: SharedRuntimeState,
+    peer_id: &str,
+    peer_addr_blob: &[u8],
+) -> Result<()> {
+    let checked_out = state
+        .borrow_mut()
+        .checkout_endpoint(peer_id, peer_addr_blob)?;
+    let removed = state.borrow_mut().release_endpoint(checked_out);
+    if let Some(removed) = removed {
+        let _ = close_ep_force(removed.ep).await;
+        release_callback_arg(removed.callback_arg);
+    }
+    Ok(())
+}
+
+fn create_pooled_ep(worker: ucp_worker_h, peer_addr_blob: &[u8]) -> Result<EndpointSlot> {
+    let mut ep: ucp_ep_h = ptr::null_mut();
+    let broken = Arc::new(AtomicBool::new(false));
+    let callback_arg = Box::into_raw(Box::new(broken.clone()));
+
+    let mut ep_params: ucp_ep_params_t = unsafe { mem::zeroed() };
+    ep_params.field_mask = (ucp_ep_params_field::UCP_EP_PARAM_FIELD_REMOTE_ADDRESS.0 as u64)
+        | (ucp_ep_params_field::UCP_EP_PARAM_FIELD_ERR_HANDLER.0 as u64)
+        | (ucp_ep_params_field::UCP_EP_PARAM_FIELD_ERR_HANDLING_MODE.0 as u64);
+    ep_params.address = peer_addr_blob.as_ptr().cast::<ucp_address_t>();
+    ep_params.err_mode = ucp_err_handling_mode_t::UCP_ERR_HANDLING_MODE_PEER;
+    ep_params.err_handler.cb = Some(endpoint_error_cb);
+    ep_params.err_handler.arg = callback_arg.cast::<c_void>();
+
+    let status = unsafe { ucp_ep_create(worker, &ep_params, &mut ep) };
+    if let Err(e) = check_status("ucp_ep_create(remote_address)", status) {
+        release_callback_arg(callback_arg);
+        return Err(e);
+    }
+
+    Ok(EndpointSlot {
+        ep,
+        broken,
+        callback_arg,
+        busy: false,
+    })
+}
+
+fn release_callback_arg(callback_arg: *mut Arc<AtomicBool>) {
+    if !callback_arg.is_null() {
+        unsafe {
+            drop(Box::from_raw(callback_arg));
+        }
     }
 }
 
-fn connect_socket(worker: ucp_worker_h, peer_addr: SocketAddr) -> Result<ucp_ep_h> {
-    let sockaddr = SockAddr::from(peer_addr);
-    let mut ep: ucp_ep_h = ptr::null_mut();
-    let mut ep_params: ucp_ep_params_t = unsafe { mem::zeroed() };
-    ep_params.field_mask = (ucp_ep_params_field::UCP_EP_PARAM_FIELD_FLAGS.0 as u64)
-        | (ucp_ep_params_field::UCP_EP_PARAM_FIELD_SOCK_ADDR.0 as u64)
-        | (ucp_ep_params_field::UCP_EP_PARAM_FIELD_ERR_HANDLER.0 as u64)
-        | (ucp_ep_params_field::UCP_EP_PARAM_FIELD_ERR_HANDLING_MODE.0 as u64);
-    ep_params.flags = ucp_ep_params_flags_field::UCP_EP_PARAMS_FLAGS_CLIENT_SERVER.0 as u32;
-    ep_params.sockaddr = sockaddr.as_ucs_sock_addr();
-    ep_params.err_mode = ucp_err_handling_mode_t::UCP_ERR_HANDLING_MODE_PEER;
-    ep_params.err_handler.cb = Some(endpoint_error_cb);
-    ep_params.err_handler.arg = ptr::null_mut();
-    let status = unsafe { ucp_ep_create(worker, &ep_params, &mut ep) };
-    check_status(&format!("ucp_ep_create(client {peer_addr})"), status)?;
-    Ok(ep)
+fn query_endpoint_transports(ep: ucp_ep_h) -> Result<Vec<String>> {
+    let mut entries: [ucp_transport_entry_t; TRANSPORT_QUERY_CAPACITY] = unsafe { mem::zeroed() };
+    let mut attr: ucp_ep_attr_t = unsafe { mem::zeroed() };
+    attr.field_mask = ucp_ep_attr_field::UCP_EP_ATTR_FIELD_TRANSPORTS.0 as u64;
+    attr.transports.entries = entries.as_mut_ptr();
+    attr.transports.num_entries = TRANSPORT_QUERY_CAPACITY as _;
+    attr.transports.entry_size = mem::size_of::<ucp_transport_entry_t>();
+
+    let status = unsafe { ucp_ep_query(ep, &mut attr) };
+    check_status("ucp_ep_query(transports)", status)?;
+
+    let mut out = Vec::new();
+    for entry in entries.iter().take(attr.transports.num_entries as usize) {
+        let transport = cstr_or_unknown(entry.transport_name);
+        let device = cstr_or_unknown(entry.device_name);
+        out.push(format!("{transport}/{device}"));
+    }
+    Ok(out)
+}
+
+fn cstr_or_unknown(ptr: *const c_char) -> String {
+    if ptr.is_null() {
+        return "unknown".into();
+    }
+    unsafe { CStr::from_ptr(ptr) }
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn encode_request(key: &ChunkKey, length: u32) -> Result<Vec<u8>> {
@@ -611,7 +887,7 @@ fn spawn_progress_task(
 ) -> JoinHandle<()> {
     tokio::task::spawn_local(async move {
         if let Err(e) = progress_worker(worker, async_fd).await {
-            tracing::debug!(error=%e, "ucx progress loop exited");
+            tracing::debug!(error = %e, "ucx progress loop exited");
         }
     })
 }
@@ -642,7 +918,12 @@ async fn stream_send(ep: ucp_ep_h, data: &[u8]) -> Result<()> {
     params.cb.send = Some(send_cb);
 
     let ptr = unsafe {
-        ucp_stream_send_nbx(ep, data.as_ptr().cast::<c_void>(), data.len() as u64, &params)
+        ucp_stream_send_nbx(
+            ep,
+            data.as_ptr().cast::<c_void>(),
+            data.len() as u64,
+            &params,
+        )
     };
     request_from_status_ptr("ucp_stream_send_nbx", ptr, 0).await?;
     Ok(())
@@ -667,9 +948,21 @@ async fn stream_recv(ep: ucp_ep_h, buf: &mut [MaybeUninit<u8>]) -> Result<usize>
 }
 
 async fn close_ep(ep: ucp_ep_h) -> Result<()> {
+    close_ep_with_flags(ep, 0, false).await
+}
+
+async fn close_ep_force(ep: ucp_ep_h) -> Result<()> {
+    close_ep_with_flags(ep, UCP_EP_CLOSE_FLAG_FORCE as _, true).await
+}
+
+async fn close_ep_with_flags(ep: ucp_ep_h, flags: u32, include_flags: bool) -> Result<()> {
     let mut params: ucp_request_param_t = unsafe { mem::zeroed() };
     params.op_attr_mask = ucp_op_attr_t::UCP_OP_ATTR_FIELD_CALLBACK as u32;
     params.cb.send = Some(send_cb);
+    if include_flags {
+        params.op_attr_mask |= ucp_op_attr_t::UCP_OP_ATTR_FIELD_FLAGS as u32;
+        params.flags = flags;
+    }
 
     let ptr = unsafe { ucp_ep_close_nbx(ep, &params) };
     request_from_status_ptr("ucp_ep_close_nbx", ptr, 0).await?;
@@ -840,17 +1133,11 @@ fn complete_request(request: *mut c_void, status: ucs_status_t, length: usize) {
     }
 }
 
-extern "C" fn server_conn_handler_cb(conn_request: ucp_conn_request_h, arg: *mut c_void) {
-    if arg.is_null() {
-        return;
+extern "C" fn endpoint_error_cb(arg: *mut c_void, _ep: ucp_ep_h, status: ucs_status_t) {
+    if !arg.is_null() {
+        let broken = unsafe { &*(arg.cast::<Arc<AtomicBool>>()) };
+        broken.store(true, Ordering::SeqCst);
     }
-    let sender = unsafe { &*(arg.cast::<mpsc::UnboundedSender<ucp_conn_request_h>>()) };
-    if sender.send(conn_request).is_err() {
-        tracing::debug!("ucx conn request receiver dropped");
-    }
-}
-
-extern "C" fn endpoint_error_cb(_arg: *mut c_void, _ep: ucp_ep_h, status: ucs_status_t) {
     tracing::debug!(
         status = ucx_status_name(status),
         "ucx endpoint error callback"
@@ -885,70 +1172,5 @@ struct WorkerEventFd(RawFd);
 impl AsRawFd for WorkerEventFd {
     fn as_raw_fd(&self) -> RawFd {
         self.0
-    }
-}
-
-struct SockAddr {
-    storage: libc::sockaddr_storage,
-    len: libc::socklen_t,
-}
-
-impl From<SocketAddr> for SockAddr {
-    fn from(addr: SocketAddr) -> Self {
-        match addr {
-            SocketAddr::V4(v4) => {
-                let mut storage: libc::sockaddr_storage = unsafe { mem::zeroed() };
-                let sockaddr = libc::sockaddr_in {
-                    sin_family: libc::AF_INET as libc::sa_family_t,
-                    sin_port: v4.port().to_be(),
-                    sin_addr: libc::in_addr {
-                        s_addr: u32::from_ne_bytes(v4.ip().octets()),
-                    },
-                    sin_zero: [0; 8],
-                };
-                unsafe {
-                    ptr::write(
-                        (&mut storage as *mut libc::sockaddr_storage).cast::<libc::sockaddr_in>(),
-                        sockaddr,
-                    );
-                }
-                Self {
-                    storage,
-                    len: mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
-                }
-            }
-            SocketAddr::V6(v6) => {
-                let mut storage: libc::sockaddr_storage = unsafe { mem::zeroed() };
-                let sockaddr = libc::sockaddr_in6 {
-                    sin6_family: libc::AF_INET6 as libc::sa_family_t,
-                    sin6_port: v6.port().to_be(),
-                    sin6_flowinfo: v6.flowinfo(),
-                    sin6_addr: libc::in6_addr {
-                        s6_addr: v6.ip().octets(),
-                    },
-                    sin6_scope_id: v6.scope_id(),
-                };
-                unsafe {
-                    ptr::write(
-                        (&mut storage as *mut libc::sockaddr_storage).cast::<libc::sockaddr_in6>(),
-                        sockaddr,
-                    );
-                }
-                Self {
-                    storage,
-                    len: mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
-                }
-            }
-        }
-    }
-}
-
-impl SockAddr {
-    fn as_ucs_sock_addr(&self) -> ucs_sock_addr_t {
-        ucs_sock_addr_t {
-            addr: (&self.storage as *const libc::sockaddr_storage).cast::<libc::sockaddr>()
-                as *const _,
-            addrlen: self.len as _,
-        }
     }
 }
