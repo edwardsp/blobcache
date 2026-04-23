@@ -130,10 +130,17 @@ impl BlobClient {
     ) -> Result<Response> {
         let max_attempts = self.max_retries.saturating_add(1).max(1);
         let mut attempt = 0u32;
+        let mut bearer_invalidated_once = false;
         loop {
             attempt += 1;
+            // Resolve bearer per attempt so we always use a fresh token (the
+            // BearerSource handles its own refresh-with-skew + singleflight).
+            let bearer = match &self.credential {
+                Credential::Bearer(src) => Some(src.token().await?),
+                _ => None,
+            };
             let content_length = body.as_ref().map(|b| b.len() as u64);
-            let headers = self.build_headers(&url, method.as_str(), content_type, content_length, extra_headers)?;
+            let headers = self.build_headers(&url, method.as_str(), content_type, content_length, extra_headers, bearer.as_deref())?;
             let mut req_url = url.clone();
             if let Credential::Sas { token } = &self.credential {
                 sas::append_sas_token(&mut req_url, token);
@@ -143,6 +150,17 @@ impl BlobClient {
             match req.send().await {
                 Ok(resp) => {
                     let status = resp.status();
+                    // 401 with a bearer credential: token may have rotated
+                    // server-side (key rolled) or our cached one is stale
+                    // despite our skew. Force one refresh and retry once.
+                    if status == StatusCode::UNAUTHORIZED && !bearer_invalidated_once {
+                        if let Credential::Bearer(src) = &self.credential {
+                            src.invalidate();
+                            bearer_invalidated_once = true;
+                            drop(resp);
+                            continue;
+                        }
+                    }
                     if is_retryable_status(status) && attempt < max_attempts {
                         let delay = retry_delay_ms(&resp, attempt);
                         drop(resp);
@@ -164,6 +182,7 @@ impl BlobClient {
     fn build_headers(
         &self, url: &Url, method: &str, content_type: Option<&str>,
         content_length: Option<u64>, extra: &[(&'static str, HeaderValue)],
+        bearer: Option<&str>,
     ) -> Result<HeaderMap> {
         let mut h = HeaderMap::new();
         let date = Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string();
@@ -181,8 +200,10 @@ impl BlobClient {
                 let auth = shared_key::sign_request(account, key, method, url, &h, content_length);
                 h.insert("Authorization", HeaderValue::from_str(&auth).unwrap());
             }
-            Credential::Bearer { token } => {
-                h.insert("Authorization", HeaderValue::from_str(&format!("Bearer {token}")).unwrap());
+            Credential::Bearer(_) => {
+                if let Some(t) = bearer {
+                    h.insert("Authorization", HeaderValue::from_str(&format!("Bearer {t}")).unwrap());
+                }
             }
             Credential::Sas { .. } | Credential::Anonymous => {}
         }

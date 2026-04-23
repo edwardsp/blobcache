@@ -13,11 +13,35 @@ const WORKLOAD_TOKEN_FILE: &str = "AZURE_FEDERATED_TOKEN_FILE";
 const WORKLOAD_AUTHORITY: &str = "AZURE_AUTHORITY_HOST";
 
 #[derive(Deserialize)]
-struct TokenResponse {
+struct WorkloadTokenResponse {
     access_token: String,
+    // AAD returns lifetime as seconds-from-now.
+    #[serde(default)]
+    expires_in: Option<u64>,
 }
 
-pub fn get_storage_token_workload() -> Result<Option<String>, BcError> {
+#[derive(Deserialize)]
+struct ImdsTokenResponse {
+    access_token: String,
+    // IMDS returns absolute Unix expiry as a stringified integer.
+    #[serde(default)]
+    expires_on: Option<String>,
+    #[serde(default)]
+    expires_in: Option<String>,
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+// Conservative default if the IDP omits expiry. AAD storage tokens are 24h;
+// 1h forces a refresh well before any plausible real expiry.
+const DEFAULT_TTL_SECS: u64 = 3600;
+
+pub fn get_storage_token_workload() -> Result<Option<(String, u64)>, BcError> {
     let (Ok(client_id), Ok(tenant_id), Ok(token_file)) = (
         std::env::var(WORKLOAD_CLIENT_ID),
         std::env::var(WORKLOAD_TENANT_ID),
@@ -27,6 +51,8 @@ pub fn get_storage_token_workload() -> Result<Option<String>, BcError> {
     };
     let authority = std::env::var(WORKLOAD_AUTHORITY)
         .unwrap_or_else(|_| "https://login.microsoftonline.com/".into());
+    // Re-read the federated assertion every refresh; the projected SA token
+    // file is rotated by the kubelet hourly.
     let assertion = std::fs::read_to_string(&token_file)
         .map_err(|e| BcError::Auth(format!("read federated token {token_file}: {e}")))?;
     let assertion = assertion.trim();
@@ -63,12 +89,13 @@ pub fn get_storage_token_workload() -> Result<Option<String>, BcError> {
             "workload token HTTP {status}: {body}"
         )));
     }
-    let parsed: TokenResponse = serde_json::from_str(&body)
+    let parsed: WorkloadTokenResponse = serde_json::from_str(&body)
         .map_err(|e| BcError::Auth(format!("parse: {e} body={body}")))?;
-    Ok(Some(parsed.access_token))
+    let expires_at = now_unix() + parsed.expires_in.unwrap_or(DEFAULT_TTL_SECS);
+    Ok(Some((parsed.access_token, expires_at)))
 }
 
-pub fn get_storage_token_imds() -> Result<Option<String>, BcError> {
+pub fn get_storage_token_imds() -> Result<Option<(String, u64)>, BcError> {
     let client_id = std::env::var(WORKLOAD_CLIENT_ID).ok();
     let resource_id = std::env::var("AZURE_MSI_RESOURCE_ID").ok();
     let mut url =
@@ -109,7 +136,19 @@ pub fn get_storage_token_imds() -> Result<Option<String>, BcError> {
         }
         return Err(BcError::Auth(format!("IMDS HTTP {status}: {body}")));
     }
-    let parsed: TokenResponse = serde_json::from_str(&body)
+    let parsed: ImdsTokenResponse = serde_json::from_str(&body)
         .map_err(|e| BcError::Auth(format!("parse: {e} body={body}")))?;
-    Ok(Some(parsed.access_token))
+    let expires_at = parsed
+        .expires_on
+        .as_deref()
+        .and_then(|s| s.parse::<u64>().ok())
+        .or_else(|| {
+            parsed
+                .expires_in
+                .as_deref()
+                .and_then(|s| s.parse::<u64>().ok())
+                .map(|secs| now_unix() + secs)
+        })
+        .unwrap_or_else(|| now_unix() + DEFAULT_TTL_SECS);
+    Ok(Some((parsed.access_token, expires_at)))
 }
