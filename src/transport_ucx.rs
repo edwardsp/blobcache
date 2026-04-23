@@ -43,8 +43,6 @@ const STATUS_ERR: u8 = 2;
 const MAX_RESPONSE_BYTES: u32 = 64 * 1024 * 1024;
 const MAX_POLLED_EPS: usize = 16;
 const POOL_SIZE_PER_PEER: usize = 4;
-const TRANSPORT_QUERY_CAPACITY: usize = 8;
-
 type SharedRuntimeState = Rc<RefCell<RuntimeState>>;
 
 // ============================================================================
@@ -205,7 +203,7 @@ async fn run_runtime(
     };
 
     let mut worker_addr: *mut ucp_address_t = ptr::null_mut();
-    let mut worker_addr_len = 0usize;
+    let mut worker_addr_len: u64 = 0;
     let worker_addr_status =
         unsafe { ucp_worker_get_address(ucx.worker, &mut worker_addr, &mut worker_addr_len) };
     if let Err(e) = check_status("ucp_worker_get_address", worker_addr_status) {
@@ -214,8 +212,9 @@ async fn run_runtime(
         return Err(e);
     }
 
-    let worker_addr_blob =
-        unsafe { std::slice::from_raw_parts(worker_addr.cast::<u8>(), worker_addr_len).to_vec() };
+    let worker_addr_blob = unsafe {
+        std::slice::from_raw_parts(worker_addr.cast::<u8>(), worker_addr_len as usize).to_vec()
+    };
     let progress = spawn_progress_task(ucx.worker, ucx.async_fd.clone());
     let state = Rc::new(RefCell::new(RuntimeState::new(ucx.worker, stats.clone())));
 
@@ -294,8 +293,9 @@ fn poll_ready_endpoints(
 ) -> Result<()> {
     let worker = state.borrow().worker;
     let mut polled_eps: [ucp_stream_poll_ep_t; MAX_POLLED_EPS] = unsafe { mem::zeroed() };
-    let ready =
-        unsafe { ucp_stream_worker_poll(worker, polled_eps.as_mut_ptr(), MAX_POLLED_EPS, 0) };
+    let ready = unsafe {
+        ucp_stream_worker_poll(worker, polled_eps.as_mut_ptr(), MAX_POLLED_EPS as u64, 0)
+    };
     if ready < 0 {
         return Err(BcError::Peer(format!(
             "ucp_stream_worker_poll failed: {ready}"
@@ -599,29 +599,19 @@ impl RuntimeState {
         removed
     }
 
-    fn verify_lane_once(&mut self, ep: ucp_ep_h) {
+    fn verify_lane_once(&mut self, _ep: ucp_ep_h) {
         if self.lane_verified {
             return;
         }
         self.lane_verified = true;
 
-        match query_endpoint_transports(ep) {
-            Ok(summary) => {
-                let lane_summary = summary.join(", ");
-                tracing::info!(transport = %lane_summary, "ucx endpoint transport selected");
-                let lower = lane_summary.to_ascii_lowercase();
-                if !lower.contains("rc") && !lower.contains("dc") {
-                    tracing::error!(
-                        transport = %lane_summary,
-                        "ucx endpoint resolved to non-RDMA transport"
-                    );
-                    self.peer_stats.rdma_non_rdma_lane.inc();
-                }
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to query ucx endpoint transport");
-            }
-        }
+        // UCX 1.13.1 in Debian bookworm does not expose
+        // ucp_ep_query(UCP_EP_ATTR_FIELD_TRANSPORTS), so lane verification is
+        // performed via UCX_LOG_LEVEL=info pod logs instead. Grep the UCX wireup
+        // lines at runtime to confirm RC/DC selection versus TCP fallback.
+        // Keep blobcache_rdma_non_rdma_lane_total defined for future UCX builds
+        // where programmatic endpoint-lane inspection is available.
+        tracing::info!("ucx lane verification relies on UCX_LOG_LEVEL=info pod logs on UCX 1.13.1");
     }
 }
 
@@ -733,35 +723,6 @@ fn release_callback_arg(callback_arg: *mut Arc<AtomicBool>) {
             drop(Box::from_raw(callback_arg));
         }
     }
-}
-
-fn query_endpoint_transports(ep: ucp_ep_h) -> Result<Vec<String>> {
-    let mut entries: [ucp_transport_entry_t; TRANSPORT_QUERY_CAPACITY] = unsafe { mem::zeroed() };
-    let mut attr: ucp_ep_attr_t = unsafe { mem::zeroed() };
-    attr.field_mask = ucp_ep_attr_field::UCP_EP_ATTR_FIELD_TRANSPORTS.0 as u64;
-    attr.transports.entries = entries.as_mut_ptr();
-    attr.transports.num_entries = TRANSPORT_QUERY_CAPACITY as _;
-    attr.transports.entry_size = mem::size_of::<ucp_transport_entry_t>();
-
-    let status = unsafe { ucp_ep_query(ep, &mut attr) };
-    check_status("ucp_ep_query(transports)", status)?;
-
-    let mut out = Vec::new();
-    for entry in entries.iter().take(attr.transports.num_entries as usize) {
-        let transport = cstr_or_unknown(entry.transport_name);
-        let device = cstr_or_unknown(entry.device_name);
-        out.push(format!("{transport}/{device}"));
-    }
-    Ok(out)
-}
-
-fn cstr_or_unknown(ptr: *const c_char) -> String {
-    if ptr.is_null() {
-        return "unknown".into();
-    }
-    unsafe { CStr::from_ptr(ptr) }
-        .to_string_lossy()
-        .into_owned()
 }
 
 fn encode_request(key: &ChunkKey, length: u32) -> Result<Vec<u8>> {
@@ -952,7 +913,7 @@ async fn close_ep(ep: ucp_ep_h) -> Result<()> {
 }
 
 async fn close_ep_force(ep: ucp_ep_h) -> Result<()> {
-    close_ep_with_flags(ep, UCP_EP_CLOSE_FLAG_FORCE as _, true).await
+    close_ep_with_flags(ep, ucp_ep_close_flags_t::UCP_EP_CLOSE_FLAG_FORCE.0, true).await
 }
 
 async fn close_ep_with_flags(ep: ucp_ep_h, flags: u32, include_flags: bool) -> Result<()> {

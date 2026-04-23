@@ -185,11 +185,14 @@ impl PeerClient {
 
     pub async fn fetch_chunk(
         &self,
-        _peer_id: &str,
+        #[cfg(feature = "ucx")] peer_id: &str,
+        #[cfg(not(feature = "ucx"))] _peer_id: &str,
         peer_url: &str,
-        _peer_worker_addr: Option<&[u8]>,
+        #[cfg(feature = "ucx")] peer_worker_addr: Option<&[u8]>,
+        #[cfg(not(feature = "ucx"))] _peer_worker_addr: Option<&[u8]>,
         key: &ChunkKey,
-        _length: u32,
+        #[cfg(feature = "ucx")] length: u32,
+        #[cfg(not(feature = "ucx"))] _length: u32,
     ) -> Result<Bytes> {
         match self {
             Self::Tcp(c) => c.fetch_chunk(peer_url, key).await,
@@ -206,9 +209,11 @@ impl PeerClient {
     #[allow(dead_code)]
     pub async fn health(
         &self,
-        _peer_id: &str,
+        #[cfg(feature = "ucx")] peer_id: &str,
+        #[cfg(not(feature = "ucx"))] _peer_id: &str,
         peer_url: &str,
-        _peer_worker_addr: Option<&[u8]>,
+        #[cfg(feature = "ucx")] peer_worker_addr: Option<&[u8]>,
+        #[cfg(not(feature = "ucx"))] _peer_worker_addr: Option<&[u8]>,
     ) -> Result<()> {
         match self {
             Self::Tcp(c) => c.health(peer_url).await.map(|_| ()),
