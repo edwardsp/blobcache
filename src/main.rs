@@ -48,15 +48,28 @@ fn main() -> anyhow::Result<()> {
     let stats = Stats::new();
     let cache = DiskCache::open(cfg.cache.dir.clone(), cfg.cache.max_bytes)?;
 
-    let cred = Credential::resolve(&cfg.mounts[0].account, cfg.mounts[0].sas_token.as_deref())
-        .context("resolve credentials")?;
-    tracing::info!("credential resolved: {}", match &cred {
-        Credential::SharedKey { .. } => "SharedKey",
-        Credential::Sas { .. } => "SAS",
-        Credential::Bearer { .. } => "Bearer (managed identity)",
-        Credential::Anonymous => "Anonymous",
-    });
-    let blob = Arc::new(BlobClient::new(cred)?);
+    // C4: resolve credentials per mount. Each mount may target a different
+    // account/container with its own auth (SAS for one, MSI bearer for
+    // another); a shared client would attach the wrong Authorization header.
+    let mut blobs: std::collections::HashMap<String, Arc<BlobClient>> =
+        std::collections::HashMap::new();
+    for m in &cfg.mounts {
+        let cred = Credential::resolve(&m.account, m.sas_token.as_deref())
+            .with_context(|| format!("resolve credentials for mount {}", m.name))?;
+        tracing::info!(
+            mount = %m.name,
+            account = %m.account,
+            credential = %match &cred {
+                Credential::SharedKey { .. } => "SharedKey",
+                Credential::Sas { .. } => "SAS",
+                Credential::Bearer(_) => "Bearer (managed identity)",
+                Credential::Anonymous => "Anonymous",
+            },
+            "credential resolved"
+        );
+        blobs.insert(m.name.clone(), Arc::new(BlobClient::new(cred)?));
+    }
+    let blobs = Arc::new(blobs);
 
     let cluster_hash = cfg.cluster_hash();
     let cluster_hash_hex = hex32(&cluster_hash);
@@ -112,8 +125,8 @@ fn main() -> anyhow::Result<()> {
     let membership = Membership::new(me, stats.cluster_stats.clone());
 
     let fetcher = Arc::new(Fetcher::new(
-        cache.clone(), blob.clone(), membership.clone(),
-        stats.clone(), cfg.cache.chunk_size,
+        cache.clone(), blobs.clone(), membership.clone(),
+        stats.clone(), cfg.cache.chunk_size, cfg.transport.chunk_concurrency,
     ));
 
     let peer_svc = PeerService::new(cache.clone(), cluster_hash, stats.peer_stats.clone());
@@ -149,7 +162,10 @@ fn main() -> anyhow::Result<()> {
     for mount in &cfg.mounts {
         std::fs::create_dir_all(&mount.mountpoint)
             .with_context(|| format!("create mountpoint {}", mount.mountpoint.display()))?;
-        let fs = fuse_fs::BlobFs::new(mount.clone(), blob.clone(), fetcher.clone(), handle.clone());
+        let blob = blobs.get(&mount.name)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("missing blob client for mount {}", mount.name))?;
+        let fs = fuse_fs::BlobFs::new(mount.clone(), blob, fetcher.clone(), handle.clone());
         let opts = vec![
             fuser::MountOption::FSName(format!("blobcache-{}", mount.name)),
             fuser::MountOption::Subtype("blobcache".into()),
