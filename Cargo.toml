@@ -53,10 +53,16 @@ prometheus = { version = "0.13", default-features = false }
 # Network interface enumeration (multi-NIC)
 pnet_datalink = "0.35"
 
+# UCX RDMA backend (optional). Raw ucx1-sys FFI is driven directly from a
+# dedicated single-thread runtime in src/transport_ucx.rs.
+ucx1-sys = { version = "0.1", optional = true }
+
 [features]
 default = []
-# UCX backend (requires libucx-dev installed; not enabled by default)
-ucx = []
+# UCX (RDMA over InfiniBand) peer transport.
+# Requires libucx-dev + libibverbs-dev + librdmacm-dev at build time and
+# libucx0 + libibverbs1 + librdmacm1t64 at runtime.
+ucx = ["dep:ucx1-sys"]
 
 [profile.release]
 debug = 1

@@ -110,3 +110,114 @@ deploy/storage-access.sh off
 
 `bench.sh` auto-discovers pods via `kubectl -n blobcache get pods -l
 app=blobcached`. P0 is used for cold/warm-local; P1 for warm-peer.
+
+---
+
+# v2 (UCX peer transport)
+
+Same cluster, same chunk size, same workload. Peer transport switched to
+UCX (`transport.kind = "rdma"`, `--features ucx`). Raw TSV:
+`benchmarks/results-rdma.tsv`.
+
+## Important caveat: no IPoIB on this cluster
+
+The pod IPs we use for the UCX listener are Azure CNI overlay addresses
+(`10.16.0.x`) bound to `eth0`. The IB devices are passed in via SR-IOV
+(`rdma/ib: 1`) but there is **no IPoIB plugin** on the cluster
+(`NicClusterPolicy.state-ipoib-cni: ignore`), so `eth0` is the only
+interface that has an IP, and the IB GIDs are link-local-only and not in
+a common subnet between hosts. UCX's RDMA-CM wireup requires an IP that
+maps to an RDMA device; with neither pod-side IB IP nor a route between
+the per-host IB GIDs, the IB transports (`rc_*`, `ud_*`, `dc_*`) cannot
+complete the wireup phase between two pods.
+
+We therefore restrict UCX to `tcp,sm,self` (`UCX_TLS=tcp,sm,self`,
+`UCX_NET_DEVICES=eth0`). The cross-node hop runs over UCX's TCP
+transport on `eth0` — kernel TCP, no kernel bypass, no RDMA. The win
+this delivers over v1 is bounded by what UCX-TCP can do better than
+HTTP/1.1 keep-alive, which on this network is "not much, and possibly
+worse" because each chunk request opens a fresh UCX endpoint
+(no pooling yet) and pays a full wireup round-trip.
+
+This is a deployment-environment limitation, not a daemon limitation.
+Once IPoIB (or a Multus/IPAM that exposes per-pod IB IPs) is enabled on
+the cluster, the same binary, same config, will negotiate `rc_mlx5` for
+the data path and the numbers below will be replaced by RDMA throughput.
+
+## Per-size, per-scenario throughput (UCX-TCP)
+
+| Size | Scenario | Wall (s) | Throughput (MiB/s) | blob_fetches Δ | peer_fetches Δ | cache_hits Δ |
+|---:|---|---:|---:|---:|---:|---:|
+| 1 MiB | cold | 0.254 | 3.9 | 1 | 0 | 8 |
+| 1 MiB | warm-local | 0.006 | 166.7 | 0 | 0 | 9 |
+| 1 MiB | warm-peer | 0.063 | 15.9 | 0 | 1 | 8 |
+| 4 MiB | cold | 0.076 | 52.6 | 2 | 0 | 31 |
+| 4 MiB | warm-local | 0.234 | 17.1 | 0 | 0 | 33 |
+| 4 MiB | warm-peer | 0.031 | 129.0 | 0 | 2 | 31 |
+| 16 MiB | cold | 0.417 | 38.4 | 5 | 0 | 121 |
+| 16 MiB | warm-local | 0.027 | 592.6 | 0 | 0 | 129 |
+| 16 MiB | warm-peer | 0.406 | 39.4 | 0 | 5 | 121 |
+| 64 MiB | cold | 1.020 | 62.7 | 17 | 0 | 481 |
+| 64 MiB | warm-local | 0.101 | 633.7 | 0 | 0 | 513 |
+| 64 MiB | warm-peer | 0.399 | 160.4 | 0 | 17 | 481 |
+| 256 MiB | cold | 4.042 | 63.3 | 65 | 0 | 1921 |
+| 256 MiB | warm-local | 0.559 | 458.0 | 0 | 0 | 2049 |
+| 256 MiB | warm-peer | 1.813 | 141.2 | 0 | 65 | 1921 |
+| 1024 MiB | cold | 14.955 | 68.5 | 257 | 0 | 7681 |
+| 1024 MiB | warm-local | 1.273 | 804.4 | 0 | 0 | 8193 |
+| 1024 MiB | warm-peer | 7.190 | 142.4 | 0 | 257 | 7681 |
+
+## v1 (HTTP/1.1) vs v2 (UCX-TCP) warm-peer head-to-head
+
+| Size | v1 HTTP MiB/s | v2 UCX-TCP MiB/s | Δ |
+|---:|---:|---:|---:|
+| 1 MiB | 2.4 | 15.9 | +13.5 (UCX wins on tiny single-shot) |
+| 4 MiB | 285.7 | 129.0 | −156.7 |
+| 16 MiB | 149.5 | 39.4 | −110.1 |
+| 64 MiB | 357.5 | 160.4 | −197.1 |
+| 256 MiB | 305.5 | 141.2 | −164.3 |
+| 1024 MiB | 407.5 | 142.4 | −265.1 |
+
+v2 UCX-TCP is **2–3× slower than v1 HTTP/1.1** on every multi-chunk
+read. Two effects dominate:
+
+1. **No connection pooling** — every chunk opens a fresh UCX endpoint
+   and tears it down after one request/response (~ms-class wireup vs
+   reqwest's keep-alive HTTP/1.1).
+2. **No RDMA** — without IPoIB, UCX is just kernel TCP with extra
+   wrapping. v1's `reqwest`/hyper stack is more mature on plain TCP.
+
+The 1 MiB row goes the other way only because v1 paid two `connect()`s
+in that scenario (different pod, no warmed pool yet) while v2's UCX
+listener cached the wireup faster on the second hop.
+
+The architectural value of v2 is unchanged — the FFI integration, the
+threading model, the protocol, and the `PeerClient` enum are all in
+place behind `transport.kind = "rdma"`. The cluster wiring is what
+gates the throughput. To realise the win on this hardware:
+
+- Enable IPoIB so each pod has an `ib0` IP that UCX can resolve to an
+  RDMA device, OR
+- Add an endpoint pool to `RdmaPeerClient` (one ep per peer, kept warm)
+  and re-test on UCX-TCP. Even without RDMA this should close most of
+  the gap to v1 by amortising wireup.
+
+## Singleflight stress (UCX-TCP)
+
+| Metric | Value |
+|---|---:|
+| Concurrent readers | 8 |
+| File size | 64 MiB (16 chunks) |
+| Wall (s) | 1.985 |
+| Aggregate throughput (MiB/s) | 257.9 |
+| `blob_fetches` Δ | 17 |
+| `singleflight_waits` Δ | 15 |
+
+Singleflight still collapses to ~1 GET per chunk regardless of
+transport, exactly as designed.
+
+## Default
+
+Default `transport.kind` remains `"tcp"`. Operators on clusters with
+IPoIB (or once a pool is added) flip to `"rdma"` per node — the binary
+auto-rejects mixed-kind clusters via the `cluster_hash`.

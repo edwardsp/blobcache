@@ -69,6 +69,7 @@ impl Fetcher {
     pub fn new(
         cache: Arc<DiskCache>,
         blobs: Arc<HashMap<String, Arc<BlobClient>>>,
+        peers: Arc<PeerClient>,
         membership: Membership,
         stats: Arc<Stats>,
         chunk_size: u64,
@@ -78,7 +79,7 @@ impl Fetcher {
         Self {
             cache,
             blobs,
-            peers: Arc::new(PeerClient::new()),
+            peers,
             membership,
             stats,
             chunk_size,
@@ -205,7 +206,11 @@ impl Fetcher {
         let mut shuffled = alive;
         shuffled.shuffle(&mut rand::thread_rng());
         for peer in shuffled.iter().take(3) {
-            match self.peers.fetch_chunk(&peer.transport_url, key).await {
+            match self
+                .peers
+                .fetch_chunk(&peer.transport_url, key, expected_len as u32)
+                .await
+            {
                 Ok(data) => {
                     if data.len() as u64 != expected_len {
                         // Peer served a chunk of the wrong size. Don't poison

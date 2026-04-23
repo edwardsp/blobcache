@@ -23,8 +23,16 @@ pub struct PeerService {
 }
 
 impl PeerService {
-    pub fn new(cache: Arc<DiskCache>, cluster_hash: [u8; 32], stats: Arc<crate::stats::PeerStats>) -> Self {
-        Self { cache, cluster_hash_hex: hex32(&cluster_hash), stats }
+    pub fn new(
+        cache: Arc<DiskCache>,
+        cluster_hash: [u8; 32],
+        stats: Arc<crate::stats::PeerStats>,
+    ) -> Self {
+        Self {
+            cache,
+            cluster_hash_hex: hex32(&cluster_hash),
+            stats,
+        }
     }
 
     pub async fn serve(self, addr: SocketAddr) -> Result<()> {
@@ -36,10 +44,13 @@ impl PeerService {
             tokio::spawn(async move {
                 let io = TokioIo::new(stream);
                 let res = http1::Builder::new()
-                    .serve_connection(io, service_fn(move |req| {
-                        let svc = svc.clone();
-                        async move { Ok::<_, Infallible>(svc.handle(req).await) }
-                    }))
+                    .serve_connection(
+                        io,
+                        service_fn(move |req| {
+                            let svc = svc.clone();
+                            async move { Ok::<_, Infallible>(svc.handle(req).await) }
+                        }),
+                    )
                     .await;
                 if let Err(e) = res {
                     tracing::debug!(%peer, error=%e, "peer conn closed");
@@ -66,14 +77,30 @@ impl PeerService {
 
     async fn handle_chunk(&self, req: Request<Incoming>) -> Response<Full<Bytes>> {
         let parts: Vec<&str> = req.uri().path().splitn(4, '/').collect();
-        if parts.len() < 4 { return bad_request("path"); }
-        let mount = match urlencoding_decode(parts[3]) { Some(s) => s, None => return bad_request("mount") };
-        let qs: std::collections::HashMap<_, _> = url::form_urlencoded::parse(
-            req.uri().query().unwrap_or("").as_bytes()
-        ).into_owned().collect();
-        let blob = match qs.get("blob") { Some(s) => s.clone(), None => return bad_request("blob") };
-        let offset: u64 = match qs.get("offset").and_then(|v| v.parse().ok()) { Some(v) => v, None => return bad_request("offset") };
-        let key = ChunkKey { mount, blob, offset };
+        if parts.len() < 4 {
+            return bad_request("path");
+        }
+        let mount = match urlencoding_decode(parts[3]) {
+            Some(s) => s,
+            None => return bad_request("mount"),
+        };
+        let qs: std::collections::HashMap<_, _> =
+            url::form_urlencoded::parse(req.uri().query().unwrap_or("").as_bytes())
+                .into_owned()
+                .collect();
+        let blob = match qs.get("blob") {
+            Some(s) => s.clone(),
+            None => return bad_request("blob"),
+        };
+        let offset: u64 = match qs.get("offset").and_then(|v| v.parse().ok()) {
+            Some(v) => v,
+            None => return bad_request("offset"),
+        };
+        let key = ChunkKey {
+            mount,
+            blob,
+            offset,
+        };
         match self.cache.try_get(&key) {
             Some(b) => {
                 self.stats.chunk_bytes_served.inc_by(b.len() as u64);
@@ -81,64 +108,127 @@ impl PeerService {
                     .status(StatusCode::OK)
                     .header("content-type", "application/octet-stream")
                     .header("content-length", b.len().to_string())
-                    .body(Full::new(b)).unwrap()
+                    .body(Full::new(b))
+                    .unwrap()
             }
             None => Response::builder()
                 .status(StatusCode::NOT_FOUND)
-                .body(Full::new(Bytes::from_static(b"miss"))).unwrap()
+                .body(Full::new(Bytes::from_static(b"miss")))
+                .unwrap(),
         }
     }
 }
 
-pub struct PeerClient {
+pub struct TcpPeerClient {
     http: reqwest::Client,
 }
 
-impl PeerClient {
+impl TcpPeerClient {
     pub fn new() -> Self {
         let http = reqwest::Client::builder()
             .pool_max_idle_per_host(64)
             .timeout(std::time::Duration::from_secs(30))
             .http1_only()
-            .build().expect("reqwest");
+            .build()
+            .expect("reqwest");
         Self { http }
     }
 
     pub async fn fetch_chunk(&self, peer_url: &str, key: &ChunkKey) -> Result<Bytes> {
-        let url = format!("{peer_url}/v1/chunk/{}?blob={}&offset={}",
+        let url = format!(
+            "{peer_url}/v1/chunk/{}?blob={}&offset={}",
             urlencoding_encode(&key.mount),
             urlencoding_encode(&key.blob),
-            key.offset);
+            key.offset
+        );
         let resp = self.http.get(&url).send().await?;
         let status = resp.status();
-        if status == reqwest::StatusCode::NOT_FOUND { return Err(BcError::NotFound("peer miss".into())); }
-        if !status.is_success() { return Err(BcError::Peer(format!("HTTP {status}"))); }
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Err(BcError::NotFound("peer miss".into()));
+        }
+        if !status.is_success() {
+            return Err(BcError::Peer(format!("HTTP {status}")));
+        }
         Ok(resp.bytes().await?)
     }
 
     pub async fn health(&self, peer_url: &str) -> Result<serde_json::Value> {
         let r = self.http.get(format!("{peer_url}/health")).send().await?;
-        if !r.status().is_success() { return Err(BcError::Peer(format!("health HTTP {}", r.status()))); }
+        if !r.status().is_success() {
+            return Err(BcError::Peer(format!("health HTTP {}", r.status())));
+        }
         Ok(r.json().await?)
+    }
+}
+
+// Unified client surface for the fetcher. The TCP variant always exists;
+// the Rdma variant is gated on the `ucx` feature so non-UCX builds do not
+// pull in async-ucx / libucx-dev. `length` on `fetch_chunk` is required by
+// the RDMA wire protocol (which pre-allocates a recv buffer); the TCP
+// variant ignores it (the HTTP body length is on the response).
+#[derive(Clone)]
+pub enum PeerClient {
+    Tcp(Arc<TcpPeerClient>),
+    #[cfg(feature = "ucx")]
+    Rdma(crate::transport_ucx::RdmaPeerClient),
+}
+
+impl PeerClient {
+    pub fn tcp() -> Self {
+        Self::Tcp(Arc::new(TcpPeerClient::new()))
+    }
+
+    #[cfg(feature = "ucx")]
+    pub fn rdma() -> Result<Self> {
+        Ok(Self::Rdma(crate::transport_ucx::RdmaPeerClient::new()?))
+    }
+
+    pub async fn fetch_chunk(&self, peer_url: &str, key: &ChunkKey, length: u32) -> Result<Bytes> {
+        match self {
+            Self::Tcp(c) => c.fetch_chunk(peer_url, key).await,
+            #[cfg(feature = "ucx")]
+            Self::Rdma(c) => c.fetch_chunk(peer_url, key, length).await,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub async fn health(&self, peer_url: &str) -> Result<()> {
+        match self {
+            Self::Tcp(c) => c.health(peer_url).await.map(|_| ()),
+            #[cfg(feature = "ucx")]
+            Self::Rdma(c) => c.health(peer_url).await,
+        }
     }
 }
 
 fn json_ok(v: serde_json::Value) -> Response<Full<Bytes>> {
     let body = serde_json::to_vec(&v).unwrap();
-    Response::builder().status(200).header("content-type", "application/json")
-        .body(Full::new(Bytes::from(body))).unwrap()
+    Response::builder()
+        .status(200)
+        .header("content-type", "application/json")
+        .body(Full::new(Bytes::from(body)))
+        .unwrap()
 }
 fn not_found() -> Response<Full<Bytes>> {
-    Response::builder().status(404).body(Full::new(Bytes::from_static(b"not found"))).unwrap()
+    Response::builder()
+        .status(404)
+        .body(Full::new(Bytes::from_static(b"not found")))
+        .unwrap()
 }
 fn bad_request(why: &str) -> Response<Full<Bytes>> {
-    Response::builder().status(400).body(Full::new(Bytes::from(format!("bad: {why}")))).unwrap()
+    Response::builder()
+        .status(400)
+        .body(Full::new(Bytes::from(format!("bad: {why}"))))
+        .unwrap()
 }
 
 fn hex32(b: &[u8; 32]) -> String {
     const C: &[u8; 16] = b"0123456789abcdef";
     let mut s = String::with_capacity(64);
-    for x in b { s.push(C[(x >> 4) as usize] as char); s.push(C[(x & 0xf) as usize] as char); }
+    for x in b {
+        s.push(C[(x >> 4) as usize] as char);
+        s.push(C[(x & 0xf) as usize] as char);
+    }
     s
 }
 
@@ -146,13 +236,23 @@ fn urlencoding_encode(s: &str) -> String {
     percent_encoding::utf8_percent_encode(s, percent_encoding::NON_ALPHANUMERIC).to_string()
 }
 fn urlencoding_decode(s: &str) -> Option<String> {
-    percent_encoding::percent_decode_str(s).decode_utf8().ok().map(|c| c.into_owned())
+    percent_encoding::percent_decode_str(s)
+        .decode_utf8()
+        .ok()
+        .map(|c| c.into_owned())
 }
 
-impl Default for PeerClient { fn default() -> Self { Self::new() } }
+impl Default for TcpPeerClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[allow(dead_code)]
 async fn _drain(b: Incoming) -> Result<Bytes> {
-    let body = b.collect().await.map_err(|e| BcError::Peer(e.to_string()))?;
+    let body = b
+        .collect()
+        .await
+        .map_err(|e| BcError::Peer(e.to_string()))?;
     Ok(body.to_bytes())
 }

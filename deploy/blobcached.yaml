@@ -111,9 +111,9 @@ spec:
             - |
               set -eux
               apt-get update -qq
-              apt-get install -y -qq fuse3 ca-certificates curl jq iproute2
+              apt-get install -y -qq fuse3 ca-certificates curl jq iproute2 \
+                libucx0 libibverbs1 librdmacm1t64 ucx-utils ibverbs-utils
               modprobe fuse || true
-              # Wait for binary + config to be dropped into /opt/blobcache by `kubectl cp`
               mkdir -p /mnt/nvme/blobcache-cache /mnt/nvme/blobcache-mnt
               echo "container ready; waiting for binary at /opt/blobcache/blobcached"
               while ! [ -x /opt/blobcache/blobcached ]; do sleep 5; done
@@ -126,6 +126,8 @@ spec:
             # Disambiguates the gb300 VMSS user-assigned identity that has
             # Storage Blob Data Contributor on myaccount.
             - { name: AZURE_CLIENT_ID, value: "00000000-0000-0000-0000-000000000000" }
+            - { name: UCX_NET_DEVICES, value: "mlx5_0:1" }
+            - { name: UCX_TLS, value: "rc,sm,self" }
           volumeMounts:
             - { name: nvme,    mountPath: /mnt/nvme, mountPropagation: HostToContainer }
             - { name: fuse,    mountPath: /dev/fuse }

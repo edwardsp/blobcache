@@ -14,6 +14,8 @@ mod fuse_fs;
 mod nic;
 mod stats;
 mod transport;
+#[cfg(feature = "ucx")]
+mod transport_ucx;
 
 use crate::auth::Credential;
 use crate::azure::BlobClient;
@@ -75,15 +77,17 @@ fn main() -> anyhow::Result<()> {
     let cluster_hash_hex = hex32(&cluster_hash);
     tracing::info!(cluster_hash = %cluster_hash_hex, "config hash computed");
 
-    let node_id = cfg.node_id.clone().unwrap_or_else(|| {
-        hostname().unwrap_or_else(|| format!("node-{}", std::process::id()))
-    });
+    let node_id = cfg
+        .node_id
+        .clone()
+        .unwrap_or_else(|| hostname().unwrap_or_else(|| format!("node-{}", std::process::id())));
 
     let advertise = cfg.transport.advertise.first().cloned().unwrap_or_else(|| {
         let bind = &cfg.transport.bind;
         if let Some((host, port)) = bind.rsplit_once(':') {
             if host == "0.0.0.0" || host.is_empty() {
-                let local = nic::enumerate(true).into_iter()
+                let local = nic::enumerate(true)
+                    .into_iter()
                     .filter(|a| matches!(a.ip, std::net::IpAddr::V4(_)))
                     .next();
                 match local {
@@ -93,14 +97,17 @@ fn main() -> anyhow::Result<()> {
             } else {
                 format!("http://{bind}")
             }
-        } else { format!("http://{bind}") }
+        } else {
+            format!("http://{bind}")
+        }
     });
 
     let gossip_advertise = cfg.cluster.advertise.clone().unwrap_or_else(|| {
         let bind = &cfg.cluster.bind;
         if let Some((host, port)) = bind.rsplit_once(':') {
             if host == "0.0.0.0" || host.is_empty() {
-                let local = nic::enumerate(true).into_iter()
+                let local = nic::enumerate(true)
+                    .into_iter()
                     .filter(|a| matches!(a.ip, std::net::IpAddr::V4(_)))
                     .next();
                 match local {
@@ -110,7 +117,9 @@ fn main() -> anyhow::Result<()> {
             } else {
                 format!("http://{bind}")
             }
-        } else { format!("http://{bind}") }
+        } else {
+            format!("http://{bind}")
+        }
     });
 
     let me = NodeInfo {
@@ -118,33 +127,87 @@ fn main() -> anyhow::Result<()> {
         transport_url: advertise.clone(),
         gossip_url: gossip_advertise.clone(),
         cluster_hash: cluster_hash_hex.clone(),
-        last_seen_unix: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+        last_seen_unix: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
         state: NodeState::Alive,
         incarnation: 1,
     };
     let membership = Membership::new(me, stats.cluster_stats.clone());
 
-    let fetcher = Arc::new(Fetcher::new(
-        cache.clone(), blobs.clone(), membership.clone(),
-        stats.clone(), cfg.cache.chunk_size, cfg.transport.chunk_concurrency,
-    ));
-
-    let peer_svc = PeerService::new(cache.clone(), cluster_hash, stats.peer_stats.clone());
-    let transport_addr: std::net::SocketAddr = cfg.transport.bind.parse()
-        .context(format!("parse transport.bind {}", cfg.transport.bind))?;
-    let cluster_addr: std::net::SocketAddr = cfg.cluster.bind.parse()
-        .context(format!("parse cluster.bind {}", cfg.cluster.bind))?;
-    let stats_addr: std::net::SocketAddr = cfg.stats.bind.parse()
-        .context(format!("parse stats.bind {}", cfg.stats.bind))?;
-
-    rt.spawn({
-        let svc = peer_svc.clone();
-        async move {
-            if let Err(e) = svc.serve(transport_addr).await {
-                tracing::error!(error = %e, "peer transport server died");
+    let peers: Arc<crate::transport::PeerClient> = match cfg.transport.kind.as_str() {
+        "tcp" => Arc::new(crate::transport::PeerClient::tcp()),
+        "rdma" => {
+            #[cfg(feature = "ucx")]
+            {
+                Arc::new(crate::transport::PeerClient::rdma().context("init RDMA peer client")?)
+            }
+            #[cfg(not(feature = "ucx"))]
+            {
+                anyhow::bail!("transport.kind=\"rdma\" requires --features ucx at build time");
             }
         }
-    });
+        other => anyhow::bail!("unknown transport.kind {other:?}"),
+    };
+    tracing::info!(kind = %cfg.transport.kind, "peer transport client initialised");
+
+    let fetcher = Arc::new(Fetcher::new(
+        cache.clone(),
+        blobs.clone(),
+        peers.clone(),
+        membership.clone(),
+        stats.clone(),
+        cfg.cache.chunk_size,
+        cfg.transport.chunk_concurrency,
+    ));
+
+    let transport_addr: std::net::SocketAddr = cfg
+        .transport
+        .bind
+        .parse()
+        .context(format!("parse transport.bind {}", cfg.transport.bind))?;
+    let cluster_addr: std::net::SocketAddr = cfg
+        .cluster
+        .bind
+        .parse()
+        .context(format!("parse cluster.bind {}", cfg.cluster.bind))?;
+    let stats_addr: std::net::SocketAddr = cfg
+        .stats
+        .bind
+        .parse()
+        .context(format!("parse stats.bind {}", cfg.stats.bind))?;
+
+    match cfg.transport.kind.as_str() {
+        "tcp" => {
+            let peer_svc = PeerService::new(cache.clone(), cluster_hash, stats.peer_stats.clone());
+            rt.spawn({
+                let svc = peer_svc.clone();
+                async move {
+                    if let Err(e) = svc.serve(transport_addr).await {
+                        tracing::error!(error = %e, "peer transport server died");
+                    }
+                }
+            });
+        }
+        "rdma" => {
+            #[cfg(feature = "ucx")]
+            {
+                let _rdma_svc = crate::transport_ucx::RdmaPeerService::start(
+                    cache.clone(),
+                    transport_addr,
+                    stats.peer_stats.clone(),
+                )
+                .context("start RDMA peer service")?;
+                std::mem::forget(_rdma_svc);
+            }
+            #[cfg(not(feature = "ucx"))]
+            {
+                anyhow::bail!("transport.kind=\"rdma\" requires --features ucx at build time");
+            }
+        }
+        _ => unreachable!(),
+    }
     rt.spawn({
         let m = membership.clone();
         let s = cluster::GossipServer::new(m);
@@ -154,15 +217,24 @@ fn main() -> anyhow::Result<()> {
             }
         }
     });
-    rt.spawn(cluster::run_gossip_loop(membership.clone(), cfg.cluster.seeds.clone()));
-    rt.spawn(stats::serve(stats.clone(), stats_addr, cache.clone(), membership.clone()));
+    rt.spawn(cluster::run_gossip_loop(
+        membership.clone(),
+        cfg.cluster.seeds.clone(),
+    ));
+    rt.spawn(stats::serve(
+        stats.clone(),
+        stats_addr,
+        cache.clone(),
+        membership.clone(),
+    ));
 
     let handle = rt.handle().clone();
     let mut sessions = Vec::new();
     for mount in &cfg.mounts {
         std::fs::create_dir_all(&mount.mountpoint)
             .with_context(|| format!("create mountpoint {}", mount.mountpoint.display()))?;
-        let blob = blobs.get(&mount.name)
+        let blob = blobs
+            .get(&mount.name)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("missing blob client for mount {}", mount.name))?;
         let fs = fuse_fs::BlobFs::new(mount.clone(), blob, fetcher.clone(), handle.clone());
@@ -187,8 +259,10 @@ fn main() -> anyhow::Result<()> {
 }
 
 async fn wait_signal() {
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("sigterm");
-    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).expect("sigint");
+    let mut sigterm =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("sigterm");
+    let mut sigint =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).expect("sigint");
     tokio::select! { _ = sigterm.recv() => {}, _ = sigint.recv() => {} }
 }
 
@@ -199,12 +273,18 @@ fn init_tracing(level: &str) {
 }
 
 fn hostname() -> Option<String> {
-    std::fs::read_to_string("/etc/hostname").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    std::fs::read_to_string("/etc/hostname")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 fn hex32(b: &[u8; 32]) -> String {
     const C: &[u8; 16] = b"0123456789abcdef";
     let mut s = String::with_capacity(64);
-    for x in b { s.push(C[(x >> 4) as usize] as char); s.push(C[(x & 0xf) as usize] as char); }
+    for x in b {
+        s.push(C[(x >> 4) as usize] as char);
+        s.push(C[(x & 0xf) as usize] as char);
+    }
     s
 }

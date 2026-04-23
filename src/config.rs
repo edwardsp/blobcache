@@ -47,12 +47,17 @@ pub struct TransportConfig {
     pub chunk_concurrency: usize,
     #[serde(default = "default_peer_concurrency")]
     pub peer_concurrency: usize,
+    #[serde(default = "default_transport_kind")]
+    pub kind: String,
 }
 fn default_chunk_concurrency() -> usize {
     32
 }
 fn default_peer_concurrency() -> usize {
     8
+}
+fn default_transport_kind() -> String {
+    "tcp".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,12 +103,20 @@ impl Config {
                 )));
             }
         }
+        if !["tcp", "rdma"].contains(&self.transport.kind.as_str()) {
+            return Err(BcError::Config(format!(
+                "transport.kind must be \"tcp\" or \"rdma\", got {:?}",
+                self.transport.kind
+            )));
+        }
         Ok(())
     }
 
     pub fn cluster_hash(&self) -> [u8; 32] {
         let mut h = Sha256::new();
         h.update(self.cache.chunk_size.to_le_bytes());
+        h.update(self.transport.kind.as_bytes());
+        h.update(b"\0");
         let mut mounts = self.mounts.clone();
         mounts.sort_by(|a, b| a.name.cmp(&b.name));
         for m in &mounts {
