@@ -5,9 +5,19 @@ Distributed FUSE-mounted Azure Blob cache for high-throughput AI/HPC clusters.
 Each node mounts one or more blob containers as read-only filesystems. Reads
 miss into a local NVMe-backed chunk cache; on miss the daemon first asks
 peer nodes (discovered via gossip) for the chunk, falling back to Azure Blob
-only if no peer has it. Designed for GB300-class nodes with InfiniBand
-HCAs (currently transports over TCP; the IB devices are passed into the pod
-so an RDMA/UCX backend can be wired in without changing the deployment).
+only if no peer has it. Designed for GB300-class nodes with InfiniBand HCAs.
+
+Two peer transports ship in-tree:
+
+- **`tcp`** (default, v1) — HTTP/1.1 over `eth0`, keep-alive pooled, the
+  baseline that the benchmarks below measure against.
+- **`rdma`** (v2, `--features ucx`) — UCX peer transport via raw
+  `ucx1-sys` FFI. The IB devices are passed into the pod (`rdma/ib: 1`)
+  and the wire protocol is selected by `transport.kind`. **Note**: on
+  this AKS cluster there is no IPoIB, so UCX falls back to its TCP
+  transport on `eth0` and the v2 numbers are currently *worse* than v1
+  (no kernel bypass + per-chunk wireup). See [BENCHMARKS.md](BENCHMARKS.md)
+  for the full v1-vs-v2 comparison and what's needed to realise RDMA.
 
 ## Architecture
 
@@ -44,12 +54,13 @@ so an RDMA/UCX backend can be wired in without changing the deployment).
 | Port | Purpose |
 |------|---------|
 | 7771 | Gossip (HTTP push-pull membership + cluster-hash check) |
-| 7772 | Peer chunk transport (HTTP GET `/v1/chunk/{mount}?blob=…&offset=…`) |
+| 7772 | Peer chunk transport (`tcp`: HTTP GET `/v1/chunk/{mount}?blob=…&offset=…` ; `rdma`: UCX stream framed `ChunkRequest`/`ChunkResponse`) |
 | 7773 | Stats: `/metrics` (Prometheus), `/stats` (JSON), `/peers` (JSON) |
 
-All three speak HTTP/1.1 today. The peer transport is behind a `Transport`
-trait shape so an RDMA/UCX backend can be added later without touching FUSE
-or fetcher code.
+Gossip and stats are HTTP/1.1. The peer transport (port 7772) is selected
+by `transport.kind`; both implementations live behind a `PeerClient` enum
+so FUSE / fetcher / cache code is transport-agnostic. `cluster_hash`
+includes the transport kind, so mixed-kind nodes refuse to merge.
 
 ## Build
 
@@ -57,8 +68,13 @@ Native (Linux x86_64 or aarch64):
 
 ```sh
 sudo apt-get install -y libfuse3-dev pkg-config
-cargo build --release
+cargo build --release                       # tcp-only (default)
+cargo build --release --features ucx        # adds the rdma/UCX peer transport
 ```
+
+The `ucx` feature requires UCX 1.16+ runtime (`libucx0`, `libibverbs1`,
+`librdmacm1t64`) on the target host; `deploy/blobcached.yaml` apt-installs
+them in the init container.
 
 Cross-build for cluster: see `Deploy → cross-compile note` below.
 
@@ -80,6 +96,7 @@ seeds = ["http://10.0.0.5:7771"]
 advertise = "http://10.0.0.6:7771"
 
 [transport]
+kind = "tcp"                  # "tcp" (default, HTTP/1.1) or "rdma" (UCX, requires --features ucx)
 bind = "0.0.0.0:7772"
 advertise = ["http://10.0.0.6:7772"]
 chunk_concurrency = 32
@@ -229,7 +246,8 @@ src/
   azure.rs          # BlobClient: HEAD, ranged GET, list (with retry)
   cache.rs          # DiskCache: sha256-named flat dir, BTreeMap LRU
   cluster.rs        # Membership + GossipServer + push-pull loop
-  transport.rs      # PeerService + PeerClient (HTTP/1.1)
+  transport.rs      # PeerService + PeerClient enum (TCP / UCX), framed protocol
+  transport_ucx.rs  # raw ucx1-sys FFI: listener, endpoint, stream send/recv (feature = "ucx")
   fetcher.rs        # cache → 3 random peers → blob; parallel chunk fan-out
   fuse_fs.rs        # BlobFs: lookup/getattr/readdir/read; on-demand listing
   nic.rs            # multi-NIC enumeration (IB heuristic)
@@ -245,12 +263,15 @@ examples/
 
 - **Read-only**. Writes are not implemented; the FUSE handler returns
   `EROFS`-style errors on write-open paths.
-- **TCP-only transport** v1. The pod spec already requests `rdma/ib: 1`
-  and `/dev/infiniband/uverbs*` is exposed inside the container; an RDMA
-  backend can be slotted behind the existing `PeerClient` shape without
-  touching FUSE / fetcher / cache code.
-- **No Multus / IPoIB** on this cluster (NicClusterPolicy reports
-  `state-ipoib-cni: ignore`); a future RDMA backend would use the raw
-  verbs / RDMA-CM devices, not an IB IP.
+- **RDMA not realised on this AKS cluster**. The v2 UCX backend is
+  feature-complete (`--features ucx`, `transport.kind = "rdma"`) and
+  passes traffic, but the cluster has **no IPoIB plugin**
+  (`NicClusterPolicy.state-ipoib-cni: ignore`) so pod IPs are Azure CNI
+  overlay (`eth0`) only. UCX falls back to its TCP transport, which
+  combined with the current per-chunk endpoint wireup is **2–3× slower
+  than v1 HTTP/1.1**. Default stays `kind = "tcp"`. To get the RDMA win:
+  enable IPoIB so each pod has an `ib0` IP that UCX can map to an RDMA
+  device, **or** add an endpoint pool to `RdmaPeerClient`. Detail and
+  numbers in [BENCHMARKS.md](BENCHMARKS.md#v2-ucx-peer-transport).
 - **Failure detection is coarse** (30 s heartbeat timeout to Suspect; no
   separate Suspect→Dead transition). Adequate for a ~20-node cluster.
