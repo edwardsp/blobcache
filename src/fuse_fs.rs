@@ -1,7 +1,7 @@
 use dashmap::DashMap;
 use fuser::{FileAttr, FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, Request};
 use libc::{ENOENT, ENOTDIR, EIO};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -15,6 +15,11 @@ use crate::fetcher::Fetcher;
 
 const TTL: Duration = Duration::from_secs(30);
 const ROOT_INO: u64 = 1;
+// Hard cap on tracked children per directory. A blob container with millions
+// of objects at one prefix would otherwise pin O(N) heap. Above the cap we
+// stop accepting new entries from listings; direct lookup() (HEAD) still works
+// for callers that know the exact path.
+const MAX_CHILDREN_PER_DIR: usize = 100_000;
 
 #[derive(Clone, Debug)]
 struct Node {
@@ -45,7 +50,7 @@ pub struct BlobFs {
     inner: Arc<RwLock<Inner>>,
     rt: Handle,
     listing_cache_ttl: Duration,
-    last_listing: DashMap<u64, std::time::Instant>,
+    last_listing: Arc<DashMap<u64, std::time::Instant>>,
     fuse_reads: Arc<AtomicU64>,
     fuse_read_bytes: Arc<AtomicU64>,
 }
@@ -68,7 +73,7 @@ impl BlobFs {
             inner: Arc::new(RwLock::new(Inner { by_ino, by_parent_name, children, next_ino: 2 })),
             rt,
             listing_cache_ttl: Duration::from_secs(30),
-            last_listing: DashMap::new(),
+            last_listing: Arc::new(DashMap::new()),
             fuse_reads: Arc::new(AtomicU64::new(0)),
             fuse_read_bytes: Arc::new(AtomicU64::new(0)),
         }
@@ -119,16 +124,61 @@ impl BlobFs {
 
         let mut g = self.inner.write().await;
         let strip = prefix.clone();
+        // Track which child names were observed in this listing, then evict
+        // any previously-tracked child not present (the blob was deleted or
+        // a directory marker is gone). Without this the FS keeps stale
+        // entries forever and readdir lies about existing files.
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut over_cap_logged = false;
         for p in prefixes {
             let rel = p.strip_prefix(&strip).unwrap_or(&p).trim_end_matches('/').to_string();
             if rel.is_empty() { continue; }
+            let cur = g.children.get(&ino).map(|v| v.len()).unwrap_or(0);
+            if cur >= MAX_CHILDREN_PER_DIR && !g.by_parent_name.contains_key(&(ino, rel.clone())) {
+                if !over_cap_logged {
+                    tracing::warn!(parent=ino, cap=MAX_CHILDREN_PER_DIR, "directory child cap reached; further entries dropped from listing");
+                    over_cap_logged = true;
+                }
+                continue;
+            }
+            seen.insert(rel.clone());
             self.upsert_dir(&mut g, ino, &rel, &p);
         }
         for b in blobs {
             let rel = b.name.strip_prefix(&strip).unwrap_or(&b.name).to_string();
             if rel.is_empty() || rel.contains('/') { continue; }
+            let cur = g.children.get(&ino).map(|v| v.len()).unwrap_or(0);
+            if cur >= MAX_CHILDREN_PER_DIR && !g.by_parent_name.contains_key(&(ino, rel.clone())) {
+                if !over_cap_logged {
+                    tracing::warn!(parent=ino, cap=MAX_CHILDREN_PER_DIR, "directory child cap reached; further entries dropped from listing");
+                    over_cap_logged = true;
+                }
+                continue;
+            }
+            seen.insert(rel.clone());
             let mtime = SystemTime::now();
             self.upsert_file(&mut g, ino, &rel, &b.name, b.content_length, b.etag, mtime);
+        }
+        // Delta-delete: anything tracked under this parent that wasn't in the
+        // current listing is gone from origin.
+        let to_remove: Vec<(String, u64)> = g
+            .children
+            .get(&ino)
+            .map(|kids| {
+                kids.iter()
+                    .filter_map(|k| g.by_ino.get(k).map(|n| (n.name.clone(), *k)))
+                    .filter(|(name, _)| !seen.contains(name))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for (name, child_ino) in to_remove {
+            g.by_parent_name.remove(&(ino, name));
+            if let Some(kids) = g.children.get_mut(&ino) {
+                kids.retain(|k| *k != child_ino);
+            }
+            // Leave by_ino entry; in-flight handles may still reference the
+            // ino. New lookups will miss via by_parent_name.
+            g.children.remove(&child_ino);
         }
         if let Some(n) = g.by_ino.get_mut(&ino) {
             if let NodeKind::Dir { children_loaded } = &mut n.kind { *children_loaded = true; }
@@ -295,7 +345,7 @@ impl BlobFs {
             inner: self.inner.clone(),
             rt: self.rt.clone(),
             listing_cache_ttl: self.listing_cache_ttl,
-            last_listing: DashMap::new(),
+            last_listing: self.last_listing.clone(),
             fuse_reads: self.fuse_reads.clone(),
             fuse_read_bytes: self.fuse_read_bytes.clone(),
         })
