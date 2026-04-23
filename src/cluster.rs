@@ -13,11 +13,19 @@ const HEARTBEAT_TIMEOUT_SECS: u64 = 30;
 const GOSSIP_INTERVAL_MS: u64 = 1500;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub enum NodeState { Alive, Suspect, Dead }
+pub enum NodeState {
+    Alive,
+    Suspect,
+    Dead,
+}
 
 impl NodeState {
     fn rank(&self) -> u8 {
-        match self { NodeState::Alive => 0, NodeState::Suspect => 1, NodeState::Dead => 2 }
+        match self {
+            NodeState::Alive => 0,
+            NodeState::Suspect => 1,
+            NodeState::Dead => 2,
+        }
     }
 }
 
@@ -75,11 +83,15 @@ impl Membership {
 
     pub fn members_alive(&self) -> Vec<NodeInfo> {
         let g = self.inner.read();
-        g.members.values()
-            .filter(|n| n.state == NodeState::Alive
-                     && n.id != self.me_id
-                     && n.cluster_hash == self.me_template.cluster_hash)
-            .cloned().collect()
+        g.members
+            .values()
+            .filter(|n| {
+                n.state == NodeState::Alive
+                    && n.id != self.me_id
+                    && n.cluster_hash == self.me_template.cluster_hash
+            })
+            .cloned()
+            .collect()
     }
 
     pub fn members_all(&self) -> Vec<NodeInfo> {
@@ -100,7 +112,11 @@ impl Membership {
                 if n.incarnation > our_inc || (n.incarnation == our_inc && claims_we_are_down) {
                     let new_inc = n.incarnation.max(our_inc) + 1;
                     self.me_incarnation.store(new_inc, Ordering::Relaxed);
-                    tracing::info!(peer_inc = n.incarnation, new_inc, "refuting suspicion; bumped incarnation");
+                    tracing::info!(
+                        peer_inc = n.incarnation,
+                        new_inc,
+                        "refuting suspicion; bumped incarnation"
+                    );
                 }
                 let mut me = self.me_template.clone();
                 me.incarnation = self.me_incarnation.load(Ordering::Relaxed);
@@ -150,14 +166,22 @@ impl Membership {
         let now = unix_now();
         let mut g = self.inner.write();
         for (id, n) in g.members.iter_mut() {
-            if id == &self.me_id { continue; }
+            if id == &self.me_id {
+                continue;
+            }
             let age = now.saturating_sub(n.last_seen_unix);
-            let new_state = if age > HEARTBEAT_TIMEOUT_SECS * 2 { NodeState::Dead }
-                            else if age > HEARTBEAT_TIMEOUT_SECS { NodeState::Suspect }
-                            else { NodeState::Alive };
+            let new_state = if age > HEARTBEAT_TIMEOUT_SECS * 2 {
+                NodeState::Dead
+            } else if age > HEARTBEAT_TIMEOUT_SECS {
+                NodeState::Suspect
+            } else {
+                NodeState::Alive
+            };
             if new_state != n.state {
-                tracing::info!(id, ?new_state, age_secs=age, "state change");
-                if matches!(new_state, NodeState::Dead) { self.stats.failures.inc(); }
+                tracing::info!(id, ?new_state, age_secs = age, "state change");
+                if matches!(new_state, NodeState::Dead) {
+                    self.stats.failures.inc();
+                }
                 n.state = new_state;
             }
         }
@@ -165,7 +189,10 @@ impl Membership {
 }
 
 fn unix_now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 pub struct GossipServer {
@@ -173,7 +200,9 @@ pub struct GossipServer {
 }
 
 impl GossipServer {
-    pub fn new(membership: Membership) -> Self { Self { membership } }
+    pub fn new(membership: Membership) -> Self {
+        Self { membership }
+    }
 
     pub async fn serve(self, addr: SocketAddr) -> Result<()> {
         use http_body_util::{BodyExt, Full};
@@ -182,8 +211,8 @@ impl GossipServer {
         use hyper::service::service_fn;
         use hyper::{Method, Request, Response};
         use hyper_util::rt::TokioIo;
-        use tokio::net::TcpListener;
         use std::convert::Infallible;
+        use tokio::net::TcpListener;
 
         let listener = TcpListener::bind(addr).await?;
         tracing::info!(%addr, "cluster gossip listening");
@@ -245,7 +274,8 @@ const MAX_GOSSIP_BODY_BYTES: usize = 1024 * 1024;
 pub async fn run_gossip_loop(membership: Membership, seeds: Vec<String>) {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
-        .build().expect("client");
+        .build()
+        .expect("client");
     let mut interval = tokio::time::interval(Duration::from_millis(GOSSIP_INTERVAL_MS));
     let me_id = membership.me_id.clone();
 
@@ -264,7 +294,9 @@ pub async fn run_gossip_loop(membership: Membership, seeds: Vec<String>) {
         let target = if alive.is_empty() {
             seeds.choose(&mut rand::thread_rng()).cloned()
         } else {
-            alive.choose(&mut rand::thread_rng()).map(|n| n.gossip_url.clone())
+            alive
+                .choose(&mut rand::thread_rng())
+                .map(|n| n.gossip_url.clone())
         };
         if let Some(url) = target {
             if let Err(e) = gossip_with(&client, &membership, &url).await {
@@ -290,7 +322,10 @@ async fn gossip_with(client: &reqwest::Client, m: &Membership, peer_url: &str) -
         .map_err(|e| BcError::Cluster(format!("decode reply: {e}")))?;
     if reply.from.cluster_hash != m.me_template.cluster_hash {
         m.stats.config_mismatches.inc();
-        return Err(BcError::Cluster(format!("reply cluster_hash mismatch from {}", reply.from.id)));
+        return Err(BcError::Cluster(format!(
+            "reply cluster_hash mismatch from {}",
+            reply.from.id
+        )));
     }
     let from_id = reply.from.id.clone();
     let mut all = reply.members;

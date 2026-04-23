@@ -124,16 +124,23 @@ impl Credential {
 
     pub fn resolve(account_name: &str, sas_token: Option<&str>) -> Result<Self> {
         if let Some(sas) = sas_token {
-            return Ok(Credential::Sas { token: sas.to_string() });
+            return Ok(Credential::Sas {
+                token: sas.to_string(),
+            });
         }
-        if let Some(c) = Self::from_env()? { return Ok(c); }
+        if let Some(c) = Self::from_env()? {
+            return Ok(c);
+        }
 
         let mut guard = ambient_cache().lock().expect("ambient cred mutex poisoned");
-        if let Some(c) = guard.as_ref() { return Ok(c.clone()); }
+        if let Some(c) = guard.as_ref() {
+            return Ok(c.clone());
+        }
 
         match imds::get_storage_token_workload() {
             Ok(Some(initial)) => {
-                let c = Credential::Bearer(Arc::new(BearerSource::new(BearerKind::Workload, initial)));
+                let c =
+                    Credential::Bearer(Arc::new(BearerSource::new(BearerKind::Workload, initial)));
                 *guard = Some(c.clone());
                 return Ok(c);
             }
