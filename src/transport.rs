@@ -65,8 +65,8 @@ impl PeerService {
     }
 
     async fn handle_chunk(&self, req: Request<Incoming>) -> Response<Full<Bytes>> {
-        let parts: Vec<&str> = req.uri().path().splitn(5, '/').collect();
-        if parts.len() != 5 { return bad_request("path"); }
+        let parts: Vec<&str> = req.uri().path().splitn(4, '/').collect();
+        if parts.len() < 4 { return bad_request("path"); }
         let mount = match urlencoding_decode(parts[3]) { Some(s) => s, None => return bad_request("mount") };
         let qs: std::collections::HashMap<_, _> = url::form_urlencoded::parse(
             req.uri().query().unwrap_or("").as_bytes()

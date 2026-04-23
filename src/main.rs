@@ -83,9 +83,27 @@ fn main() -> anyhow::Result<()> {
         } else { format!("http://{bind}") }
     });
 
+    let gossip_advertise = cfg.cluster.advertise.clone().unwrap_or_else(|| {
+        let bind = &cfg.cluster.bind;
+        if let Some((host, port)) = bind.rsplit_once(':') {
+            if host == "0.0.0.0" || host.is_empty() {
+                let local = nic::enumerate(true).into_iter()
+                    .filter(|a| matches!(a.ip, std::net::IpAddr::V4(_)))
+                    .next();
+                match local {
+                    Some(a) => format!("http://{}:{}", a.ip, port),
+                    None => format!("http://127.0.0.1:{port}"),
+                }
+            } else {
+                format!("http://{bind}")
+            }
+        } else { format!("http://{bind}") }
+    });
+
     let me = NodeInfo {
         id: node_id.clone(),
         transport_url: advertise.clone(),
+        gossip_url: gossip_advertise.clone(),
         cluster_hash: cluster_hash_hex.clone(),
         last_seen_unix: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
         state: NodeState::Alive,

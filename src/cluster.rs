@@ -18,6 +18,7 @@ pub enum NodeState { Alive, Suspect, Dead }
 pub struct NodeInfo {
     pub id: String,
     pub transport_url: String,
+    pub gossip_url: String,
     pub cluster_hash: String,
     pub last_seen_unix: u64,
     pub state: NodeState,
@@ -209,7 +210,7 @@ pub async fn run_gossip_loop(membership: Membership, seeds: Vec<String>) {
         let target = if alive.is_empty() {
             seeds.choose(&mut rand::thread_rng()).cloned()
         } else {
-            alive.choose(&mut rand::thread_rng()).map(|n| n.transport_url.clone())
+            alive.choose(&mut rand::thread_rng()).map(|n| n.gossip_url.clone())
         };
         if let Some(url) = target {
             if let Err(e) = gossip_with(&client, &membership, &url).await {

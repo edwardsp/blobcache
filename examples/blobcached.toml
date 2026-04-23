@@ -1,0 +1,25 @@
+node_id = "node-local"
+
+[cache]
+dir = "/tmp/blobcache-cache"
+max_bytes = 1073741824        # 1 GiB
+chunk_size = 4194304          # 4 MiB
+
+[cluster]
+bind = "0.0.0.0:7771"
+seeds = []
+
+[transport]
+bind = "0.0.0.0:7772"
+chunk_concurrency = 32
+peer_concurrency = 8
+
+[stats]
+bind = "0.0.0.0:7773"
+
+[[mounts]]
+name = "models"
+mountpoint = "/tmp/blobcache-mnt/models"
+account = "myaccount"
+container = "models"
+prefix = ""
