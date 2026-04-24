@@ -151,15 +151,70 @@ impl DiskCache {
                 return None;
             }
         };
+        if !self.touch_lru(key) {
+            return None;
+        }
+        self.stats.hits.fetch_add(1, Ordering::Relaxed);
+        Some(Bytes::from(data))
+    }
+
+    /// Read only `[range_offset, range_offset + range_len)` from the cached
+    /// chunk. Returns None on miss. Avoids reading the entire chunk into
+    /// memory when the FUSE caller only needs a sub-slice (the common case
+    /// when kernel splits a 4 MiB read into 32 x 128 KiB FUSE requests).
+    pub fn try_get_range(
+        self: &Arc<Self>,
+        key: &ChunkKey,
+        range_offset: u64,
+        range_len: u64,
+    ) -> Option<Bytes> {
+        use std::os::unix::fs::FileExt;
+        if range_len == 0 {
+            return Some(Bytes::new());
+        }
+        let entry_size = {
+            let g = self.inner.lock();
+            match g.entries.get(key) {
+                Some(e) => e.size,
+                None => {
+                    self.stats.misses.fetch_add(1, Ordering::Relaxed);
+                    return None;
+                }
+            }
+        };
+        if range_offset.saturating_add(range_len) > entry_size {
+            // Caller asked beyond the chunk. Treat as miss so the caller can
+            // re-fetch a fresh full chunk; cached one is wrong size.
+            self.stats.misses.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        let path = self.path_for(key);
+        let f = match std::fs::File::open(&path) {
+            Ok(f) => f,
+            Err(_) => {
+                self.stats.misses.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+        };
+        let mut buf = vec![0u8; range_len as usize];
+        if let Err(_) = f.read_exact_at(&mut buf, range_offset) {
+            self.stats.misses.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        if !self.touch_lru(key) {
+            return None;
+        }
+        self.stats.hits.fetch_add(1, Ordering::Relaxed);
+        Some(Bytes::from(buf))
+    }
+
+    fn touch_lru(self: &Arc<Self>, key: &ChunkKey) -> bool {
         let mut g = self.inner.lock();
         let prev_seq = match g.entries.get(key) {
             Some(e) => e.last_access_seq,
             None => {
-                // Entry was evicted between our two locks; treat as miss
-                // rather than re-insert (which would orphan the on-disk file
-                // bookkeeping if eviction's remove_file already fired).
                 self.stats.misses.fetch_add(1, Ordering::Relaxed);
-                return None;
+                return false;
             }
         };
         g.lru.remove(&prev_seq);
@@ -169,8 +224,7 @@ impl DiskCache {
             entry.last_access_seq = new_seq;
         }
         g.lru.insert(new_seq, key.clone());
-        self.stats.hits.fetch_add(1, Ordering::Relaxed);
-        Some(Bytes::from(data))
+        true
     }
 
     pub fn insert(self: &Arc<Self>, key: ChunkKey, data: &[u8]) -> Result<()> {

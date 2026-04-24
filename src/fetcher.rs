@@ -112,6 +112,86 @@ impl Fetcher {
         res
     }
 
+    /// Like `fetch_chunk` but returns only `[sub_offset, sub_offset+sub_len)`
+    /// of the chunk. On a cache hit it issues a single pread() of just the
+    /// requested slice, avoiding the 32x read amplification when FUSE splits
+    /// a 4 MiB read into 32 x 128 KiB sub-reads (each previously caused a
+    /// full 4 MiB cache read).
+    pub async fn fetch_chunk_range(
+        &self,
+        mount: &MountConfig,
+        blob_path: &str,
+        chunk_offset: u64,
+        sub_offset: u64,
+        sub_len: u64,
+        expected_chunk_len: u64,
+    ) -> Result<Bytes> {
+        let t_total = std::time::Instant::now();
+        let res = self
+            .fetch_chunk_range_inner(
+                mount,
+                blob_path,
+                chunk_offset,
+                sub_offset,
+                sub_len,
+                expected_chunk_len,
+            )
+            .await;
+        self.stats
+            .chunk_total_seconds
+            .observe(t_total.elapsed().as_secs_f64());
+        res
+    }
+
+    async fn fetch_chunk_range_inner(
+        &self,
+        mount: &MountConfig,
+        blob_path: &str,
+        chunk_offset: u64,
+        sub_offset: u64,
+        sub_len: u64,
+        expected_chunk_len: u64,
+    ) -> Result<Bytes> {
+        if sub_len == 0 {
+            return Ok(Bytes::new());
+        }
+        let key = ChunkKey {
+            mount: mount.name.clone(),
+            blob: blob_path.to_string(),
+            offset: chunk_offset,
+        };
+
+        let cache_for_get = self.cache.clone();
+        let key_for_get = key.clone();
+        let t_get = std::time::Instant::now();
+        let cached = tokio::task::spawn_blocking(move || {
+            cache_for_get.try_get_range(&key_for_get, sub_offset, sub_len)
+        })
+        .await
+        .map_err(|e| BcError::Other(format!("cache get join: {e}")))?;
+        self.stats
+            .chunk_cache_get_seconds
+            .observe(t_get.elapsed().as_secs_f64());
+        if let Some(b) = cached {
+            return Ok(b);
+        }
+
+        // Slice miss: full-chunk fetch (will populate cache for subsequent
+        // sub-reads), then slice.
+        let full = self
+            .fetch_chunk_inner(mount, blob_path, chunk_offset, expected_chunk_len)
+            .await?;
+        let end = (sub_offset + sub_len) as usize;
+        if end > full.len() {
+            return Err(BcError::Other(format!(
+                "fetched chunk shorter than requested slice: have {} need {}",
+                full.len(),
+                end
+            )));
+        }
+        Ok(full.slice(sub_offset as usize..end))
+    }
+
     async fn fetch_chunk_inner(
         &self,
         mount: &MountConfig,
@@ -376,17 +456,21 @@ impl Fetcher {
         let mut o = first_chunk;
         while o <= last_chunk {
             let chunk_len = cs.min(file_size - o);
+            let take_start = offset.max(o) - o;
+            let take_end = end.min(o + chunk_len) - o;
+            let sub_len = take_end - take_start;
             let mc = mount.clone();
             let bp = blob_path.to_string();
             let me = self.clone_handles();
             let sem = self.chunk_sem.clone();
             tasks.push(tokio::spawn(async move {
-                // Bound concurrent chunk fetches across the whole Fetcher.
                 let _permit = sem
                     .acquire_owned()
                     .await
                     .map_err(|e| BcError::Other(format!("sem closed: {e}")))?;
-                me.fetch_chunk(&mc, &bp, o, chunk_len).await.map(|b| (o, b))
+                me.fetch_chunk_range(&mc, &bp, o, take_start, sub_len, chunk_len)
+                    .await
+                    .map(|b| (o, b))
             }));
             o = match o.checked_add(cs) {
                 Some(n) => n,
@@ -402,14 +486,12 @@ impl Fetcher {
         }
         chunks.sort_by_key(|(o, _)| *o);
 
+        if chunks.len() == 1 {
+            return Ok(chunks.into_iter().next().unwrap().1);
+        }
         let mut out = Vec::with_capacity((end - offset) as usize);
-        for (co, data) in chunks {
-            let chunk_end = co + data.len() as u64;
-            let take_start = offset.max(co) - co;
-            let take_end = end.min(chunk_end) - co;
-            if take_end > take_start {
-                out.extend_from_slice(&data[take_start as usize..take_end as usize]);
-            }
+        for (_co, data) in chunks {
+            out.extend_from_slice(&data);
         }
         Ok(Bytes::from(out))
     }

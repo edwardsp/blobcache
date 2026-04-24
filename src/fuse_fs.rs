@@ -1,6 +1,7 @@
 use dashmap::DashMap;
 use fuser::{
-    FileAttr, FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, Request,
+    FileAttr, FileType, Filesystem, KernelConfig, ReplyAttr, ReplyData, ReplyDirectory,
+    ReplyEntry, Request,
 };
 use libc::{EIO, ENOENT, ENOTDIR};
 use std::collections::{HashMap, HashSet};
@@ -353,6 +354,17 @@ impl BlobFs {
 }
 
 impl Filesystem for BlobFs {
+    fn init(
+        &mut self,
+        _req: &Request<'_>,
+        config: &mut KernelConfig,
+    ) -> std::result::Result<(), libc::c_int> {
+        let target = self.fetcher.chunk_size.max(1) as u32;
+        let _ = config.set_max_readahead(target);
+        let _ = config.set_max_write(target);
+        Ok(())
+    }
+
     fn lookup(&mut self, req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
         let name = name.to_string_lossy().to_string();
         let me = self.clone_handles();
