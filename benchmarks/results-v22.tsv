@@ -1,0 +1,7 @@
+# v2.2 - read-amplification fix on top of v2.1.0 RDMA
+# 3-node gb300 cluster, file = 2 GiB, transport = rdma (UCX)
+# fetcher = h5j2w, peer source = h4pr5 (warmed)
+concurrency	v2.1.0_MiB_s	v2.2_MiB_s	speedup
+1	670	1083	1.62
+4	1886	2700	1.43
+8	2340	3500	1.50

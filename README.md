@@ -11,13 +11,16 @@ Two peer transports ship in-tree:
 
 - **`tcp`** (default, v1) — HTTP/1.1 over `eth0`, keep-alive pooled, the
   baseline that the benchmarks below measure against.
-- **`rdma`** (v2.1, `--features ucx`) — UCX peer transport via raw
+- **`rdma`** (v2.2, `--features ucx`) — UCX peer transport via raw
   `ucx1-sys` FFI. The IB devices are passed into the pod
   (`rdma/ib: 1`), pods exchange UCX worker addresses out-of-band via
   gossip (no IPoIB / no RDMA-CM dependency), and the data path runs
-  `rc_mlx5` direct between mlx5 HCAs. Single-stream warm-peer is
-  **1.55–1.86× v1**; 8-stream aggregate sustains **~2.3 GiB/s** per
-  fetcher node. See [BENCHMARKS.md](BENCHMARKS.md#v21-ucx-peer-transport--real-rdma).
+  `rc_mlx5` direct between mlx5 HCAs. v2.2 also fixes the 32:1 read
+  amplification that bottlenecked v2.1 single-stream — `cache.try_get_range`
+  pread()s only the requested slice and `BlobFs::init` negotiates a
+  `chunk_size` FUSE max_read with the kernel. Single-stream warm-peer is
+  **2.66× v1** (1083 MiB/s); 8-stream aggregate sustains **~3.5 GiB/s**
+  per fetcher node. See [BENCHMARKS.md](BENCHMARKS.md#v22-read-amplification-fix).
 
 ## Architecture
 
@@ -263,11 +266,12 @@ examples/
 
 - **Read-only**. Writes are not implemented; the FUSE handler returns
   `EROFS`-style errors on write-open paths.
-- **Single-stream warm-peer is software-bound at ~630 MiB/s** even
-  though aggregate scales to ~2.3 GiB/s across 8 streams. The remaining
-  per-chunk overhead is in the client fetcher and the single-threaded
-  FUSE handler, not the wire (UCX `tag_bw` clears 50+ GiB/s on the same
-  fabric). Tractable in v2.2 by parallelising `cache.insert` and
-  spreading FUSE reads across multiple workers.
+- **Single-stream warm-peer is software-bound at ~1.1 GiB/s** even
+  though aggregate scales to ~3.5 GiB/s across 8 streams. The remaining
+  per-chunk overhead is `cache.insert` on the critical path (~1.25 ms),
+  the peer round-trip (~640 µs), and the single FUSE handler thread.
+  UCX `tag_bw` clears 50+ GiB/s on the same fabric. Tractable in v2.3 by
+  parallelising `cache.insert` (now that the v2.1 32:1 amplification is
+  out of the way) and spreading FUSE reads across multiple workers.
 - **Failure detection is coarse** (30 s heartbeat timeout to Suspect; no
   separate Suspect→Dead transition). Adequate for a ~20-node cluster.

@@ -358,3 +358,74 @@ Default remains `transport.kind = "tcp"`. Set `kind = "rdma"` (and build
 with `--features ucx`) on clusters that have IB devices and a
 multi-pod gossip wireup path. The binary refuses to merge mixed-kind
 clusters via `cluster_hash`.
+
+# v2.2 (read-amplification fix)
+
+## Setup
+
+Same hardware, transport, and bench harness as v2.1. Two changes ship
+in v2.2:
+
+1. `cache.try_get_range(key, sub_offset, sub_len)` — pread()s only the
+   requested slice instead of reading the whole 4 MiB chunk for every
+   FUSE sub-read.
+2. `BlobFs::init` negotiates `max_readahead = max_write = chunk_size`
+   so the kernel can ship up to 4 MiB FUSE requests where the client
+   API allows.
+
+## Profile that motivated the fix
+
+Per-stage histograms added in v2.2 (5 new
+`blobcache_chunk_*_seconds` / `blobcache_fuse_read_seconds`) revealed
+v2.1.0 single-stream warm-peer was spending **56% of FUSE time in
+`cache.try_get`**:
+
+| Histogram (3 × 2 GiB single-stream warm-peer on v2.1.0) | Count | Sum | Mean |
+|---|---|---|---|
+| `chunk_cache_get_seconds` | 49152 | 9.15 s | **186 µs** |
+| `chunk_cache_insert_seconds` | 1536 | 1.92 s | 1.25 ms |
+| `chunk_peer_fetch_seconds` | 2322 | 1.49 s | 643 µs |
+| `chunk_fetch_total_seconds` | 49152 | 15.93 s | 324 µs |
+| `fuse_read_seconds` | 49152 | 16.40 s | 333 µs |
+
+`49152 / 1536 = 32` — the kernel was splitting each `dd bs=4M` syscall
+into 32 × 128 KiB FUSE reads, each one re-reading the entire 4 MiB
+chunk into a Vec. With 4 MiB read amplification per 128 KiB of user
+data we were burning ~32× more bandwidth on the cache file than on the
+peer fetch.
+
+After the fix `chunk_cache_get_seconds` mean dropped to **44 µs**.
+
+## Throughput (warm-peer, file_a..h_9.bin = 2 GiB each)
+
+| Concurrency | v2.1.0 | v2.2 | Speedup |
+|---|---|---|---|
+| 1-stream | 670 MiB/s | **1067–1099 MiB/s** | **1.59–1.64×** |
+| 4-stream aggregate | 1886 MiB/s | **2700 MiB/s** | **1.43×** |
+| 8-stream aggregate | 2340 MiB/s | **3500 MiB/s** | **1.50×** |
+
+## v1 (HTTP/1.1) vs v2.2 (RDMA + slice cache) warm-peer head-to-head
+
+Single-stream warm-peer at 2 GiB (file_a_9.bin):
+
+| Variant | MiB/s | vs v1 |
+|---|---|---|
+| v1 HTTP/1.1 | 407 | 1.00× |
+| v2.1 RDMA | 670 | 1.65× |
+| **v2.2 RDMA + slice cache** | **1083** | **2.66×** |
+
+## What's left for v2.3+
+
+- 1-stream now caps at ~1.1 GiB/s. The remaining per-chunk fixed cost
+  is split roughly: peer round-trip ~640 µs, NVMe slice read ~44 µs,
+  cache.insert ~1.25 ms (still on the critical path), tokio scheduler
+  + FUSE handler dispatch.
+- `cache.insert` fire-and-forget (the failed v2.2 #1 attempt) was
+  rejected at 22% regression because pre-fix the 32× cache_get cost
+  was so dominant that any extra `tokio::spawn` overhead was visible.
+  With cache_get at 44 µs that headroom may now exist; a re-try is
+  warranted but should be measured per-concurrency.
+- FUSE multi-worker still untested. With a single FUSE handler thread
+  and per-chunk semaphore at 32, single-stream is still serialised
+  across the chunk boundary.
+
