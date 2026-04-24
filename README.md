@@ -11,16 +11,21 @@ Two peer transports ship in-tree:
 
 - **`tcp`** (default, v1) — HTTP/1.1 over `eth0`, keep-alive pooled, the
   baseline that the benchmarks below measure against.
-- **`rdma`** (v2.2, `--features ucx`) — UCX peer transport via raw
+- **`rdma`** (v2.3, `--features ucx`) — UCX peer transport via raw
   `ucx1-sys` FFI. The IB devices are passed into the pod
   (`rdma/ib: 1`), pods exchange UCX worker addresses out-of-band via
   gossip (no IPoIB / no RDMA-CM dependency), and the data path runs
-  `rc_mlx5` direct between mlx5 HCAs. v2.2 also fixes the 32:1 read
-  amplification that bottlenecked v2.1 single-stream — `cache.try_get_range`
-  pread()s only the requested slice and `BlobFs::init` negotiates a
-  `chunk_size` FUSE max_read with the kernel. Single-stream warm-peer is
-  **2.66× v1** (1083 MiB/s); 8-stream aggregate sustains **~3.5 GiB/s**
-  per fetcher node. See [BENCHMARKS.md](BENCHMARKS.md#v22-read-amplification-fix).
+  `rc_mlx5` direct between mlx5 HCAs. v2.2 fixed the 32:1 read
+  amplification that bottlenecked v2.1 (`cache.try_get_range` pread()s
+  only the requested slice; `BlobFs::init` negotiates a `chunk_size`
+  FUSE max_read with the kernel). v2.3 then took the per-chunk
+  software cost out of the hot path with three landed wins
+  (sequential-await fix, zero-init recv buffer, pre-registered slab)
+  and two honest negative results (FUSE `max_background` tuning,
+  multi-NIC fan-out — the latter regressed because v2.3.3 is
+  daemon-bound, not NIC-bound). Single-stream warm-peer is **3550 MiB/s**
+  (3.3× v2.2); 8-stream aggregate sustains **~11.75 GiB/s** per fetcher
+  node. See [BENCHMARKS.md](BENCHMARKS.md#v23-rdma-driver-fixes--registered-recv-slab).
 
 ## Architecture
 
@@ -266,12 +271,18 @@ examples/
 
 - **Read-only**. Writes are not implemented; the FUSE handler returns
   `EROFS`-style errors on write-open paths.
-- **Single-stream warm-peer is software-bound at ~1.1 GiB/s** even
-  though aggregate scales to ~3.5 GiB/s across 8 streams. The remaining
-  per-chunk overhead is `cache.insert` on the critical path (~1.25 ms),
-  the peer round-trip (~640 µs), and the single FUSE handler thread.
-  UCX `tag_bw` clears 50+ GiB/s on the same fabric. Tractable in v2.3 by
-  parallelising `cache.insert` (now that the v2.1 32:1 amplification is
-  out of the way) and spreading FUSE reads across multiple workers.
+- **Single-stream warm-peer is software-bound at ~3.55 GiB/s** even
+  though aggregate scales to ~11.75 GiB/s across 8 streams. v2.3
+  eliminated the per-chunk recv-buffer registration and `cache.insert`
+  hot-path overhead; what remains is the kernel-userspace context
+  switch on `read()`, dd's serialised syscall pattern, and the
+  single-threaded tokio worker driving `ucp_worker_progress`. Multi-NIC
+  fan-out was tested (UCX confirmed correct 25%/rail striping across
+  4 HCAs) but regressed because the bottleneck is the daemon thread,
+  not the fabric — the gain from extra rails is overwhelmed by the
+  per-rail coordination cost in a single progress loop. Lifting the
+  ceiling further requires multi-threaded UCX progress (per-NIC,
+  NUMA-pinned worker) or splitting the daemon into one process per
+  NIC. Both are out of scope for the v2.3 micro-tuning series.
 - **Failure detection is coarse** (30 s heartbeat timeout to Suspect; no
   separate Suspect→Dead transition). Adequate for a ~20-node cluster.
