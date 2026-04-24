@@ -821,65 +821,113 @@ Both are substantial rewrites — not v2.3 micro-tuning. Recording
 this so we don't re-try the env-only path expecting different
 results.
 
-### v2.3-E follow-up — NUMA pinning (also NEGATIVE)
+### v2.3-E follow-up — NUMA pinning, properly controlled (NEGATIVE)
 
-**Hypothesis tested.** The v2.3-E multi-NIC regression might be a
-NUMA-locality artefact rather than a true daemon-bound ceiling: gb300
-nodes are 2× Grace Neoverse-V2 sockets (128 cores total), with
-mlx5_0/mlx5_1 on NUMA node 0 (cores 0–63) and mlx5_2/mlx5_3 on NUMA
-node 1 (cores 64–127). The unpinned daemon was floating across both
-sockets (`Cpus_allowed_list: 0-127`), so progress-loop polling on
-multi-rail traffic could be eating cross-socket interconnect cost on
-every `ucp_worker_progress` iteration.
+**First attempt was sloppy.** An initial NUMA test compared
+"NUMA-pinned 2-rail" against the prior-session "v2.3.3 baseline 3550
+MiB/s 1-stream" and against "unpinned 2-rail" measured in the same
+session, then concluded "pinning makes things worse." That comparison
+mixed two variables (pinning + multi-NIC) against an uncontrolled
+single-NIC unpinned baseline measured in a different session. The
+correct test is a 2×2 (NICs × pinning) all run fresh in the same
+session.
 
-**Setup.** Daemon launched under `numactl --cpunodebind=0 --membind=0`
-via a wrapper at `/opt/blobcache/blobcached` that re-execs the real
-binary. UCX restricted to the two NUMA-0-local NICs:
-`UCX_NET_DEVICES=mlx5_0:1,mlx5_1:1`, `UCX_MAX_RNDV_RAILS=2`. Pinning
-verified live via `/proc/1/status` (`Cpus_allowed_list: 0-63`,
-`Mems_allowed_list: 0-1`). Same v2.3.3 binary (md5
-`ad4402076c4b507771dfe8a69a93d21a`), same warm-peer methodology, same
-`drop_caches` between runs.
+**Topology recap.** gb300 nodes are 2× Grace Neoverse-V2 sockets, 128
+cores total. mlx5_0 and mlx5_1 sit on NUMA node 0 (cores 0–63);
+mlx5_2 and mlx5_3 sit on NUMA node 1 (cores 64–127). All mlx5
+completion IRQs for mlx5_0 are steered to NUMA-0 cores by default
+(verified via `/proc/irq/<N>/smp_affinity_list`: 51, 16, 54, 26, 36,
+6, 47, 46 — all in 0–63). So pinning the daemon to NUMA 0 + using
+mlx5_0/1 should be IRQ-aligned, not fighting them.
 
-**Result.**
+**Methodology.** Same v2.3.3 binary (md5
+`ad4402076c4b507771dfe8a69a93d21a`) on all three pods. Fetcher cache
+cleared between configs by recycling the fetcher pod (its
+`/opt/blobcache` is `emptyDir`, so a restart wipes the disk cache).
+Per config, 1-stream reads `file_a_<S>`, 4-stream reads
+`file_e_<S>..h_<S>` (disjoint from 1-stream → all fresh peer
+fetches), 8-stream reads `file_a_<S>..h_<S>` (so 5 of 8 are
+cache-hit-via-FUSE, all configs equally). Peers warmed with
+`file_<a-h>_<5..9>.bin` ahead of time. Pinning effected by a
+`/opt/blobcache/blobcached` wrapper that `exec numactl --cpunodebind=0
+--membind=0 /opt/blobcache/blobcached.real "$@"`; verified live via
+`/proc/1/status` showing `Cpus_allowed_list: 0-63`,
+`Mems_allowed_list: 0-1`.
 
-| streams | v2.3.3 (1 NIC, unpinned) | v2.3-E (2-rail, unpinned) | NUMA-pinned 2-rail |
-|---|---|---|---|
-| 1 | 3550 | 2209 | **1840** (run1), **1398** (run2) |
-| 4 | 10135 | 7297 | **7562** (run1), **5770** (run2) |
-| 8 | 11750 | 8338 | **10693** (run1), **11932** (run2) |
+**Results (single measurement per cell, MiB/s).**
 
-NUMA-pinned 2-rail is **worse** than unpinned 2-rail at 1-stream
-(1840 vs 2209) and roughly comparable at 4 / 8 streams. Pinning did
-**not** rescue the multi-NIC regression — it deepened it at low
-concurrency. The 8-stream variance (10.7 → 11.9 GiB/s across two
-runs) means the apparent "match" with v2.3.3 baseline is within noise
-band, not a real win.
+| streams | A: 1 NIC unpinned | C: 1 NIC pinned | B: 2 NIC unpinned | D: 2 NIC pinned |
+|---|---|---|---|---|
+| 1 | **2161** | 1909 (−12 %) | 1592 (−26 %) | 1616 (−25 %) |
+| 4 | **8345** | 5968 (−28 %) | 7902 (−5 %) | 6083 (−27 %) |
+| 8 | 9925 | **10880** (+10 %) | 9944 (≈) | n/a (test went to blob) |
 
-**Why pinning made things worse, not better.** Restricting to NUMA
-node 0 cuts the tokio runtime's available cores from 128 to 64. The
-daemon is single-threaded for `ucp_worker_progress`, but tokio worker
-threads still service hash-routed peer requests, FUSE callbacks,
-gossip, and metrics in parallel. Halving the worker pool starves
-those concurrent paths, and that hurts more than NUMA-local NIC
-affinity helps. Cross-socket UPI traffic on NIC progress was a real
-cost — but a smaller one than the cost of giving up half the cores.
+(Percentages relative to Config A. The D 8-stream cell was invalid
+because suffix `_5` wasn't pre-warmed on peers, so the run fell
+through to Azure Blob; excluded.)
 
-**Implication.** The v2.3-E multi-NIC negative result is **not** a
-NUMA artefact; it's a true ceiling. The single-threaded UCX worker
-cannot effectively drive multiple rails regardless of which socket it
-runs on. Both per-NIC dedicated workers (multi-thread UCX progress)
-and per-NIC daemon processes remain the only architectural paths
-forward — and both would need to also handle the tokio-worker
-oversubscription that pinning exposed.
+**Pinning effect, isolated.**
+
+- 1-stream, 1 NIC: 2161 → 1909 (−12 %).
+- 4-stream, 1 NIC: 8345 → 5968 (**−28 %**).
+- 4-stream, 2 NICs: 7902 → 6083 (**−23 %**).
+- 8-stream, 1 NIC: 9925 → 10880 (+10 %).
+
+So pinning **does** measurably hurt at low/medium concurrency (1–4
+streams) and may help slightly at high concurrency (8 streams,
+single-shot, treat as suggestive not definitive).
+
+**Why pinning hurts, with the IRQ hypothesis ruled out.** IRQ
+affinity is correctly aligned (mlx5_0 IRQs already live on NUMA-0
+cores), so the "pinning fights IRQs" theory is dead. The remaining
+plausible cause is **system-process contention**: cores 0–63 also
+host kubelet, systemd, kernel softirqs, the network stack's RPS
+hashing, and other daemonsets' workers. When unpinned, the kernel
+scheduler can drift the blobcached threads to whichever core is
+currently idle (likely on NUMA 1, which is less crowded by AKS
+control-plane work). When pinned to NUMA 0, the daemon competes for
+the same cores as those system processes — paying scheduling latency
+and cache-thrash that exceeds the NUMA-local-memory benefit at low
+concurrency.
+
+The 8-stream + pinned data point is intriguing (the only place
+pinning won), but with one measurement and a partially-cached test
+(5/8 hits) it's not enough to claim NUMA pinning helps high-fan-out.
+
+**Multi-NIC effect, isolated (unpinned).**
+
+- 1-stream: 2161 → 1592 (−26 %). Net loss; multi-rail coordination
+  cost dominates.
+- 4-stream: 8345 → 7902 (−5 %). Roughly neutral.
+- 8-stream: 9925 → 9944 (~0 %). Roughly neutral.
+
+Multi-NIC unpinned is **never a win** at any stream count. Combined
+with pinned, it's a wash or worse. Confirms the v2.3-E conclusion
+that multi-NIC fan-out via env vars alone (single ucp_worker, no
+code changes) does not lift the ceiling.
+
+**Cross-session caveat.** This session's best 1-stream throughput
+(Config A: 2161 MiB/s) is markedly below the prior session's "v2.3.3
+baseline 3550 MiB/s" — same binary (md5 confirmed), same nodes, same
+code path. Cluster/network state shifted between sessions in ways we
+didn't measure (other tenants, IB switch ECMP state, NIC firmware
+counters, SR-IOV scheduling). **Absolute numbers do not transfer
+between sessions; only intra-session ratios are reliable.** The 2×2
+ratios above are intra-session, so the pinning and multi-NIC
+conclusions stand on their own.
 
 ### Net conclusion of the v2.3 series
 
-Five experiments planned (A → E), plus a NUMA follow-up; three landed
-real wins (v2.3.1 sequential-await fix, v2.3.2 zero-init recv, v2.3.3
-RegisteredSlab) and three were honest negative results (v2.3-D FUSE
-tuning, v2.3-E multi-NIC, v2.3-E NUMA pinning). The shipped headline:
-**1-stream 3550 MiB/s, 8-stream 11.75 GiB/s** — bounded by the
-single-threaded daemon, not the fabric, not NUMA locality. Lifting
-that ceiling needs architectural work (per-NIC workers, per-NIC
-daemons), not parameter tuning.
+Five experiments planned (A → E), plus a properly-controlled NUMA
+follow-up; three landed real wins (v2.3.1 sequential-await fix,
+v2.3.2 zero-init recv, v2.3.3 RegisteredSlab) and three were honest
+negative results (v2.3-D FUSE tuning, v2.3-E multi-NIC, v2.3-E NUMA
+pinning of the single-threaded daemon). The shipped headline from
+the v2.3.3 session: **1-stream 3550 MiB/s, 8-stream 11.75 GiB/s** —
+bounded by the single-threaded daemon, not the fabric, not NUMA
+locality, not IRQ misalignment. Lifting that ceiling needs
+architectural work — per-NIC workers in a multi-thread UCX runtime,
+or per-NIC daemon processes — not parameter tuning. Pinning a
+single-threaded daemon to one socket is actively counter-productive
+at low concurrency because the pinned cores are already crowded with
+AKS system processes.
