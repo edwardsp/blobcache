@@ -732,7 +732,15 @@ async fn client_fetch_inner(
     let req_tag = TAG_REQ_BASE | id;
     let resp_tag = TAG_RESP_BASE | id;
 
-    let mut resp_buf = vec![0u8; 8 + length as usize];
+    // SAFETY: allocate uninitialized buffer of exactly the bytes UCX will write.
+    // We only ever read [..resp_len] returned by tag_recv, so the uninit tail
+    // (if any) is never observed. Same pattern as the v2.3.1 server-side fix:
+    // skipping zero-init saves ~244 µs per 4 MiB chunk on the hot path.
+    let total = 8 + length as usize;
+    let mut resp_buf: Vec<u8> = Vec::with_capacity(total);
+    unsafe {
+        resp_buf.set_len(total);
+    }
     let req = encode_request(key, length, requester_peer_id)?;
     // Post recv FIRST (so server's reply isn't dropped if it races our send),
     // post send, then await both concurrently. Sequential .await on recv would

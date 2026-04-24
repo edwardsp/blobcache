@@ -551,3 +551,58 @@ Combined with the existing client-side `chunk_*` histograms, every per-
 chunk stage is now timed end-to-end: client `fetch_chunk_seconds` =
 client cache_get + peer_fetch (which spans server handler) + cache_insert
 + scheduler.
+
+# v2.3.2 — uninitialised client recv buffer (2.26 GiB/s 1-stream)
+
+The client-side per-fetch path was allocating a fresh 4 MiB+8 byte
+zero-initialised `Vec<u8>` on every chunk recv (`transport_ucx.rs:735`
+`vec![0u8; 8 + length as usize]`). That mirrors the same anti-pattern
+fixed on the server side in v2.3.1 — UCX immediately overwrites every
+byte of the buffer, so the zeroing is pure waste.
+
+v2.3.2 swaps to the same `Vec::with_capacity` + `unsafe set_len` pattern
+already used in v2.3.1's server-side response build:
+
+```rust
+let total = 8 + length as usize;
+let mut resp_buf: Vec<u8> = Vec::with_capacity(total);
+unsafe { resp_buf.set_len(total); }
+```
+
+The `Vec` is only ever read up to `resp_len` returned by `tag_recv`, so
+the uninit tail (if any — `recv_info.length` is exact) is never observed.
+
+## Throughput (head-to-head on the same cluster session)
+
+Cluster co-tenants visibly drift run-to-run on shared GB300 VMSS — to
+get a clean number we re-benched v2.3.1 immediately before v2.3.2 on
+the same pods. (The v2.3.1 absolute numbers therefore differ from the
+v2.3.1 release section above, which was captured a session earlier;
+relative deltas are the metric to read.)
+
+| Concurrency | v2.3.1 (re-bench) | **v2.3.2** | Δ |
+|---|---|---|---|
+| 1-stream | 1122 MiB/s | **2259 MiB/s** | **+101%** |
+| 4-stream | 3329 MiB/s | **4636 MiB/s** | **+39%** |
+| 8-stream | 3433 MiB/s | **4412 MiB/s** | **+29%** |
+
+The 4-stream regression that v2.3.1 introduced (−23% vs v2.3.0) is also
+swept away by this single change — the client-side zeroing was likely
+the same root cause amplified by 4× concurrency hitting the allocator.
+
+## Honesty footnote — cross-session absolute numbers
+
+Comparing v2.3.2 numbers to the v2.3.1 *release-session* numbers above
+shows a smaller gap (1-stream ~ −8%) than the head-to-head re-bench.
+That gap is cluster co-tenancy noise on the shared GB300 nodepool, not
+a regression: re-benching v2.3.1 in the same v2.3.2 session reproduces
+the same 1122 MiB/s baseline that v2.3.2 then doubles. Future entries
+will use within-session re-benches as the canonical comparison.
+
+## What's next (v2.3.3)
+
+The leftover client-side overhead is per-fetch HCA registration (UCX
+registers each fresh recv buffer with the IB MR cache on first use) and
+the page-fault tax on touching freshly-allocated 4 MiB pages. v2.3.3
+will introduce a `RegisteredSlab` — a single `ucp_mem_map`'d region
+sliced into per-in-flight slots, eliminating both costs.
