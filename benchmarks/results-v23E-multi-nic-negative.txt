@@ -1,0 +1,35 @@
+v2.3-E multi-NIC fan-out — NEGATIVE RESULT
+==========================================
+
+Cluster: 3-pod, gb300 nodes, 4x mlx5 HCAs each
+Binary: v2.3.3 (md5 ad440207); only env vars changed
+UCX confirmed multi-rail active via ucx_info -e -P inter:
+  "rendezvous zero-copy fenced write to remote
+   25% on rc_mlx5/mlx5_0:1/path0,
+   25% on rc_mlx5/mlx5_1:1/path0,
+   25% on rc_mlx5/mlx5_2:1/path0,
+   25% on rc_mlx5/mlx5_3:1/path0"
+
+Bench (drop_caches between runs, warm peers):
+
+| streams | v2.3.3 (1 NIC) | v2.3-E 4-rail | v2.3-E 2-rail |
+|---------|---------------:|--------------:|--------------:|
+|       1 |      3550 MiB/s|      2698     |      2209     |
+|       4 |     10135      |      7982     |      7297     |
+|       8 |     11750      |      8964     |      8338     |
+
+Both rail counts regress. Worse with fewer rails (more idle NICs)
+suggests the cost is NOT NIC saturation - it's per-rail coordination
+overhead absorbed by the single-threaded tokio worker that polls
+ucp_worker_progress.
+
+Root cause: v2.3.3's 11.7 GiB/s was daemon-bound, not NIC-bound.
+mlx5 NDR has ~50 GiB/s/HCA peak fabric BW; we were at 23% of one HCA.
+Adding more NICs gives the same single thread more lanes to poll, more
+completions to drain, and N RTTs per chunk to coordinate. Net loss.
+
+Path forward (out of scope for v2.3 series):
+  - Multi-thread the UCX progress engine (worker per CPU-pinned NIC)
+  - Or split the daemon into N processes, one per NIC (NUMA-aware)
+  - Either is a substantial rewrite; the v2.3 micro-tuning series
+    has hit its architectural ceiling.

@@ -732,3 +732,101 @@ multi-fd dd on the client side, neither of which is in scope for the
 v2.3 micro-tuning series.
 
 Moving on to **v2.3-E (multi-NIC fan-out)** as the next experiment.
+
+## v2.3-E — Multi-NIC fan-out (NEGATIVE RESULT, NOT SHIPPED)
+
+Tested but **abandoned**. The experiment was theoretically sound and
+UCX correctly enabled the multi-rail path, but our daemon architecture
+turned out to be the bottleneck — not the fabric.
+
+### Hypothesis
+
+gb300 nodes have 4 IB HCAs (`mlx5_0..mlx5_3`, one per PCIe root) but
+the deploy manifest pinned `UCX_NET_DEVICES=mlx5_0:1` and explicitly
+set `UCX_MAX_RNDV_RAILS=1`. UCX's canonical multi-rail pattern (used
+by NCCL, OpenMPI, MPICH) is to expose multiple devices via
+`UCX_NET_DEVICES` and let UCX automatically stripe rendezvous
+transfers across rails — with **a single `ucp_context` and
+`ucp_worker`**. Going from 1 → 4 rails should ~4× the available
+fabric bandwidth.
+
+### Patch (env-only, no code changes)
+
+```yaml
+# deploy/blobcached.yaml
+- { name: UCX_NET_DEVICES, value: "mlx5_0:1,mlx5_1:1,mlx5_2:1,mlx5_3:1" }
+- { name: UCX_MAX_RNDV_RAILS, value: "4" }
+```
+
+### UCX confirmed it was striping correctly
+
+`ucx_info -e -P inter` reported the endpoint actually using all 4 rails:
+
+```
+| 64K..inf | rendezvous zero-copy fenced write to remote
+            | 25% on rc_mlx5/mlx5_0:1/path0,
+              25% on rc_mlx5/mlx5_1:1/path0,
+              25% on rc_mlx5/mlx5_2:1/path0,
+              25% on rc_mlx5/mlx5_3:1/path0 |
+```
+
+The wireup created 8 lanes per endpoint (2 paths × 4 NICs) and the
+worker-address blob grew from ~250 to 559 bytes. Multi-rail was
+genuinely active.
+
+### Result (head-to-head, drop_caches between runs, warm peers)
+
+| streams | v2.3.3 (1 NIC) | v2.3-E 4-rail | v2.3-E 2-rail |
+|---|---|---|---|
+| 1 | 3550 MiB/s | **2698** (−24%) | **2209** (−38%) |
+| 4 | 10135 MiB/s | **7982** (−21%) | **7297** (−28%) |
+| 8 | 11750 MiB/s | **8964** (−24%) | **8338** (−29%) |
+
+Both rail counts regress. 2-rail being **worse** than 4-rail
+(despite using fewer NICs) rules out NIC contention and points
+squarely at per-rail coordination overhead.
+
+### Root cause
+
+v2.3.3's 11.7 GiB/s 8-stream aggregate was **daemon-bound, not
+NIC-bound**. mlx5 NDR has ~50 GiB/s/HCA peak fabric bandwidth; we
+were running at 23 % of one HCA. The bottleneck is the
+single-threaded tokio worker that drives `ucp_worker_progress`:
+
+- Multi-rail splits each 4 MiB chunk into 4 × 1 MiB sub-transfers,
+  each requiring its own post + completion poll.
+- All 8 lanes (2 paths × 4 NICs) are progressed by the same one
+  worker thread, multiplying the per-chunk syscall and completion
+  drain cost.
+- The per-rail handshake at endpoint creation also pays a fixed
+  cost the first time each peer is contacted.
+
+Adding more NICs gave the same single thread more lanes to poll
+without addressing the bottleneck — net loss.
+
+### Path forward (out of scope for v2.3 series)
+
+To make multi-NIC pay off we'd need either:
+
+1. **Multi-thread the UCX progress engine** — one worker per NIC,
+   each pinned to the local NUMA node. This requires lifting the
+   `Rc<RuntimeState>` to `Arc<…>` and moving from `LocalSet` /
+   `current_thread` to a multi-thread runtime, plus per-worker
+   endpoint sharding.
+2. **Multi-process the daemon** — N processes, one per NIC, each
+   on its local NUMA node, with a thin shim in front. Less
+   invasive but adds operational complexity.
+
+Both are substantial rewrites — not v2.3 micro-tuning. Recording
+this so we don't re-try the env-only path expecting different
+results.
+
+### Net conclusion of the v2.3 series
+
+Five experiments planned (A → E); three landed real wins
+(v2.3.1 sequential-await fix, v2.3.2 zero-init recv, v2.3.3
+RegisteredSlab) and two were honest negative results (v2.3-D FUSE
+tuning, v2.3-E multi-NIC). The shipped headline:
+**1-stream 3550 MiB/s, 8-stream 11.75 GiB/s** — bounded by the
+single-threaded daemon, not the fabric. Lifting that ceiling needs
+architectural work, not parameter tuning.
