@@ -29,9 +29,33 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 use tokio::io::unix::AsyncFd;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Notify};
 use tokio::task::JoinHandle;
 use ucx1_sys::*;
+
+// Per-thread Notify woken whenever a UCX op is posted that may need immediate
+// worker progress to complete. Set once at runtime startup; tag_send/tag_recv/
+// tag_msg_recv/close_ep_* call `kick_progress()` after posting a deferred op.
+thread_local! {
+    static PROGRESS_KICK: RefCell<Option<Rc<Notify>>> = const { RefCell::new(None) };
+}
+
+fn install_progress_kick(kick: Rc<Notify>) {
+    PROGRESS_KICK.with(|cell| {
+        *cell.borrow_mut() = Some(kick);
+    });
+}
+
+fn kick_progress() {
+    PROGRESS_KICK.with(|cell| {
+        if let Some(k) = cell.borrow().as_ref() {
+            k.notify_one();
+        }
+    });
+}
+
+const PROGRESS_BUDGET: usize = 64;
+const INBOUND_DRAIN_BUDGET: usize = 32;
 
 use crate::cache::{ChunkKey, DiskCache};
 use crate::error::{BcError, Result};
@@ -238,11 +262,21 @@ async fn run_runtime(
     let worker_addr_blob = unsafe {
         std::slice::from_raw_parts(worker_addr.cast::<u8>(), worker_addr_len as usize).to_vec()
     };
-    let progress = spawn_progress_task(ucx.worker, ucx.async_fd.clone());
     let state = Rc::new(RefCell::new(RuntimeState::new(
         ucx.worker,
         local_peer_id,
     )));
+
+    let inbound_ready = Rc::new(Notify::new());
+    let progress_kick = Rc::new(Notify::new());
+    install_progress_kick(progress_kick.clone());
+
+    let progress = spawn_progress_task(
+        ucx.worker,
+        ucx.async_fd.clone(),
+        progress_kick.clone(),
+        inbound_ready.clone(),
+    );
 
     if started_tx.send(Ok(worker_addr_blob.clone())).is_err() {
         progress.abort();
@@ -253,7 +287,8 @@ async fn run_runtime(
         return Err(BcError::Peer("ucx runtime startup receiver dropped".into()));
     }
 
-    let mut poll_tick = tokio::time::interval(Duration::from_millis(5));
+    let mut safety_tick = tokio::time::interval(Duration::from_millis(100));
+    safety_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let result = loop {
         tokio::select! {
             _ = &mut shutdown_rx => {
@@ -266,12 +301,10 @@ async fn run_runtime(
                 };
                 dispatch_cmd(state.clone(), cmd);
             }
-            _ = poll_tick.tick() => {
-                let worker = state.borrow().worker;
-                while unsafe { ucp_worker_progress(worker) } != 0 {}
-                if let Err(e) = poll_tag_requests(state.clone(), cache.clone(), stats.clone()).await {
-                    break Err(e);
-                }
+            _ = inbound_ready.notified() => {
+                drain_inbound(state.clone(), cache.clone(), stats.clone());
+            }
+            _ = safety_tick.tick() => {
                 if let Err(e) = reap_broken_eps(state.clone()).await {
                     break Err(e);
                 }
@@ -331,13 +364,14 @@ async fn update_peer(state: SharedRuntimeState, peer_id: &str, peer_addr_blob: &
     Ok(())
 }
 
-async fn poll_tag_requests(
+fn drain_inbound(
     state: SharedRuntimeState,
     cache: Arc<DiskCache>,
     stats: Arc<crate::stats::PeerStats>,
-) -> Result<()> {
+) {
+    let worker = state.borrow().worker;
+    let mut drained = 0usize;
     loop {
-        let worker = state.borrow().worker;
         let mut info: ucp_tag_recv_info_t = unsafe { mem::zeroed() };
         let msg = unsafe { ucp_tag_probe_nb(worker, TAG_REQ_BASE, TAG_CLASS_MASK, 1, &mut info) };
         if msg.is_null() {
@@ -345,68 +379,90 @@ async fn poll_tag_requests(
         }
 
         stats.chunk_requests.inc();
+        let sender_tag = info.sender_tag;
+        let recv_len = info.length as usize;
+        let state_c = state.clone();
+        let cache_c = cache.clone();
+        let stats_c = stats.clone();
 
-        let mut buf = vec![0u8; info.length as usize];
-        let recv_len = tag_msg_recv(worker, &mut buf, msg).await?;
-        buf.truncate(recv_len);
-
-        let request = match decode_request(&buf) {
-            Ok(req) => req,
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to decode UCX tag request");
-                continue;
+        tokio::task::spawn_local(async move {
+            if let Err(e) =
+                handle_inbound_request(state_c, cache_c, stats_c, msg, recv_len, sender_tag).await
+            {
+                tracing::warn!(error = %e, "inbound UCX request handler failed");
             }
-        };
+        });
 
-        if request.length == 0 || request.length > MAX_RESPONSE_BYTES {
-            tracing::warn!(
-                peer = %request.requester_peer_id,
-                length = request.length,
-                "dropping UCX tag request with invalid length"
-            );
-            continue;
-        }
-
-        let cache2 = cache.clone();
-        let key2 = request.key.clone();
-        let cached = tokio::task::spawn_blocking(move || cache2.try_get(&key2))
-            .await
-            .map_err(|e| BcError::Peer(format!("spawn_blocking: {e}")))?;
-
-        let response = match cached {
-            Some(bytes) => {
-                if bytes.len() > request.length as usize {
-                    tracing::warn!(
-                        peer = %request.requester_peer_id,
-                        served = bytes.len(),
-                        requested = request.length,
-                        "dropping UCX tag response larger than requested"
-                    );
-                    continue;
-                }
-                stats.chunk_bytes_served.inc_by(bytes.len() as u64);
-                encode_response(STATUS_OK, &bytes)?
-            }
-            None => encode_response(STATUS_MISS, &[])?,
-        };
-
-        let resp_tag = TAG_RESP_BASE | (info.sender_tag & TAG_ID_MASK);
-        if let Err(e) = server_send_response(
-            state.clone(),
-            &request.requester_peer_id,
-            resp_tag,
-            &response,
-        )
-        .await
-        {
-            tracing::warn!(
-                peer = %request.requester_peer_id,
-                error = %e,
-                "failed to send UCX tag response"
-            );
+        drained += 1;
+        if drained >= INBOUND_DRAIN_BUDGET {
+            break;
         }
     }
+}
 
+async fn handle_inbound_request(
+    state: SharedRuntimeState,
+    cache: Arc<DiskCache>,
+    stats: Arc<crate::stats::PeerStats>,
+    msg: ucp_tag_message_h,
+    recv_len: usize,
+    sender_tag: u64,
+) -> Result<()> {
+    let worker = state.borrow().worker;
+    let mut buf = vec![0u8; recv_len];
+    let actual = tag_msg_recv(worker, &mut buf, msg).await?;
+    buf.truncate(actual);
+
+    let request = decode_request(&buf)?;
+    let resp_tag = TAG_RESP_BASE | (sender_tag & TAG_ID_MASK);
+
+    if request.length == 0 || request.length > MAX_RESPONSE_BYTES {
+        tracing::warn!(
+            peer = %request.requester_peer_id,
+            length = request.length,
+            "dropping UCX tag request with invalid length"
+        );
+        return Ok(());
+    }
+
+    let cache2 = cache.clone();
+    let key2 = request.key.clone();
+    let cached = match tokio::task::spawn_blocking(move || cache2.try_get(&key2)).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "cache try_get blocking task failed");
+            let response = encode_response(STATUS_ERR, &[])?;
+            let _ = server_send_response(state, &request.requester_peer_id, resp_tag, &response).await;
+            return Ok(());
+        }
+    };
+
+    let response = match cached {
+        Some(bytes) => {
+            if bytes.len() > request.length as usize {
+                tracing::warn!(
+                    peer = %request.requester_peer_id,
+                    served = bytes.len(),
+                    requested = request.length,
+                    "dropping UCX tag response larger than requested"
+                );
+                return Ok(());
+            }
+            stats.chunk_bytes_served.inc_by(bytes.len() as u64);
+            encode_response(STATUS_OK, &bytes)?
+        }
+        None => encode_response(STATUS_MISS, &[])?,
+    };
+
+    if let Err(e) =
+        server_send_response(state, &request.requester_peer_id, resp_tag, &response).await
+    {
+        tracing::warn!(
+            peer = %request.requester_peer_id,
+            error = %e,
+            "failed to send UCX tag response"
+        );
+    }
     Ok(())
 }
 
@@ -1013,9 +1069,11 @@ impl Drop for UcxRuntime {
 fn spawn_progress_task(
     worker: ucp_worker_h,
     async_fd: Arc<AsyncFd<WorkerEventFd>>,
+    progress_kick: Rc<Notify>,
+    inbound_ready: Rc<Notify>,
 ) -> JoinHandle<()> {
     tokio::task::spawn_local(async move {
-        if let Err(e) = progress_worker(worker, async_fd).await {
+        if let Err(e) = progress_worker(worker, async_fd, progress_kick, inbound_ready).await {
             tracing::debug!(error = %e, "ucx progress loop exited");
         }
     })
@@ -1024,18 +1082,42 @@ fn spawn_progress_task(
 async fn progress_worker(
     worker: ucp_worker_h,
     async_fd: Arc<AsyncFd<WorkerEventFd>>,
+    progress_kick: Rc<Notify>,
+    inbound_ready: Rc<Notify>,
 ) -> Result<()> {
     loop {
-        while unsafe { ucp_worker_progress(worker) } != 0 {}
+        let mut budget = PROGRESS_BUDGET;
+        let mut did_work = false;
+        loop {
+            if unsafe { ucp_worker_progress(worker) } == 0 {
+                break;
+            }
+            did_work = true;
+            budget -= 1;
+            if budget == 0 {
+                tokio::task::yield_now().await;
+                budget = PROGRESS_BUDGET;
+            }
+        }
+        if did_work {
+            inbound_ready.notify_one();
+        }
         match unsafe { ucp_worker_arm(worker) } {
             ucs_status_t::UCS_OK => {
-                let mut guard = async_fd
-                    .readable()
-                    .await
-                    .map_err(|e| BcError::Peer(format!("ucx worker efd wait: {e}")))?;
-                guard.clear_ready();
+                tokio::select! {
+                    biased;
+                    _ = progress_kick.notified() => {}
+                    guard = async_fd.readable() => {
+                        let mut g = guard
+                            .map_err(|e| BcError::Peer(format!("ucx worker efd wait: {e}")))?;
+                        g.clear_ready();
+                    }
+                }
             }
-            ucs_status_t::UCS_ERR_BUSY => continue,
+            ucs_status_t::UCS_ERR_BUSY => {
+                tokio::task::yield_now().await;
+                continue;
+            }
             status => return Err(status_error("ucp_worker_arm", status)),
         }
     }
@@ -1055,7 +1137,12 @@ async fn tag_send(ep: ucp_ep_h, data: &[u8], tag: u64) -> Result<()> {
             &params,
         )
     };
-    request_from_status_ptr("ucp_tag_send_nbx", ptr, 0).await?;
+    let needs_progress = !ptr.is_null() && !UCS_PTR_IS_ERR(ptr);
+    let fut = request_from_status_ptr("ucp_tag_send_nbx", ptr, 0);
+    if needs_progress {
+        kick_progress();
+    }
+    fut.await?;
     Ok(())
 }
 
@@ -1077,12 +1164,13 @@ async fn tag_recv(worker: ucp_worker_h, buf: &mut [u8], tag: u64) -> Result<usiz
             &params,
         )
     };
-    request_from_status_ptr(
-        "ucp_tag_recv_nbx",
-        ptr,
-        recv_info.length.try_into().unwrap(),
-    )
-    .await
+    let inline_len = recv_info.length as usize;
+    let needs_progress = !ptr.is_null() && !UCS_PTR_IS_ERR(ptr);
+    let fut = request_from_status_ptr("ucp_tag_recv_nbx", ptr, inline_len);
+    if needs_progress {
+        kick_progress();
+    }
+    fut.await
 }
 
 async fn tag_msg_recv(
@@ -1106,12 +1194,16 @@ async fn tag_msg_recv(
             &params,
         )
     };
-    request_from_status_ptr(
+    let needs_progress = !ptr.is_null() && !UCS_PTR_IS_ERR(ptr);
+    let fut = request_from_status_ptr(
         "ucp_tag_msg_recv_nbx",
         ptr,
         recv_info.length.try_into().unwrap(),
-    )
-    .await
+    );
+    if needs_progress {
+        kick_progress();
+    }
+    fut.await
 }
 
 async fn close_ep(ep: ucp_ep_h) -> Result<()> {
@@ -1132,7 +1224,12 @@ async fn close_ep_with_flags(ep: ucp_ep_h, flags: u32, include_flags: bool) -> R
     }
 
     let ptr = unsafe { ucp_ep_close_nbx(ep, &params) };
-    request_from_status_ptr("ucp_ep_close_nbx", ptr, 0).await?;
+    let needs_progress = !ptr.is_null() && !UCS_PTR_IS_ERR(ptr);
+    let fut = request_from_status_ptr("ucp_ep_close_nbx", ptr, 0);
+    if needs_progress {
+        kick_progress();
+    }
+    fut.await?;
     Ok(())
 }
 
@@ -1217,6 +1314,18 @@ fn request_from_status_ptr(
     }
 
     let request = ptr.cast::<c_void>();
+    // UCX recycles request handles from a pool. `request_init_cb` only fires
+    // on the FIRST allocation of a slot; subsequent reuses retain the previous
+    // RequestState (done=true, length=N from the prior op). We MUST reset
+    // here, before any poll, otherwise UcxRequest::poll sees stale `done=true`
+    // and returns immediately with a stale length while the buffer is unwritten.
+    unsafe {
+        let state = request_state_mut(request);
+        state.done = false;
+        state.status = ucs_status_t::UCS_INPROGRESS;
+        state.length = 0;
+        state.waker = None;
+    }
     UcxRequest {
         action,
         request: Some(request),
