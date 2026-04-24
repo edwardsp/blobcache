@@ -1,5 +1,6 @@
 use base64::prelude::{Engine as _, BASE64_STANDARD};
 use bytes::Bytes;
+use dashmap::DashMap;
 use parking_lot::Mutex;
 use rand::seq::SliceRandom;
 use std::collections::HashMap;
@@ -35,6 +36,11 @@ pub struct Fetcher {
     pub chunk_size: u64,
     inflight: Arc<Mutex<HashMap<ChunkKey, InflightTx>>>,
     chunk_sem: Arc<Semaphore>,
+    // Chunks fetched from a peer/blob whose disk insert is still in flight.
+    // Read paths consult this before hitting cache.try_get so a follower
+    // arriving in the 1.25 ms window between data-return and disk-commit
+    // sees the bytes instead of triggering a redundant peer fetch.
+    inflight_writes: Arc<DashMap<ChunkKey, Bytes>>,
 }
 
 // RAII guard for the leader slot in `inflight`. On drop (panic, cancel, or
@@ -86,6 +92,7 @@ impl Fetcher {
             chunk_size,
             inflight: Arc::new(Mutex::new(HashMap::new())),
             chunk_sem: Arc::new(Semaphore::new(permits)),
+            inflight_writes: Arc::new(DashMap::new()),
         }
     }
 
@@ -161,6 +168,14 @@ impl Fetcher {
             offset: chunk_offset,
         };
 
+        if let Some(b) = self.inflight_writes.get(&key) {
+            let bytes = b.value().clone();
+            let end = (sub_offset + sub_len) as usize;
+            if end <= bytes.len() {
+                return Ok(bytes.slice(sub_offset as usize..end));
+            }
+        }
+
         let cache_for_get = self.cache.clone();
         let key_for_get = key.clone();
         let t_get = std::time::Instant::now();
@@ -205,7 +220,13 @@ impl Fetcher {
             offset,
         };
 
-        // Cache lookup is sync I/O (read + stat); push it to the blocking pool.
+        if let Some(b) = self.inflight_writes.get(&key) {
+            let bytes = b.value().clone();
+            if bytes.len() as u64 == expected_len {
+                return Ok(bytes);
+            }
+        }
+
         let cache_for_get = self.cache.clone();
         let key_for_get = key.clone();
         let t_get = std::time::Instant::now();
@@ -366,14 +387,7 @@ impl Fetcher {
                     }
                     self.stats.peer_fetches_ok.inc();
                     self.stats.peer_fetch_bytes.inc_by(data.len() as u64);
-                    let cache = self.cache.clone();
-                    let k = key.clone();
-                    let d = data.clone();
-                    let t_ins = std::time::Instant::now();
-                    let _ = tokio::task::spawn_blocking(move || cache.insert(k, &d)).await;
-                    self.stats
-                        .chunk_cache_insert_seconds
-                        .observe(t_ins.elapsed().as_secs_f64());
+                    self.spawn_insert(key.clone(), data.clone());
                     return Ok(data);
                 }
                 Err(BcError::NotFound(_)) => {
@@ -416,15 +430,24 @@ impl Fetcher {
         }
         self.stats.blob_fetches.inc();
         self.stats.blob_fetch_bytes.inc_by(data.len() as u64);
-        let cache = self.cache.clone();
-        let k = key.clone();
-        let d = data.clone();
-        let t_ins = std::time::Instant::now();
-        let _ = tokio::task::spawn_blocking(move || cache.insert(k, &d)).await;
-        self.stats
-            .chunk_cache_insert_seconds
-            .observe(t_ins.elapsed().as_secs_f64());
+        self.spawn_insert(key.clone(), data.clone());
         Ok(data)
+    }
+
+    fn spawn_insert(&self, key: ChunkKey, data: Bytes) {
+        self.inflight_writes.insert(key.clone(), data.clone());
+        let cache = self.cache.clone();
+        let stats = self.stats.clone();
+        let inflight = self.inflight_writes.clone();
+        let k = key.clone();
+        tokio::spawn(async move {
+            let t_ins = std::time::Instant::now();
+            let _ = tokio::task::spawn_blocking(move || cache.insert(k, &data)).await;
+            stats
+                .chunk_cache_insert_seconds
+                .observe(t_ins.elapsed().as_secs_f64());
+            inflight.remove(&key);
+        });
     }
 
     pub async fn fetch_range(
@@ -506,6 +529,7 @@ impl Fetcher {
             chunk_size: self.chunk_size,
             inflight: self.inflight.clone(),
             chunk_sem: self.chunk_sem.clone(),
+            inflight_writes: self.inflight_writes.clone(),
         }
     }
 }

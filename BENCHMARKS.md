@@ -429,3 +429,38 @@ Single-stream warm-peer at 2 GiB (file_a_9.bin):
   and per-chunk semaphore at 32, single-stream is still serialised
   across the chunk boundary.
 
+
+# v2.3 (cache.insert off the critical path)
+
+## Setup
+
+Same hardware/transport. v2.2 profile showed cache.insert was now the
+single-largest per-chunk cost (mean 1.25 ms x 1 per chunk) sitting on
+the synchronous return path. v2.3 spawns the disk insert in the
+background and stages the bytes in an in-memory `inflight_writes`
+DashMap so concurrent / immediately-following readers don't trigger
+a redundant peer fetch in the 1.25 ms commit window.
+
+## v2.3-A throughput (warm-peer, 2 GiB files, RDMA)
+
+| Concurrency | v2.2 | **v2.3-A** | vs v2.2 | vs v2.1.0 | vs v1 |
+|---|---|---|---|---|---|
+| 1-stream | 1083 MiB/s | **2046 MiB/s** | 1.89x | 3.05x | 5.03x |
+| 4-stream | 2700 MiB/s | **4358 MiB/s** | 1.61x | 2.31x | n/a |
+| 8-stream | 3500 MiB/s | **4071 MiB/s** | 1.16x | 1.74x | n/a |
+
+Single-stream now sustains over **2 GiB/s from a single dd**. The
+v2.1.0 attempt at this same change regressed by 22-29% because the
+32:1 cache_get amplification was so dominant that any extra spawn
+overhead was net-negative; with v2.2's slice-cache freeing that
+headroom, the same change is +89%.
+
+## Correctness invariant
+
+`inflight_writes: DashMap<ChunkKey, Bytes>` is populated synchronously
+before `tokio::spawn` starts the disk insert and removed only after
+the spawn_blocking call returns. All three read paths
+(fetch_chunk_inner, fetch_chunk_range_inner, FUSE follower via
+singleflight rx) consult inflight_writes before cache.try_get, so a
+follower arriving in the commit window sees the in-memory bytes and
+returns immediately rather than re-fetching from the peer.
