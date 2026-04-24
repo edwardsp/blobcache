@@ -687,3 +687,48 @@ reports for raw UCX on this fabric.
   we open a UCX context on the first one only. Round-robining
   endpoints across `mlx5_0..mlx5_3` should lift aggregate towards
   20+ GiB/s and remove the per-NIC link-rate ceiling.
+
+## v2.3-D — FUSE kernel-config tuning (NEGATIVE RESULT, NOT SHIPPED)
+
+Tested but **abandoned**. Recorded here so we don't re-try the same thing.
+
+### Hypothesis
+
+`fuser-0.15.1` defaults `KernelConfig::max_background = 16`. With 8
+concurrent dd streams each issuing 32-deep kernel readahead, ~256
+requests can be in flight; anything below that should throttle the
+FUSE queue and starve the daemon. Bumping it to 512 (with
+`congestion_threshold = 384`) plus `FUSE_PARALLEL_DIROPS` and
+`FUSE_ASYNC_DIO` capabilities was expected to lift 4-stream and
+8-stream throughput.
+
+### Patch
+
+```rust
+// src/fuse_fs.rs::init
+let _ = config.set_max_background(512);
+let _ = config.set_congestion_threshold(384);
+let _ = config.add_capabilities(fuser::consts::FUSE_PARALLEL_DIROPS);
+let _ = config.add_capabilities(fuser::consts::FUSE_ASYNC_DIO);
+```
+
+### Result (head-to-head, drop_caches between runs)
+
+| streams | v2.3.3 | v2.3.4 (max_bg=512) | Δ |
+|---|---|---|---|
+| 1 | 3550 MiB/s | 2653 MiB/s | **−25%** |
+| 4 | 10135 MiB/s | 10022 MiB/s | flat |
+| 8 | 11750 MiB/s | 10990 MiB/s | −6% |
+
+### Conclusion
+
+`max_background` is **not** the bottleneck. The 1-stream regression
+is unexplained but reproducible; the 4/8-stream curves are at-or-below
+v2.3.3. Reverted on commit `<this commit>`. The real 1-stream
+ceiling is most likely the kernel's per-fd FUSE read serialisation
+(one outstanding `READ` per fd), which `max_background` doesn't
+affect — that needs either multi-fd dispatch on the daemon side or
+multi-fd dd on the client side, neither of which is in scope for the
+v2.3 micro-tuning series.
+
+Moving on to **v2.3-E (multi-NIC fan-out)** as the next experiment.
