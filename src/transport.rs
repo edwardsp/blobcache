@@ -76,6 +76,7 @@ impl PeerService {
     }
 
     async fn handle_chunk(&self, req: Request<Incoming>) -> Response<Full<Bytes>> {
+        let t_total = std::time::Instant::now();
         let parts: Vec<&str> = req.uri().path().splitn(4, '/').collect();
         if parts.len() < 4 {
             return bad_request("path");
@@ -101,7 +102,12 @@ impl PeerService {
             blob,
             offset,
         };
-        match self.cache.try_get(&key) {
+        let t_cg = std::time::Instant::now();
+        let got = self.cache.try_get(&key);
+        self.stats
+            .server_cache_get_seconds
+            .observe(t_cg.elapsed().as_secs_f64());
+        let resp = match got {
             Some(b) => {
                 self.stats.chunk_bytes_served.inc_by(b.len() as u64);
                 Response::builder()
@@ -115,7 +121,11 @@ impl PeerService {
                 .status(StatusCode::NOT_FOUND)
                 .body(Full::new(Bytes::from_static(b"miss")))
                 .unwrap(),
-        }
+        };
+        self.stats
+            .server_handler_seconds
+            .observe(t_total.elapsed().as_secs_f64());
+        resp
     }
 }
 

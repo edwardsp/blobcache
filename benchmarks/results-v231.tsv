@@ -1,0 +1,10 @@
+version	transport	streams	run	mibps	notes
+v2.3.1	rdma	1	1	2434	cache_size=4MiB chunk_concurrency=32
+v2.3.1	rdma	1	2	2434	
+v2.3.1	rdma	1	3	2466	
+v2.3.1	rdma	4	1	3341	
+v2.3.1	rdma	4	2	3408	
+v2.3.1	rdma	4	3	3309	
+v2.3.1	rdma	8	1	4719	
+v2.3.1	rdma	8	2	4587	
+v2.3.1	rdma	8	3	4581	

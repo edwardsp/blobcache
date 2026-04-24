@@ -33,6 +33,9 @@ pub struct PeerStats {
     pub chunk_bytes_served: IntCounter,
     #[cfg(feature = "ucx")]
     pub rdma_non_rdma_lane: IntCounter,
+    pub server_handler_seconds: Histogram,
+    pub server_cache_get_seconds: Histogram,
+    pub server_send_seconds: Histogram,
 }
 pub struct ClusterStats {
     pub gossip_rounds: IntCounter,
@@ -130,6 +133,18 @@ impl Stats {
             "blobcache_fuse_read_seconds",
             "wall time in FUSE read callback",
         );
+        let server_handler_seconds = mk_hist(
+            "blobcache_peer_server_handler_seconds",
+            "wall time per inbound peer chunk request handler",
+        );
+        let server_cache_get_seconds = mk_hist(
+            "blobcache_peer_server_cache_get_seconds",
+            "wall time in server-side cache.try_get for peer chunk requests",
+        );
+        let server_send_seconds = mk_hist(
+            "blobcache_peer_server_send_seconds",
+            "wall time sending response bytes to peer",
+        );
 
         for m in [
             &cache_hits,
@@ -165,6 +180,9 @@ impl Stats {
             &chunk_peer_fetch_seconds,
             &chunk_cache_insert_seconds,
             &fuse_read_seconds,
+            &server_handler_seconds,
+            &server_cache_get_seconds,
+            &server_send_seconds,
         ] {
             r.register(Box::new(h.clone())).unwrap();
         }
@@ -197,6 +215,9 @@ impl Stats {
                 chunk_bytes_served,
                 #[cfg(feature = "ucx")]
                 rdma_non_rdma_lane,
+                server_handler_seconds,
+                server_cache_get_seconds,
+                server_send_seconds,
             }),
             cluster_stats: Arc::new(ClusterStats {
                 gossip_rounds,

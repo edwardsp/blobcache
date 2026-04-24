@@ -208,6 +208,57 @@ impl DiskCache {
         Some(Bytes::from(buf))
     }
 
+    /// Read the entire cached chunk via a single pread into the caller's
+    /// `dst` slice. Returns the number of bytes read on hit, or None on
+    /// miss / size mismatch. The caller is responsible for sizing `dst`
+    /// exactly to the entry size (call `entry_size(key)` first).
+    /// This is the zero-extra-copy server fast-path: the server allocates
+    /// one buffer holding both wire header and payload, then pread()s the
+    /// payload directly into the tail of that buffer, eliminating the
+    /// 4 MiB userspace memcpy that `try_get` + `extend_from_slice(payload)`
+    /// would otherwise incur for every served peer chunk.
+    pub fn try_get_into_slice(self: &Arc<Self>, key: &ChunkKey, dst: &mut [u8]) -> Option<usize> {
+        use std::os::unix::fs::FileExt;
+        let entry_size = {
+            let g = self.inner.lock();
+            match g.entries.get(key) {
+                Some(e) => e.size as usize,
+                None => {
+                    self.stats.misses.fetch_add(1, Ordering::Relaxed);
+                    return None;
+                }
+            }
+        };
+        if dst.len() != entry_size {
+            return None;
+        }
+        let path = self.path_for(key);
+        let f = match std::fs::File::open(&path) {
+            Ok(f) => f,
+            Err(_) => {
+                self.stats.misses.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+        };
+        if let Err(_) = f.read_exact_at(dst, 0) {
+            self.stats.misses.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        if !self.touch_lru(key) {
+            return None;
+        }
+        self.stats.hits.fetch_add(1, Ordering::Relaxed);
+        Some(entry_size)
+    }
+
+    /// Returns the on-disk size of the cached chunk, or None on miss.
+    /// Used by server fast-paths to size a single combined header+payload
+    /// buffer before issuing `try_get_into`.
+    pub fn entry_size(self: &Arc<Self>, key: &ChunkKey) -> Option<u64> {
+        let g = self.inner.lock();
+        g.entries.get(key).map(|e| e.size)
+    }
+
     fn touch_lru(self: &Arc<Self>, key: &ChunkKey) -> bool {
         let mut g = self.inner.lock();
         let prev_seq = match g.entries.get(key) {

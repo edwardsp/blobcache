@@ -464,3 +464,90 @@ the spawn_blocking call returns. All three read paths
 singleflight rx) consult inflight_writes before cache.try_get, so a
 follower arriving in the commit window sees the in-memory bytes and
 returns immediately rather than re-fetching from the peer.
+
+
+# v2.3.1 (server-side single-buffer pread, zero extra copy)
+
+## Setup
+
+Same hardware/transport. v2.3.0 single-stream profile showed the server
+handler (h4pr5) spent 605 µs/req split as: cache.try_get 313 µs,
+encode_response (extend_from_slice of the 4 MiB payload) ~149 µs,
+ucp_tag_send_nbx 143 µs. The dominant cost was two back-to-back
+4 MiB userspace memcpys: page-cache → fresh `Vec` (try_get), then
+fresh `Vec` → response buffer (encode_response). At the measured
+~16 GiB/s memcpy throughput, each 4 MiB copy costs ~244 µs, matching
+the breakdown.
+
+v2.3.1 collapses the two copies into one. The server allocates a
+single `Vec<u8>` of `8 + chunk_size` capacity (uninitialized payload
+region via `Vec::with_capacity` + unsafe `set_len` — only 8 header
+bytes are explicitly written before the pread fills the rest), then
+`cache.try_get_into_slice` pread()s the cached file directly into the
+tail of that buffer. UCX `tag_send_nbx` ships the combined buffer as
+the response. Net: one syscall, one userspace copy (page cache → user
+buf via pread), no second memcpy.
+
+The TCP transport already had only one copy (it hands `Bytes` straight
+to `Full::new(b)` with no separate header-prefix payload), so v2.3.1
+ships UCX-only.
+
+## Server-side timing (warm-peer, 1-stream, 1536 reqs each)
+
+| Stage | v2.3.0 | **v2.3.1** | Δ |
+|---|---|---|---|
+| `server_cache_get_seconds` mean | 313 µs | 348 µs | +35 µs (now includes header alloc + write) |
+| `server_send_seconds` mean | 143 µs | 143 µs | unchanged |
+| `server_handler_seconds` mean | **605 µs** | **492 µs** | **−113 µs (−19%)** |
+
+The cache_get histogram went up because v2.3.1 moved the response-buffer
+allocation and header writes inside the `spawn_blocking` block (and thus
+into the `cache_get` timing window). Total handler time dropped because
+the second 4 MiB extend_from_slice in `encode_response` is gone.
+
+## v2.3.1 throughput (warm-peer, 2 GiB files, RDMA, 3 runs/config)
+
+| Concurrency | v2.3.0 | **v2.3.1** | Δ vs v2.3.0 |
+|---|---|---|---|
+| 1-stream | 2046 MiB/s | **2320 MiB/s** | **+13%** |
+| 4-stream | 4358 MiB/s | 3352 MiB/s | −23% (see below) |
+| 8-stream | 4071 MiB/s | **4629 MiB/s** | **+14%** |
+
+## 4-stream regression — under investigation
+
+3 consecutive runs at 3308–3408 MiB/s vs v2.3.0's 4282–4433 MiB/s. 1-
+and 8-stream both improve consistently with the same change, so this is
+not pure variance. Hypotheses (to verify in v2.3-B/D):
+
+- The single `spawn_blocking` block now does 2 mutex acquires (`entry_size`
+  + `try_get_into_slice`'s `touch_lru`) + a 4 MiB pread, vs v2.3.0's one
+  acquire + pread; under the specific concurrency curve of 4-stream
+  (4 × 32 = 128 in-flight, server fan-out cap), the extra mutex round
+  may serialise more than at 1- or 8-stream.
+- 4-stream is the load point where server-side spawn_blocking pool
+  contention (default 512 threads, but per-task wakeup cost) and
+  receive-side tag-message drain interact unfavourably.
+- 8-stream wins more from the lower per-request CPU because the runtime
+  is genuinely bottlenecked there; 4-stream may be I/O-or-wire bound
+  in v2.3.0 already.
+
+## Server-side instrumentation added
+
+v2.3.1 also adds three new histograms on the server side, with the same
+100 µs–1 s buckets used elsewhere:
+
+- `blobcache_peer_server_handler_seconds` — total time per inbound
+  peer chunk request handler (UCX path measures from receive of the
+  tag-message to completion of the tag-send response; TCP path
+  measures across the whole `handle_chunk` body).
+- `blobcache_peer_server_cache_get_seconds` — time spent loading the
+  chunk on the server (UCX: spawn_blocking that allocs response buf +
+  pread; TCP: synchronous `cache.try_get`).
+- `blobcache_peer_server_send_seconds` — time spent sending the
+  response back over UCX (TCP path is unmeasured because `Full::new`
+  + hyper handle that internally).
+
+Combined with the existing client-side `chunk_*` histograms, every per-
+chunk stage is now timed end-to-end: client `fetch_chunk_seconds` =
+client cache_get + peer_fetch (which spans server handler) + cache_insert
++ scheduler.

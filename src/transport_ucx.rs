@@ -408,6 +408,7 @@ async fn handle_inbound_request(
     recv_len: usize,
     sender_tag: u64,
 ) -> Result<()> {
+    let t_total = std::time::Instant::now();
     let worker = state.borrow().worker;
     let mut buf = vec![0u8; recv_len];
     let actual = tag_msg_recv(worker, &mut buf, msg).await?;
@@ -427,42 +428,63 @@ async fn handle_inbound_request(
 
     let cache2 = cache.clone();
     let key2 = request.key.clone();
-    let cached = match tokio::task::spawn_blocking(move || cache2.try_get(&key2)).await {
+    let req_len = request.length as usize;
+    let t_cg = std::time::Instant::now();
+    let response = match tokio::task::spawn_blocking(move || {
+        let size = cache2.entry_size(&key2)?;
+        let size_us = size as usize;
+        if size_us > req_len {
+            return None;
+        }
+        let total = 8 + size_us;
+        let mut buf: Vec<u8> = Vec::with_capacity(total);
+        buf.extend_from_slice(&STATUS_OK.to_le_bytes());
+        buf.extend_from_slice(&(size_us as u32).to_le_bytes());
+        let payload_slice = unsafe {
+            std::slice::from_raw_parts_mut(buf.as_mut_ptr().add(8), size_us)
+        };
+        cache2.try_get_into_slice(&key2, payload_slice)?;
+        unsafe { buf.set_len(total); }
+        Some((buf, size_us))
+    })
+    .await
+    {
         Ok(v) => v,
         Err(e) => {
-            tracing::warn!(error = %e, "cache try_get blocking task failed");
+            tracing::warn!(error = %e, "cache try_get_into blocking task failed");
             let response = encode_response(STATUS_ERR, &[])?;
             let _ = server_send_response(state, &request.requester_peer_id, resp_tag, &response).await;
             return Ok(());
         }
     };
+    stats
+        .server_cache_get_seconds
+        .observe(t_cg.elapsed().as_secs_f64());
 
-    let response = match cached {
-        Some(bytes) => {
-            if bytes.len() > request.length as usize {
-                tracing::warn!(
-                    peer = %request.requester_peer_id,
-                    served = bytes.len(),
-                    requested = request.length,
-                    "dropping UCX tag response larger than requested"
-                );
-                return Ok(());
-            }
-            stats.chunk_bytes_served.inc_by(bytes.len() as u64);
-            encode_response(STATUS_OK, &bytes)?
+    let response = match response {
+        Some((buf, served)) => {
+            stats.chunk_bytes_served.inc_by(served as u64);
+            buf
         }
         None => encode_response(STATUS_MISS, &[])?,
     };
 
-    if let Err(e) =
-        server_send_response(state, &request.requester_peer_id, resp_tag, &response).await
-    {
+    let t_send = std::time::Instant::now();
+    let send_res =
+        server_send_response(state, &request.requester_peer_id, resp_tag, &response).await;
+    stats
+        .server_send_seconds
+        .observe(t_send.elapsed().as_secs_f64());
+    if let Err(e) = send_res {
         tracing::warn!(
             peer = %request.requester_peer_id,
             error = %e,
             "failed to send UCX tag response"
         );
     }
+    stats
+        .server_handler_seconds
+        .observe(t_total.elapsed().as_secs_f64());
     Ok(())
 }
 
