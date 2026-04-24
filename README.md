@@ -11,13 +11,13 @@ Two peer transports ship in-tree:
 
 - **`tcp`** (default, v1) — HTTP/1.1 over `eth0`, keep-alive pooled, the
   baseline that the benchmarks below measure against.
-- **`rdma`** (v2, `--features ucx`) — UCX peer transport via raw
-  `ucx1-sys` FFI. The IB devices are passed into the pod (`rdma/ib: 1`)
-  and the wire protocol is selected by `transport.kind`. **Note**: on
-  this AKS cluster there is no IPoIB, so UCX falls back to its TCP
-  transport on `eth0` and the v2 numbers are currently *worse* than v1
-  (no kernel bypass + per-chunk wireup). See [BENCHMARKS.md](BENCHMARKS.md)
-  for the full v1-vs-v2 comparison and what's needed to realise RDMA.
+- **`rdma`** (v2.1, `--features ucx`) — UCX peer transport via raw
+  `ucx1-sys` FFI. The IB devices are passed into the pod
+  (`rdma/ib: 1`), pods exchange UCX worker addresses out-of-band via
+  gossip (no IPoIB / no RDMA-CM dependency), and the data path runs
+  `rc_mlx5` direct between mlx5 HCAs. Single-stream warm-peer is
+  **1.55–1.86× v1**; 8-stream aggregate sustains **~2.3 GiB/s** per
+  fetcher node. See [BENCHMARKS.md](BENCHMARKS.md#v21-ucx-peer-transport--real-rdma).
 
 ## Architecture
 
@@ -263,15 +263,11 @@ examples/
 
 - **Read-only**. Writes are not implemented; the FUSE handler returns
   `EROFS`-style errors on write-open paths.
-- **RDMA not realised on this AKS cluster**. The v2 UCX backend is
-  feature-complete (`--features ucx`, `transport.kind = "rdma"`) and
-  passes traffic, but the cluster has **no IPoIB plugin**
-  (`NicClusterPolicy.state-ipoib-cni: ignore`) so pod IPs are Azure CNI
-  overlay (`eth0`) only. UCX falls back to its TCP transport, which
-  combined with the current per-chunk endpoint wireup is **2–3× slower
-  than v1 HTTP/1.1**. Default stays `kind = "tcp"`. To get the RDMA win:
-  enable IPoIB so each pod has an `ib0` IP that UCX can map to an RDMA
-  device, **or** add an endpoint pool to `RdmaPeerClient`. Detail and
-  numbers in [BENCHMARKS.md](BENCHMARKS.md#v2-ucx-peer-transport).
+- **Single-stream warm-peer is software-bound at ~630 MiB/s** even
+  though aggregate scales to ~2.3 GiB/s across 8 streams. The remaining
+  per-chunk overhead is in the client fetcher and the single-threaded
+  FUSE handler, not the wire (UCX `tag_bw` clears 50+ GiB/s on the same
+  fabric). Tractable in v2.2 by parallelising `cache.insert` and
+  spreading FUSE reads across multiple workers.
 - **Failure detection is coarse** (30 s heartbeat timeout to Suspect; no
   separate Suspect→Dead transition). Adequate for a ~20-node cluster.

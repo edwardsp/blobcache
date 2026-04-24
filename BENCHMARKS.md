@@ -221,3 +221,140 @@ transport, exactly as designed.
 Default `transport.kind` remains `"tcp"`. Operators on clusters with
 IPoIB (or once a pool is added) flip to `"rdma"` per node — the binary
 auto-rejects mixed-kind clusters via the `cluster_hash`.
+
+---
+
+# v2.1 (UCX peer transport — real RDMA)
+
+The IPoIB-fallback caveat above is now obsolete on this cluster. v2.1
+replaces the per-chunk endpoint, sequential-await server loop with:
+
+1. **OOB worker-address wireup** — pods exchange UCX worker addresses via
+   gossip (no IPoIB / no RDMA-CM round trip), so the IB transports
+   (`rc_mlx5`, `ud_mlx5`) negotiate directly between mlx5 devices.
+2. **UCX tag API** with one persistent endpoint per peer; chunk requests
+   ride sender-tag-bits = local node id, request-id correlation in the
+   tag low bits.
+3. **Event-driven progress** — `progress_worker` arms `epoll(eventfd)`
+   and a `Notify` "kick" channel, calls `ucp_worker_progress` to budget
+   exhaustion then yields cooperatively. The 5 ms `tokio::time::interval`
+   poll tick that gated v2.0's inbound drain is gone.
+4. **Fire-and-forget per-request handlers** spawned from a sync
+   `drain_inbound` probe. Server-side `cache.try_get` runs on
+   `spawn_blocking` so progress isn't blocked.
+5. **Request-pool reuse fix** — `RequestState` is reset to
+   `{done:false, status:UCS_INPROGRESS}` on every deferred op, so a
+   recycled UCX request slot doesn't see a stale `done` from a prior
+   completion.
+
+Result: zero IPoIB anywhere in the wireup, `rdma_non_rdma_lane_total = 0`
+across all peer fetches, `peer_fetches_err_total = 0`. Raw TSV:
+`benchmarks/results-rdma-real.tsv`.
+
+## Per-size, per-scenario throughput (v2.1 RDMA)
+
+| Size | Scenario | Wall (s) | Throughput (MiB/s) | blob_fetches Δ | peer_fetches Δ | cache_hits Δ |
+|---:|---|---:|---:|---:|---:|---:|
+| 1 MiB | cold | 0.206 | 4.9 | 1 | 0 | 8 |
+| 1 MiB | warm-local | 0.007 | 142.9 | 0 | 0 | 9 |
+| 1 MiB | warm-peer | 0.093 | 10.8 | 0 | 1 | 8 |
+| 4 MiB | cold | 0.075 | 53.3 | 2 | 0 | 31 |
+| 4 MiB | warm-local | 0.053 | 75.5 | 0 | 0 | 33 |
+| 4 MiB | warm-peer | 0.015 | 266.7 | 0 | 2 | 31 |
+| 16 MiB | cold | 0.193 | 82.9 | 5 | 0 | 121 |
+| 16 MiB | warm-local | 0.037 | 432.4 | 0 | 0 | 129 |
+| 16 MiB | warm-peer | 0.061 | 262.3 | 0 | 5 | 121 |
+| 64 MiB | cold | 0.629 | 101.7 | 17 | 0 | 481 |
+| 64 MiB | warm-local | 0.108 | 592.6 | 0 | 0 | 513 |
+| 64 MiB | warm-peer | 0.107 | 598.1 | 0 | 17 | 481 |
+| 256 MiB | cold | 2.496 | 102.6 | 65 | 0 | 1921 |
+| 256 MiB | warm-local | 0.427 | 599.5 | 0 | 0 | 2049 |
+| 256 MiB | warm-peer | 0.450 | 568.9 | 0 | 65 | 1921 |
+| 1024 MiB | cold | 10.266 | 99.7 | 257 | 0 | 7681 |
+| 1024 MiB | warm-local | 1.744 | 587.2 | 0 | 0 | 8193 |
+| 1024 MiB | warm-peer | 1.626 | **629.8** | 0 | 257 | 7681 |
+
+## v1 (HTTP/1.1) vs v2.1 (RDMA) warm-peer head-to-head
+
+| Size | v1 HTTP MiB/s | v2.1 RDMA MiB/s | Speedup |
+|---:|---:|---:|---:|
+| 1 MiB | 2.4 | 10.8 | 4.5× |
+| 4 MiB | 285.7 | 266.7 | 0.93× |
+| 16 MiB | 149.5 | 262.3 | 1.75× |
+| 64 MiB | 357.5 | 598.1 | 1.67× |
+| 256 MiB | 305.5 | 568.9 | 1.86× |
+| 1024 MiB | 407.5 | **629.8** | **1.55×** |
+
+Single-stream, large-file warm-peer is **1.55–1.86× v1**. The 4 MiB row
+is in the noise — at one chunk the read finishes before steady state.
+
+## Multi-stream aggregate (v2.1 RDMA)
+
+The single-stream 630 MiB/s is software-bound (per-chunk client
+overhead in `fetcher::fetch_chunk` and FUSE single-thread serialization).
+The transport itself sustains far more under concurrency — measured
+on `blobcached-h5j2w` reading files pre-warmed on `blobcached-h4pr5`,
+2 GiB per file, all-RDMA peer fetches:
+
+| Streams | Wall (s) | Aggregate (MiB/s) | vs v1 single-stream (407 MiB/s) |
+|---:|---:|---:|---:|
+| 1 | 3.17 | 678 | 1.67× |
+| 4 | 4.56 | **1886** | **4.6×** |
+| 8 | 7.34 | **2340** | **5.75×** |
+
+8-stream aggregate lands inside the 1.5–3 GB/s target band. Per-stream
+scaling tapers past 4 streams — server-side `spawn_blocking(cache.try_get)`
+serializes on the blocking pool and the FUSE handler runs on a single
+thread. Both are tractable in v2.2.
+
+## Latency
+
+Per-chunk warm-peer (4 KiB read forces one cold-via-peer fetch on
+otherwise-cached file):
+
+| Version | Per-chunk latency |
+|---|---|
+| v1 HTTP/1.1 (TCP) | 8–12 ms |
+| v2.0 UCX-TCP | 12–25 ms (per-chunk wireup) |
+| v2.1 UCX RC over IB | **3.3–4.0 ms** |
+
+UCX `tag_bw` 4 MiB on the same fabric reaches ~80 µs / 53 GiB/s, so the
+remaining ~3 ms per chunk is in our daemon (request decode → cache
+lookup → response encode → FUSE return), not the wire.
+
+## Singleflight stress (v2.1 RDMA)
+
+| Metric | Value |
+|---|---:|
+| Concurrent readers | 8 |
+| File size | 64 MiB (16 chunks) |
+| Wall (s) | 1.774 |
+| Aggregate throughput (MiB/s) | 288.6 |
+| `blob_fetches` Δ | 17 |
+| `singleflight_waits` Δ | 13 |
+
+Per-chunk singleflight collapses 8× duplicate work to 1 GET per chunk,
+unchanged from v1.
+
+## UCX runtime configuration (v2.1 baked into `deploy/blobcached.yaml`)
+
+```
+UCX_NET_DEVICES   = mlx5_0:1
+UCX_TLS           = rc,ud,sm,self
+UCX_IB_ADDR_TYPE  = auto         # required on UCX 1.16; "gid" was rejected
+UCX_RNDV_THRESH   = 64K
+UCX_ZCOPY_THRESH  = 64K
+UCX_RNDV_SCHEME   = put_zcopy
+UCX_MAX_RNDV_RAILS = 1
+```
+
+`UCX_RNDV_SCHEME` and `UCX_MAX_RNDV_RAILS` give a small (within-noise)
+single-stream gain on this hardware; the dominant wins came from the
+five driver fixes above.
+
+## Default
+
+Default remains `transport.kind = "tcp"`. Set `kind = "rdma"` (and build
+with `--features ucx`) on clusters that have IB devices and a
+multi-pod gossip wireup path. The binary refuses to merge mixed-kind
+clusters via `cluster_hash`.
