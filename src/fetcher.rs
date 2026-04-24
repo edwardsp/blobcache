@@ -102,6 +102,23 @@ impl Fetcher {
         offset: u64,
         expected_len: u64,
     ) -> Result<Bytes> {
+        let t_total = std::time::Instant::now();
+        let res = self
+            .fetch_chunk_inner(mount, blob_path, offset, expected_len)
+            .await;
+        self.stats
+            .chunk_total_seconds
+            .observe(t_total.elapsed().as_secs_f64());
+        res
+    }
+
+    async fn fetch_chunk_inner(
+        &self,
+        mount: &MountConfig,
+        blob_path: &str,
+        offset: u64,
+        expected_len: u64,
+    ) -> Result<Bytes> {
         let key = ChunkKey {
             mount: mount.name.clone(),
             blob: blob_path.to_string(),
@@ -111,9 +128,13 @@ impl Fetcher {
         // Cache lookup is sync I/O (read + stat); push it to the blocking pool.
         let cache_for_get = self.cache.clone();
         let key_for_get = key.clone();
+        let t_get = std::time::Instant::now();
         let cached = tokio::task::spawn_blocking(move || cache_for_get.try_get(&key_for_get))
             .await
             .map_err(|e| BcError::Other(format!("cache get join: {e}")))?;
+        self.stats
+            .chunk_cache_get_seconds
+            .observe(t_get.elapsed().as_secs_f64());
         if let Some(b) = cached {
             if b.len() as u64 == expected_len {
                 return Ok(b);
@@ -233,7 +254,8 @@ impl Fetcher {
                     }
                 },
             };
-            match self
+            let t_peer = std::time::Instant::now();
+            let peer_res = self
                 .peers
                 .fetch_chunk(
                     &peer.id,
@@ -242,7 +264,11 @@ impl Fetcher {
                     key,
                     expected_len as u32,
                 )
-                .await
+                .await;
+            self.stats
+                .chunk_peer_fetch_seconds
+                .observe(t_peer.elapsed().as_secs_f64());
+            match peer_res
             {
                 Ok(data) => {
                     if data.len() as u64 != expected_len {
@@ -263,7 +289,11 @@ impl Fetcher {
                     let cache = self.cache.clone();
                     let k = key.clone();
                     let d = data.clone();
+                    let t_ins = std::time::Instant::now();
                     let _ = tokio::task::spawn_blocking(move || cache.insert(k, &d)).await;
+                    self.stats
+                        .chunk_cache_insert_seconds
+                        .observe(t_ins.elapsed().as_secs_f64());
                     return Ok(data);
                 }
                 Err(BcError::NotFound(_)) => {
@@ -309,7 +339,11 @@ impl Fetcher {
         let cache = self.cache.clone();
         let k = key.clone();
         let d = data.clone();
+        let t_ins = std::time::Instant::now();
         let _ = tokio::task::spawn_blocking(move || cache.insert(k, &d)).await;
+        self.stats
+            .chunk_cache_insert_seconds
+            .observe(t_ins.elapsed().as_secs_f64());
         Ok(data)
     }
 

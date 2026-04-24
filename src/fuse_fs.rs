@@ -443,6 +443,7 @@ impl Filesystem for BlobFs {
         let fuse_reads = self.fuse_reads.clone();
         let fuse_read_bytes = self.fuse_read_bytes.clone();
         self.rt.spawn(async move {
+            let t_read = std::time::Instant::now();
             let (full_path, file_size) = {
                 let g = me.inner.read().await;
                 match g.by_ino.get(&ino) {
@@ -474,10 +475,18 @@ impl Filesystem for BlobFs {
                     fuse_read_bytes.fetch_add(b.len() as u64, Ordering::Relaxed);
                     me.fetcher.stats.fuse_reads.inc();
                     me.fetcher.stats.fuse_read_bytes.inc_by(b.len() as u64);
+                    me.fetcher
+                        .stats
+                        .fuse_read_seconds
+                        .observe(t_read.elapsed().as_secs_f64());
                     reply.data(&b);
                 }
                 Err(e) => {
                     tracing::error!(?e, "read failed");
+                    me.fetcher
+                        .stats
+                        .fuse_read_seconds
+                        .observe(t_read.elapsed().as_secs_f64());
                     reply.error(EIO);
                 }
             }

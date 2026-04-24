@@ -1,4 +1,4 @@
-use prometheus::{Encoder, IntCounter, IntGauge, Registry, TextEncoder};
+use prometheus::{Encoder, Histogram, HistogramOpts, IntCounter, IntGauge, Registry, TextEncoder};
 use std::sync::Arc;
 
 pub struct Stats {
@@ -21,6 +21,11 @@ pub struct Stats {
     pub cluster_stats: Arc<ClusterStats>,
     pub members_alive: IntGauge,
     pub members_dead: IntGauge,
+    pub chunk_total_seconds: Histogram,
+    pub chunk_cache_get_seconds: Histogram,
+    pub chunk_peer_fetch_seconds: Histogram,
+    pub chunk_cache_insert_seconds: Histogram,
+    pub fuse_read_seconds: Histogram,
 }
 
 pub struct PeerStats {
@@ -96,6 +101,36 @@ impl Stats {
             IntGauge::new("blobcache_cluster_members_alive", "alive members").unwrap();
         let members_dead = IntGauge::new("blobcache_cluster_members_dead", "dead members").unwrap();
 
+        let mk_hist = |name: &str, help: &str| {
+            Histogram::with_opts(
+                HistogramOpts::new(name, help).buckets(vec![
+                    0.0001, 0.00025, 0.0005, 0.001, 0.002, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25,
+                    0.5, 1.0,
+                ]),
+            )
+            .unwrap()
+        };
+        let chunk_total_seconds = mk_hist(
+            "blobcache_chunk_fetch_total_seconds",
+            "wall time in fetch_chunk()",
+        );
+        let chunk_cache_get_seconds = mk_hist(
+            "blobcache_chunk_cache_get_seconds",
+            "wall time in cache.try_get spawn_blocking",
+        );
+        let chunk_peer_fetch_seconds = mk_hist(
+            "blobcache_chunk_peer_fetch_seconds",
+            "wall time in peers.fetch_chunk await",
+        );
+        let chunk_cache_insert_seconds = mk_hist(
+            "blobcache_chunk_cache_insert_seconds",
+            "wall time in cache.insert spawn_blocking",
+        );
+        let fuse_read_seconds = mk_hist(
+            "blobcache_fuse_read_seconds",
+            "wall time in FUSE read callback",
+        );
+
         for m in [
             &cache_hits,
             &cache_misses,
@@ -124,6 +159,15 @@ impl Stats {
         for g in [&cache_bytes, &members_alive, &members_dead] {
             r.register(Box::new(g.clone())).unwrap();
         }
+        for h in [
+            &chunk_total_seconds,
+            &chunk_cache_get_seconds,
+            &chunk_peer_fetch_seconds,
+            &chunk_cache_insert_seconds,
+            &fuse_read_seconds,
+        ] {
+            r.register(Box::new(h.clone())).unwrap();
+        }
 
         Arc::new(Self {
             registry: r,
@@ -143,6 +187,11 @@ impl Stats {
             singleflight_waits,
             members_alive,
             members_dead,
+            chunk_total_seconds,
+            chunk_cache_get_seconds,
+            chunk_peer_fetch_seconds,
+            chunk_cache_insert_seconds,
+            fuse_read_seconds,
             peer_stats: Arc::new(PeerStats {
                 chunk_requests,
                 chunk_bytes_served,
