@@ -19,8 +19,8 @@ set -euo pipefail
 # storage-access ON, mount name "test", blob path azcp-bench/dl-src-big/*.
 
 NS=${NS:-blobcache}
-MOUNT_DIR=/mnt/nvme/blobcache-mnt/test
-BLOB_DIR=azcp-bench/dl-src-big
+MOUNT_DIR=${MOUNT_DIR:-/mnt/nvme/blobcache-mnt/test}
+BLOB_DIR=${BLOB_DIR:-azcp-bench/dl-src-big}
 SIZES_MIB=(1 4 16 64 256 1024)
 
 PODS=($(kubectl -n "$NS" get pods -l app=blobcached -o jsonpath='{.items[*].metadata.name}'))

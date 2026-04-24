@@ -128,9 +128,16 @@ spec:
             - { name: AZURE_CLIENT_ID, value: "00000000-0000-0000-0000-000000000000" }
             - { name: UCX_NET_DEVICES, value: "mlx5_0:1" }
             - { name: UCX_TLS, value: "rc,ud,sm,self" }
-            - { name: UCX_IB_ADDR_TYPE, value: "gid" }
+            # "auto" is required on UCX 1.16 — "gid" was rejected at runtime.
+            - { name: UCX_IB_ADDR_TYPE, value: "auto" }
             - { name: UCX_RNDV_THRESH, value: "64K" }
             - { name: UCX_ZCOPY_THRESH, value: "64K" }
+            # Single rail + put_zcopy keeps the rendezvous path on one HCA and
+            # avoids per-message rail-balancing overhead. Tuning matters less
+            # than the in-process driver fixes (event-driven progress) but
+            # leaves us in the right operating point.
+            - { name: UCX_RNDV_SCHEME, value: "put_zcopy" }
+            - { name: UCX_MAX_RNDV_RAILS, value: "1" }
             - { name: UCX_LOG_LEVEL, value: "info" }
           volumeMounts:
             - { name: nvme,    mountPath: /mnt/nvme, mountPropagation: HostToContainer }
