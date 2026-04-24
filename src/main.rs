@@ -143,6 +143,8 @@ fn main() -> anyhow::Result<()> {
                         transport_addr,
                         stats.peer_stats.clone(),
                         node_id.clone(),
+                        8 + cfg.cache.chunk_size as usize,
+                        cfg.transport.chunk_concurrency as usize,
                     )
                     .context("start RDMA peer service")?;
                 let encoded = BASE64_STANDARD.encode(worker_addr_blob.as_slice());

@@ -606,3 +606,84 @@ registers each fresh recv buffer with the IB MR cache on first use) and
 the page-fault tax on touching freshly-allocated 4 MiB pages. v2.3.3
 will introduce a `RegisteredSlab` — a single `ucp_mem_map`'d region
 sliced into per-in-flight slots, eliminating both costs.
+
+## v2.3.3 — RegisteredSlab + reg-cache pre-warm
+
+**Single-stream warm-peer: 2621 → 3550 MiB/s (+35%).
+4-stream: 4769 → 10135 MiB/s (+113%).
+8-stream: 6049 → 11750 MiB/s (+94%).**
+
+### What changed
+
+Client-side recv buffers are now drawn from a single `ucp_mem_map`'d
+slab registered with UCX at startup, rather than freshly heap-allocated
+per fetch. The slab is sliced into `chunk_concurrency` slots of
+`8 + chunk_size` bytes (32 × 4 MiB = 128 MiB by default), guarded by an
+async semaphore. `ucp_mem_advise(WILLNEED)` warms the page tables and
+the `UCP_MEM_MAP_NONBLOCK` flag lets registration overlap with normal
+operation.
+
+The bindgen output for this UCX (1.16) revealed that
+`ucp_request_param_t` has **no** `memh` field in this version, so we
+cannot pass the memory handle into `tag_recv` directly. UCX falls back
+to its reg-cache, which keys on virtual address: by always receiving
+into addresses that live inside the pre-mapped slab, every recv hits
+the cache and never triggers an inline `ibv_reg_mr` on the hot path.
+
+Concretely, `client_fetch_inner` now:
+
+```rust
+let total = 8 + length as usize;
+let mut slot = slab.checkout().await?;        // semaphore + free-list
+let recv_slice = slot.as_mut_slice(total);
+let recv_fut = tag_recv(worker, recv_slice, resp_tag);
+// ... join with send_fut, decode, drop slot back to free list
+```
+
+Per fetch we save:
+1. `Vec::with_capacity(total)` (4 MiB virtual allocation) and the page
+   faults from first touch — the slab pages are already resident.
+2. UCX's per-buffer `ibv_reg_mr` (~50 µs + IB rkey allocation) that
+   would otherwise fire on every cache miss.
+3. The per-request lookup churn in UCX's reg-cache hash table.
+
+### Head-to-head numbers (same cluster, same session, drop_caches between runs)
+
+| Concurrency | v2.3.2 (re-bench) | **v2.3.3** | Δ |
+|---|---|---|---|
+| 1-stream | 2621 MiB/s | **3550 MiB/s** | **+35%** |
+| 4-stream | 4769 MiB/s | **10135 MiB/s** | **+113%** |
+| 8-stream | 6049 MiB/s | **11750 MiB/s** | **+94%** |
+
+Per-run detail:
+
+| C | v2.3.2 (3 runs) | v2.3.3 (3 runs) |
+|---|---|---|
+| 1 | 2815 / 2464 / 2583 | 3408 / 3672 / 3570 |
+| 4 | 4752 / 4772 / 4782 | 11782 / 9610 / 9014 |
+| 8 | 6554 / 5533 / 6060 | 10955 / 11958 / 12337 |
+
+v2.3.3 also normalizes the bench methodology: `echo 3 >
+/proc/sys/vm/drop_caches` between runs so the FUSE kernel page cache
+can't artificially boost re-runs. (Without that, re-runs of the same
+1-stream workload showed unrealistic 3500+ MiB/s on v2.3.2 too.)
+
+### Why it matters more at higher concurrency
+
+The improvement is largest at 4–8 streams because UCX's reg-cache
+contention is per-`ibv_reg_mr` and serialises across worker threads
+when multiple requests race on a fresh recv buffer. Pre-registering the
+entire slab eliminates all of those races; what's left is fabric-bound
+rather than software-bound. 11.7 GiB/s aggregate from a single fetcher
+node over a single rc_mlx5 endpoint is approaching what `tag_bw -t`
+reports for raw UCX on this fabric.
+
+### What's next (v2.3.4 / v2.3-D, v2.3-E)
+
+- **D — FUSE multi-worker.** The single FUSE handler thread is now the
+  bottleneck for 1-stream latency. Splitting reads across `nproc/2`
+  worker sessions should lift 1-stream past 5 GiB/s.
+- **E — Multi-NIC fan-out.** Each gb300 node has 4 IB devices; today
+  we open a UCX context on the first one only. Round-robining
+  endpoints across `mlx5_0..mlx5_3` should lift aggregate towards
+  20+ GiB/s and remove the per-NIC link-rate ceiling.

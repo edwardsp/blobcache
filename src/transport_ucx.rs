@@ -73,6 +73,121 @@ static REQ_ID: AtomicU64 = AtomicU64::new(1);
 
 type SharedRuntimeState = Rc<RefCell<RuntimeState>>;
 
+struct RecvSlab {
+    backing: Box<[u8]>,
+    slot_size: usize,
+    n_slots: usize,
+    memh: ucp_mem_h,
+    context: ucp_context_h,
+    free: RefCell<Vec<usize>>,
+    permits: Arc<tokio::sync::Semaphore>,
+}
+
+unsafe impl Send for RecvSlab {}
+unsafe impl Sync for RecvSlab {}
+
+impl RecvSlab {
+    fn new(context: ucp_context_h, n_slots: usize, slot_size: usize) -> Result<Rc<Self>> {
+        let total = n_slots
+            .checked_mul(slot_size)
+            .ok_or_else(|| BcError::Peer("RecvSlab size overflow".into()))?;
+        let backing: Box<[u8]> = vec![0u8; total].into_boxed_slice();
+
+        let mut params: ucp_mem_map_params_t = unsafe { mem::zeroed() };
+        params.field_mask = (ucp_mem_map_params_field::UCP_MEM_MAP_PARAM_FIELD_ADDRESS.0 as u64)
+            | (ucp_mem_map_params_field::UCP_MEM_MAP_PARAM_FIELD_LENGTH.0 as u64)
+            | (ucp_mem_map_params_field::UCP_MEM_MAP_PARAM_FIELD_FLAGS.0 as u64);
+        params.address = backing.as_ptr() as *mut c_void;
+        params.length = total as u64;
+        params.flags = UCP_MEM_MAP_NONBLOCK as u32;
+
+        let mut memh: ucp_mem_h = ptr::null_mut();
+        let status = unsafe { ucp_mem_map(context, &params, &mut memh) };
+        check_status("ucp_mem_map", status)?;
+
+        let mut advise: ucp_mem_advise_params_t = unsafe { mem::zeroed() };
+        advise.field_mask =
+            (ucp_mem_advise_params_field::UCP_MEM_ADVISE_PARAM_FIELD_ADDRESS.0 as u64)
+                | (ucp_mem_advise_params_field::UCP_MEM_ADVISE_PARAM_FIELD_LENGTH.0 as u64)
+                | (ucp_mem_advise_params_field::UCP_MEM_ADVISE_PARAM_FIELD_ADVICE.0 as u64);
+        advise.address = backing.as_ptr() as *mut c_void;
+        advise.length = total as u64;
+        advise.advice = ucp_mem_advice::UCP_MADV_WILLNEED;
+        let advise_status = unsafe { ucp_mem_advise(context, memh, &mut advise) };
+        if let Err(e) = check_status("ucp_mem_advise(WILLNEED)", advise_status) {
+            tracing::warn!(error = %e, "ucp_mem_advise(WILLNEED) failed; continuing");
+        }
+
+        let free = RefCell::new((0..n_slots).rev().collect());
+        let permits = Arc::new(tokio::sync::Semaphore::new(n_slots));
+
+        tracing::info!(
+            n_slots,
+            slot_size,
+            total_bytes = total,
+            "RecvSlab registered with UCX (NONBLOCK + WILLNEED)"
+        );
+
+        Ok(Rc::new(Self {
+            backing,
+            slot_size,
+            n_slots,
+            memh,
+            context,
+            free,
+            permits,
+        }))
+    }
+
+    async fn checkout(self: &Rc<Self>) -> Result<SlabSlot> {
+        let permit = self
+            .permits
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| BcError::Peer("RecvSlab semaphore closed".into()))?;
+        let idx = self
+            .free
+            .borrow_mut()
+            .pop()
+            .ok_or_else(|| BcError::Peer("RecvSlab free list empty (semaphore desync)".into()))?;
+        Ok(SlabSlot {
+            slab: self.clone(),
+            idx,
+            _permit: permit,
+        })
+    }
+}
+
+impl Drop for RecvSlab {
+    fn drop(&mut self) {
+        unsafe {
+            ucp_mem_unmap(self.context, self.memh);
+        }
+    }
+}
+
+struct SlabSlot {
+    slab: Rc<RecvSlab>,
+    idx: usize,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl SlabSlot {
+    fn as_mut_slice(&mut self, len: usize) -> &mut [u8] {
+        debug_assert!(len <= self.slab.slot_size);
+        let start = self.idx * self.slab.slot_size;
+        let backing_ptr = self.slab.backing.as_ptr() as *mut u8;
+        unsafe { std::slice::from_raw_parts_mut(backing_ptr.add(start), len) }
+    }
+}
+
+impl Drop for SlabSlot {
+    fn drop(&mut self) {
+        self.slab.free.borrow_mut().push(self.idx);
+    }
+}
+
 pub struct RdmaPeerService {
     _shared: Arc<RdmaRuntimeShared>,
 }
@@ -128,6 +243,8 @@ impl RdmaPeerService {
         addr: SocketAddr,
         stats: Arc<crate::stats::PeerStats>,
         local_peer_id: String,
+        slab_slot_size: usize,
+        slab_n_slots: usize,
     ) -> Result<(Self, RdmaPeerClient, Vec<u8>)> {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<RdmaCmd>();
         let (started_tx, started_rx) = std::sync::mpsc::sync_channel::<Result<Vec<u8>>>(1);
@@ -155,6 +272,8 @@ impl RdmaPeerService {
                         cmd_rx,
                         started_tx,
                         shutdown_rx,
+                        slab_slot_size,
+                        slab_n_slots,
                     )
                     .await
                     {
@@ -239,9 +358,20 @@ async fn run_runtime(
     mut cmd_rx: mpsc::UnboundedReceiver<RdmaCmd>,
     started_tx: std::sync::mpsc::SyncSender<Result<Vec<u8>>>,
     mut shutdown_rx: oneshot::Receiver<()>,
+    slab_slot_size: usize,
+    slab_n_slots: usize,
 ) -> Result<()> {
     let ucx = match UcxRuntime::new() {
         Ok(ucx) => ucx,
+        Err(e) => {
+            let msg = e.to_string();
+            let _ = started_tx.send(Err(BcError::Peer(msg.clone())));
+            return Err(e);
+        }
+    };
+
+    let recv_slab = match RecvSlab::new(ucx.context, slab_n_slots, slab_slot_size) {
+        Ok(s) => s,
         Err(e) => {
             let msg = e.to_string();
             let _ = started_tx.send(Err(BcError::Peer(msg.clone())));
@@ -265,6 +395,7 @@ async fn run_runtime(
     let state = Rc::new(RefCell::new(RuntimeState::new(
         ucx.worker,
         local_peer_id,
+        recv_slab,
     )));
 
     let inbound_ready = Rc::new(Notify::new());
@@ -525,6 +656,7 @@ struct RuntimeState {
     peer_eps: HashMap<String, EndpointSlot>,
     peer_addr_blobs: HashMap<String, Vec<u8>>,
     lane_verified: bool,
+    recv_slab: Rc<RecvSlab>,
 }
 
 struct EndpointSlot {
@@ -557,13 +689,14 @@ impl RemovedEndpoint {
 }
 
 impl RuntimeState {
-    fn new(worker: ucp_worker_h, local_peer_id: String) -> Self {
+    fn new(worker: ucp_worker_h, local_peer_id: String, recv_slab: Rc<RecvSlab>) -> Self {
         Self {
             worker,
             local_peer_id,
             peer_eps: HashMap::new(),
             peer_addr_blobs: HashMap::new(),
             lane_verified: false,
+            recv_slab,
         }
     }
 
@@ -695,7 +828,7 @@ async fn client_fetch(
         return Err(BcError::Peer(format!("bad chunk length {length}")));
     }
 
-    let (checked_out, removed_before, worker, requester_peer_id) = {
+    let (checked_out, removed_before, worker, requester_peer_id, slab) = {
         let mut runtime = state.borrow_mut();
         let removed_before = runtime.update_peer_addr_blob(peer_id, peer_addr_blob);
         let checked_out = runtime.checkout_endpoint(peer_id, peer_addr_blob)?;
@@ -704,13 +837,15 @@ async fn client_fetch(
             removed_before,
             runtime.worker,
             runtime.local_peer_id.clone(),
+            runtime.recv_slab.clone(),
         )
     };
     if let Some(removed) = removed_before {
         close_removed_endpoint(removed).await;
     }
 
-    let result = client_fetch_inner(worker, checked_out.ep, key, length, &requester_peer_id).await;
+    let result =
+        client_fetch_inner(worker, checked_out.ep, key, length, &requester_peer_id, &slab).await;
     if should_mark_endpoint_broken(&result) {
         state.borrow_mut().mark_peer_ep_broken(peer_id);
     }
@@ -727,30 +862,31 @@ async fn client_fetch_inner(
     key: &ChunkKey,
     length: u32,
     requester_peer_id: &str,
+    slab: &Rc<RecvSlab>,
 ) -> Result<Bytes> {
     let id = REQ_ID.fetch_add(1, Ordering::Relaxed);
     let req_tag = TAG_REQ_BASE | id;
     let resp_tag = TAG_RESP_BASE | id;
 
-    // SAFETY: allocate uninitialized buffer of exactly the bytes UCX will write.
-    // We only ever read [..resp_len] returned by tag_recv, so the uninit tail
-    // (if any) is never observed. Same pattern as the v2.3.1 server-side fix:
-    // skipping zero-init saves ~244 µs per 4 MiB chunk on the hot path.
+    // v2.3.3: receive into a pre-registered slab slot so UCX's reg-cache
+    // hits immediately and the rendezvous path goes RDMA without a per-
+    // request memory registration. The slot itself is uninitialized
+    // (Box<[u8]> backing via MaybeUninit); only [..resp_len] is read.
     let total = 8 + length as usize;
-    let mut resp_buf: Vec<u8> = Vec::with_capacity(total);
-    unsafe {
-        resp_buf.set_len(total);
-    }
+    let mut slot = slab.checkout().await?;
     let req = encode_request(key, length, requester_peer_id)?;
     // Post recv FIRST (so server's reply isn't dropped if it races our send),
     // post send, then await both concurrently. Sequential .await on recv would
     // deadlock: server can't reply until we send the request.
-    let recv_fut = tag_recv(worker, &mut resp_buf, resp_tag);
-    let send_fut = tag_send(ep, &req, req_tag);
-    let (send_res, recv_res) = tokio::join!(send_fut, recv_fut);
-    send_res?;
-    let resp_len = recv_res?;
-    decode_response(&resp_buf[..resp_len], length)
+    let resp_len = {
+        let recv_slice = slot.as_mut_slice(total);
+        let recv_fut = tag_recv(worker, recv_slice, resp_tag);
+        let send_fut = tag_send(ep, &req, req_tag);
+        let (send_res, recv_res) = tokio::join!(send_fut, recv_fut);
+        send_res?;
+        recv_res?
+    };
+    decode_response(&slot.as_mut_slice(total)[..resp_len], length)
 }
 
 async fn client_health(
