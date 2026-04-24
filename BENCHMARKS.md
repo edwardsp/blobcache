@@ -821,12 +821,65 @@ Both are substantial rewrites — not v2.3 micro-tuning. Recording
 this so we don't re-try the env-only path expecting different
 results.
 
+### v2.3-E follow-up — NUMA pinning (also NEGATIVE)
+
+**Hypothesis tested.** The v2.3-E multi-NIC regression might be a
+NUMA-locality artefact rather than a true daemon-bound ceiling: gb300
+nodes are 2× Grace Neoverse-V2 sockets (128 cores total), with
+mlx5_0/mlx5_1 on NUMA node 0 (cores 0–63) and mlx5_2/mlx5_3 on NUMA
+node 1 (cores 64–127). The unpinned daemon was floating across both
+sockets (`Cpus_allowed_list: 0-127`), so progress-loop polling on
+multi-rail traffic could be eating cross-socket interconnect cost on
+every `ucp_worker_progress` iteration.
+
+**Setup.** Daemon launched under `numactl --cpunodebind=0 --membind=0`
+via a wrapper at `/opt/blobcache/blobcached` that re-execs the real
+binary. UCX restricted to the two NUMA-0-local NICs:
+`UCX_NET_DEVICES=mlx5_0:1,mlx5_1:1`, `UCX_MAX_RNDV_RAILS=2`. Pinning
+verified live via `/proc/1/status` (`Cpus_allowed_list: 0-63`,
+`Mems_allowed_list: 0-1`). Same v2.3.3 binary (md5
+`ad4402076c4b507771dfe8a69a93d21a`), same warm-peer methodology, same
+`drop_caches` between runs.
+
+**Result.**
+
+| streams | v2.3.3 (1 NIC, unpinned) | v2.3-E (2-rail, unpinned) | NUMA-pinned 2-rail |
+|---|---|---|---|
+| 1 | 3550 | 2209 | **1840** (run1), **1398** (run2) |
+| 4 | 10135 | 7297 | **7562** (run1), **5770** (run2) |
+| 8 | 11750 | 8338 | **10693** (run1), **11932** (run2) |
+
+NUMA-pinned 2-rail is **worse** than unpinned 2-rail at 1-stream
+(1840 vs 2209) and roughly comparable at 4 / 8 streams. Pinning did
+**not** rescue the multi-NIC regression — it deepened it at low
+concurrency. The 8-stream variance (10.7 → 11.9 GiB/s across two
+runs) means the apparent "match" with v2.3.3 baseline is within noise
+band, not a real win.
+
+**Why pinning made things worse, not better.** Restricting to NUMA
+node 0 cuts the tokio runtime's available cores from 128 to 64. The
+daemon is single-threaded for `ucp_worker_progress`, but tokio worker
+threads still service hash-routed peer requests, FUSE callbacks,
+gossip, and metrics in parallel. Halving the worker pool starves
+those concurrent paths, and that hurts more than NUMA-local NIC
+affinity helps. Cross-socket UPI traffic on NIC progress was a real
+cost — but a smaller one than the cost of giving up half the cores.
+
+**Implication.** The v2.3-E multi-NIC negative result is **not** a
+NUMA artefact; it's a true ceiling. The single-threaded UCX worker
+cannot effectively drive multiple rails regardless of which socket it
+runs on. Both per-NIC dedicated workers (multi-thread UCX progress)
+and per-NIC daemon processes remain the only architectural paths
+forward — and both would need to also handle the tokio-worker
+oversubscription that pinning exposed.
+
 ### Net conclusion of the v2.3 series
 
-Five experiments planned (A → E); three landed real wins
-(v2.3.1 sequential-await fix, v2.3.2 zero-init recv, v2.3.3
-RegisteredSlab) and two were honest negative results (v2.3-D FUSE
-tuning, v2.3-E multi-NIC). The shipped headline:
+Five experiments planned (A → E), plus a NUMA follow-up; three landed
+real wins (v2.3.1 sequential-await fix, v2.3.2 zero-init recv, v2.3.3
+RegisteredSlab) and three were honest negative results (v2.3-D FUSE
+tuning, v2.3-E multi-NIC, v2.3-E NUMA pinning). The shipped headline:
 **1-stream 3550 MiB/s, 8-stream 11.75 GiB/s** — bounded by the
-single-threaded daemon, not the fabric. Lifting that ceiling needs
-architectural work, not parameter tuning.
+single-threaded daemon, not the fabric, not NUMA locality. Lifting
+that ceiling needs architectural work (per-NIC workers, per-NIC
+daemons), not parameter tuning.
