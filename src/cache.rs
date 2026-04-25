@@ -259,6 +259,11 @@ impl DiskCache {
         g.entries.get(key).map(|e| e.size)
     }
 
+    pub fn live_keys(&self) -> Vec<ChunkKey> {
+        let g = self.inner.lock();
+        g.entries.keys().cloned().collect()
+    }
+
     fn touch_lru(self: &Arc<Self>, key: &ChunkKey) -> bool {
         let mut g = self.inner.lock();
         let prev_seq = match g.entries.get(key) {

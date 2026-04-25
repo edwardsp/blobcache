@@ -16,6 +16,10 @@ peer_concurrency = 8
 prefetch_depth = 16
 prefetch_threshold = 3
 prefetch_concurrency = 32
+bloom_bits = 8388608          # 1 MiB / peer; FP ~0.024% at 100k entries
+bloom_rebuild_secs = 30
+bloom_pull_secs = 5
+peer_max_candidates = 4
 
 [stats]
 bind = "0.0.0.0:7773"

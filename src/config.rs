@@ -55,6 +55,14 @@ pub struct TransportConfig {
     pub prefetch_concurrency: usize,
     #[serde(default = "default_transport_kind")]
     pub kind: String,
+    #[serde(default = "default_bloom_bits")]
+    pub bloom_bits: usize,
+    #[serde(default = "default_bloom_rebuild_secs")]
+    pub bloom_rebuild_secs: u64,
+    #[serde(default = "default_bloom_pull_secs")]
+    pub bloom_pull_secs: u64,
+    #[serde(default = "default_peer_max_candidates")]
+    pub peer_max_candidates: usize,
 }
 fn default_chunk_concurrency() -> usize {
     32
@@ -73,6 +81,18 @@ fn default_prefetch_concurrency() -> usize {
 }
 fn default_transport_kind() -> String {
     "tcp".into()
+}
+fn default_bloom_bits() -> usize {
+    1 << 23
+}
+fn default_bloom_rebuild_secs() -> u64 {
+    30
+}
+fn default_bloom_pull_secs() -> u64 {
+    5
+}
+fn default_peer_max_candidates() -> usize {
+    4
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

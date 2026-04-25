@@ -14,6 +14,7 @@ mod error;
 mod fetcher;
 mod fuse_fs;
 mod nic;
+mod peerindex;
 mod stats;
 mod transport;
 #[cfg(feature = "ucx")]
@@ -25,6 +26,7 @@ use crate::cache::DiskCache;
 use crate::cluster::{Membership, NodeInfo, NodeState};
 use crate::config::Config;
 use crate::fetcher::Fetcher;
+use crate::peerindex::PeerIndex;
 use crate::stats::Stats;
 use crate::transport::PeerService;
 
@@ -171,6 +173,7 @@ fn main() -> anyhow::Result<()> {
             .as_secs(),
         state: NodeState::Alive,
         incarnation: 1,
+        bloom_version: 0,
     };
     #[allow(unused_mut)]
     let mut membership = Membership::new(me, stats.cluster_stats.clone());
@@ -215,6 +218,8 @@ fn main() -> anyhow::Result<()> {
 
     tracing::info!(kind = %cfg.transport.kind, "peer transport client initialised");
 
+    let peer_index = PeerIndex::new(node_id.clone(), cfg.transport.bloom_bits);
+
     let fetcher = Arc::new(Fetcher::new(
         cache.clone(),
         blobs.clone(),
@@ -226,6 +231,8 @@ fn main() -> anyhow::Result<()> {
         cfg.transport.prefetch_depth,
         cfg.transport.prefetch_threshold,
         cfg.transport.prefetch_concurrency,
+        peer_index.clone(),
+        cfg.transport.peer_max_candidates,
     ));
 
     let transport_addr: std::net::SocketAddr = cfg
@@ -270,7 +277,7 @@ fn main() -> anyhow::Result<()> {
     }
     rt.spawn({
         let m = membership.clone();
-        let s = cluster::GossipServer::new(m);
+        let s = cluster::GossipServer::new(m).with_peer_index(peer_index.clone());
         async move {
             if let Err(e) = s.serve(cluster_addr).await {
                 tracing::error!(error = %e, "gossip server died");
@@ -280,6 +287,18 @@ fn main() -> anyhow::Result<()> {
     rt.spawn(cluster::run_gossip_loop(
         membership.clone(),
         cfg.cluster.seeds.clone(),
+    ));
+    rt.spawn(run_bloom_rebuild_loop(
+        peer_index.clone(),
+        cache.clone(),
+        membership.clone(),
+        cfg.transport.bloom_rebuild_secs,
+    ));
+    rt.spawn(run_bloom_pull_loop(
+        peer_index.clone(),
+        membership.clone(),
+        stats.clone(),
+        cfg.transport.bloom_pull_secs,
     ));
     rt.spawn(stats::serve(
         stats.clone(),
@@ -339,6 +358,125 @@ fn hostname() -> Option<String> {
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+async fn run_bloom_rebuild_loop(
+    peer_index: Arc<PeerIndex>,
+    cache: Arc<DiskCache>,
+    membership: Membership,
+    period_secs: u64,
+) {
+    let period = std::time::Duration::from_secs(period_secs.max(1));
+    let mut tick = tokio::time::interval(period);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        let pi = peer_index.clone();
+        let c = cache.clone();
+        // Bloom rebuild walks the live cache key set and re-hashes all entries; do
+        // it on a blocking thread so the tokio worker is not stalled by I/O.
+        let res = tokio::task::spawn_blocking(move || {
+            pi.rebuild_local_from_cache(&c);
+            pi.local_version()
+        })
+        .await;
+        match res {
+            Ok(v) => {
+                membership.set_bloom_version(v);
+                tracing::debug!(version = v, "bloom rebuild complete");
+            }
+            Err(e) => tracing::warn!(error = %e, "bloom rebuild task panicked"),
+        }
+    }
+}
+
+async fn run_bloom_pull_loop(
+    peer_index: Arc<PeerIndex>,
+    membership: Membership,
+    stats: Arc<Stats>,
+    period_secs: u64,
+) {
+    let period = std::time::Duration::from_secs(period_secs.max(1));
+    let mut tick = tokio::time::interval(period);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let client = match reqwest::Client::builder()
+        .pool_idle_timeout(std::time::Duration::from_secs(30))
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, "bloom pull client build failed");
+            return;
+        }
+    };
+    loop {
+        tick.tick().await;
+        let alive: Vec<NodeInfo> = membership
+            .members_all()
+            .into_iter()
+            .filter(|n| matches!(n.state, NodeState::Alive))
+            .collect();
+        let me = peer_index.me_id.clone();
+        let mut alive_ids = std::collections::HashSet::new();
+        for n in alive.iter() {
+            alive_ids.insert(n.id.clone());
+        }
+        // Forget bloom state for peers that have left the cluster so we don't
+        // route to a dead node based on a stale digest.
+        for entry in membership.members_all() {
+            if !alive_ids.contains(&entry.id) {
+                peer_index.drop_remote(&entry.id);
+            }
+        }
+        for n in alive.iter() {
+            if n.id == me {
+                continue;
+            }
+            if n.bloom_version == 0 {
+                continue;
+            }
+            let have = peer_index.remote_version(&n.id).unwrap_or(0);
+            if n.bloom_version <= have {
+                continue;
+            }
+            let url = format!("{}/cluster/bloom", n.gossip_url.trim_end_matches('/'));
+            let req = client.get(&url).send().await;
+            match req {
+                Ok(resp) if resp.status().is_success() => {
+                    let v_hdr = resp
+                        .headers()
+                        .get("x-blobcache-bloom-version")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .unwrap_or(n.bloom_version);
+                    match resp.bytes().await {
+                        Ok(body) => {
+                            if peer_index.ingest_remote(&n.id, v_hdr, &body) {
+                                stats.peer_bloom_pulls_total.inc();
+                                tracing::debug!(peer=%n.id, version=v_hdr, bytes=body.len(), "ingested peer bloom");
+                            } else {
+                                stats.peer_bloom_pull_errors_total.inc();
+                                tracing::warn!(peer=%n.id, "peer bloom payload rejected");
+                            }
+                        }
+                        Err(e) => {
+                            stats.peer_bloom_pull_errors_total.inc();
+                            tracing::warn!(peer=%n.id, error=%e, "peer bloom body read failed");
+                        }
+                    }
+                }
+                Ok(resp) => {
+                    stats.peer_bloom_pull_errors_total.inc();
+                    tracing::debug!(peer=%n.id, status=%resp.status(), "peer bloom non-2xx");
+                }
+                Err(e) => {
+                    stats.peer_bloom_pull_errors_total.inc();
+                    tracing::debug!(peer=%n.id, error=%e, "peer bloom GET failed");
+                }
+            }
+        }
+    }
 }
 
 fn hex32(b: &[u8; 32]) -> String {

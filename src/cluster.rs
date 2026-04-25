@@ -40,6 +40,8 @@ pub struct NodeInfo {
     pub last_seen_unix: u64,
     pub state: NodeState,
     pub incarnation: u64,
+    #[serde(default)]
+    pub bloom_version: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -53,6 +55,7 @@ pub struct Membership {
     pub me_id: String,
     pub me_template: NodeInfo,
     me_incarnation: Arc<AtomicU64>,
+    me_bloom_version: Arc<AtomicU64>,
     inner: Arc<RwLock<Inner>>,
     pub stats: Arc<crate::stats::ClusterStats>,
     #[cfg(feature = "ucx")]
@@ -68,10 +71,12 @@ impl Membership {
         let mut m = HashMap::new();
         m.insert(me.id.clone(), me.clone());
         let me_incarnation = Arc::new(AtomicU64::new(me.incarnation.max(1)));
+        let me_bloom_version = Arc::new(AtomicU64::new(me.bloom_version));
         Self {
             me_id: me.id.clone(),
             me_template: me,
             me_incarnation,
+            me_bloom_version,
             inner: Arc::new(RwLock::new(Inner { members: m })),
             stats,
             #[cfg(feature = "ucx")]
@@ -90,9 +95,14 @@ impl Membership {
     pub fn me_snapshot(&self) -> NodeInfo {
         let mut me = self.me_template.clone();
         me.incarnation = self.me_incarnation.load(Ordering::Relaxed);
+        me.bloom_version = self.me_bloom_version.load(Ordering::Relaxed);
         me.last_seen_unix = unix_now();
         me.state = NodeState::Alive;
         me
+    }
+
+    pub fn set_bloom_version(&self, v: u64) {
+        self.me_bloom_version.store(v, Ordering::Relaxed);
     }
 
     pub fn members_alive(&self) -> Vec<NodeInfo> {
@@ -229,11 +239,20 @@ fn unix_now() -> u64 {
 
 pub struct GossipServer {
     pub membership: Membership,
+    pub peer_index: Option<Arc<crate::peerindex::PeerIndex>>,
 }
 
 impl GossipServer {
     pub fn new(membership: Membership) -> Self {
-        Self { membership }
+        Self {
+            membership,
+            peer_index: None,
+        }
+    }
+
+    pub fn with_peer_index(mut self, peer_index: Arc<crate::peerindex::PeerIndex>) -> Self {
+        self.peer_index = Some(peer_index);
+        self
     }
 
     pub async fn serve(self, addr: SocketAddr) -> Result<()> {
@@ -249,13 +268,16 @@ impl GossipServer {
         let listener = TcpListener::bind(addr).await?;
         tracing::info!(%addr, "cluster gossip listening");
         let me = self.membership;
+        let pi = self.peer_index;
         loop {
             let (stream, _peer) = listener.accept().await?;
             let me = me.clone();
+            let pi = pi.clone();
             tokio::spawn(async move {
                 let io = TokioIo::new(stream);
                 let _ = http1::Builder::new().serve_connection(io, service_fn(move |req: Request<Incoming>| {
                     let me = me.clone();
+                    let pi = pi.clone();
                     async move {
                         let resp = match (req.method(), req.uri().path()) {
                             (&Method::POST, "/cluster/sync") => {
@@ -290,6 +312,18 @@ impl GossipServer {
                                     Err(e) => Response::builder().status(400)
                                         .body(Full::new(HBytes::from(format!("bad: {e}")))).unwrap(),
                                 }
+                            }
+                            (&Method::GET, "/cluster/bloom") => match &pi {
+                                Some(idx) => {
+                                    let body = idx.local_serialised();
+                                    let v = idx.local_version();
+                                    Response::builder().status(200)
+                                        .header("content-type", "application/octet-stream")
+                                        .header("x-blobcache-bloom-version", v.to_string())
+                                        .body(Full::new(HBytes::from(body))).unwrap()
+                                }
+                                None => Response::builder().status(404)
+                                    .body(Full::new(HBytes::new())).unwrap(),
                             }
                             _ => Response::builder().status(404).body(Full::new(HBytes::new())).unwrap(),
                         };

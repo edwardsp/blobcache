@@ -22,6 +22,11 @@ pub struct Stats {
     pub prefetch_skipped_inflight: IntCounter,
     pub prefetch_completed_ok: IntCounter,
     pub prefetch_completed_err: IntCounter,
+    pub peer_bloom_yes: IntCounter,
+    pub peer_bloom_no_holder: IntCounter,
+    pub peer_bloom_false_positive: IntCounter,
+    pub peer_bloom_pulls_total: IntCounter,
+    pub peer_bloom_pull_errors_total: IntCounter,
     pub peer_stats: Arc<PeerStats>,
     pub cluster_stats: Arc<ClusterStats>,
     pub members_alive: IntGauge,
@@ -101,6 +106,31 @@ impl Stats {
         let prefetch_completed_err = IntCounter::new(
             "blobcache_prefetch_completed_err_total",
             "prefetch chunk fetches that failed",
+        )
+        .unwrap();
+        let peer_bloom_yes = IntCounter::new(
+            "blobcache_peer_bloom_yes_total",
+            "fetches where at least one peer bloom indicated holder",
+        )
+        .unwrap();
+        let peer_bloom_no_holder = IntCounter::new(
+            "blobcache_peer_bloom_no_holder_total",
+            "fetches with peers known but no bloom-positive holder",
+        )
+        .unwrap();
+        let peer_bloom_false_positive = IntCounter::new(
+            "blobcache_peer_bloom_false_positive_total",
+            "bloom-positive peers that returned NotFound",
+        )
+        .unwrap();
+        let peer_bloom_pulls_total = IntCounter::new(
+            "blobcache_peer_bloom_pulls_total",
+            "successful peer bloom pulls",
+        )
+        .unwrap();
+        let peer_bloom_pull_errors_total = IntCounter::new(
+            "blobcache_peer_bloom_pull_errors_total",
+            "failed peer bloom pulls",
         )
         .unwrap();
         let chunk_requests = IntCounter::new(
@@ -195,6 +225,11 @@ impl Stats {
             &prefetch_skipped_inflight,
             &prefetch_completed_ok,
             &prefetch_completed_err,
+            &peer_bloom_yes,
+            &peer_bloom_no_holder,
+            &peer_bloom_false_positive,
+            &peer_bloom_pulls_total,
+            &peer_bloom_pull_errors_total,
             &chunk_requests,
             &chunk_bytes_served,
             #[cfg(feature = "ucx")]
@@ -243,6 +278,11 @@ impl Stats {
             prefetch_skipped_inflight,
             prefetch_completed_ok,
             prefetch_completed_err,
+            peer_bloom_yes,
+            peer_bloom_no_holder,
+            peer_bloom_false_positive,
+            peer_bloom_pulls_total,
+            peer_bloom_pull_errors_total,
             members_alive,
             members_dead,
             chunk_total_seconds,

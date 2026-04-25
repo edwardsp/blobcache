@@ -2,7 +2,6 @@ use base64::prelude::{Engine as _, BASE64_STANDARD};
 use bytes::Bytes;
 use dashmap::DashMap;
 use parking_lot::Mutex;
-use rand::seq::SliceRandom;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{broadcast, Semaphore};
@@ -12,6 +11,7 @@ use crate::cache::{ChunkKey, DiskCache};
 use crate::cluster::Membership;
 use crate::config::MountConfig;
 use crate::error::{BcError, Result};
+use crate::peerindex::{key_digest, PeerIndex};
 use crate::stats::Stats;
 use crate::transport::PeerClient;
 // Hard cap on a single fetch_range call. Prevents an unbounded readahead from
@@ -26,28 +26,16 @@ type InflightTx = broadcast::Sender<std::result::Result<Bytes, String>>;
 
 pub struct Fetcher {
     pub cache: Arc<DiskCache>,
-    // Per-mount BlobClient: each mount may have its own resolved credential
-    // (one container could be SAS-token, another MSI-bearer). A single shared
-    // client would attach the wrong Authorization header to half the calls.
     pub blobs: Arc<HashMap<String, Arc<BlobClient>>>,
     pub peers: Arc<PeerClient>,
     pub membership: Membership,
     pub stats: Arc<Stats>,
     pub chunk_size: u64,
+    pub peer_index: Arc<PeerIndex>,
+    pub peer_max_candidates: usize,
     inflight: Arc<Mutex<HashMap<ChunkKey, InflightTx>>>,
     chunk_sem: Arc<Semaphore>,
-    // Chunks fetched from a peer/blob whose disk insert is still in flight.
-    // Read paths consult this before hitting cache.try_get so a follower
-    // arriving in the 1.25 ms window between data-return and disk-commit
-    // sees the bytes instead of triggering a redundant peer fetch.
     inflight_writes: Arc<DashMap<ChunkKey, Bytes>>,
-    // Per-(mount,blob) sequential-read tracker. Drives readahead: once the
-    // caller has issued `prefetch_threshold` consecutive forward reads we
-    // spawn background fetches for the next `prefetch_depth` chunks. This
-    // exists because FUSE serialises read() at the kernel boundary and
-    // delivers one ~128 KiB sub-read at a time, which collapses our
-    // chunk_concurrency budget to 1 effective in-flight blob fetch per
-    // stream and caps single-stream cold throughput at ~50 MiB/s.
     seq_state: Arc<DashMap<String, SeqState>>,
     prefetch_sem: Arc<Semaphore>,
     prefetch_depth: u32,
@@ -101,6 +89,8 @@ impl Fetcher {
         prefetch_depth: u32,
         prefetch_threshold: u32,
         prefetch_concurrency: usize,
+        peer_index: Arc<PeerIndex>,
+        peer_max_candidates: usize,
     ) -> Self {
         let permits = chunk_concurrency.max(1);
         let pf_permits = prefetch_concurrency.max(1);
@@ -111,6 +101,8 @@ impl Fetcher {
             membership,
             stats,
             chunk_size,
+            peer_index,
+            peer_max_candidates: peer_max_candidates.max(1),
             inflight: Arc::new(Mutex::new(HashMap::new())),
             chunk_sem: Arc::new(Semaphore::new(permits)),
             inflight_writes: Arc::new(DashMap::new()),
@@ -351,9 +343,20 @@ impl Fetcher {
         expected_len: u64,
     ) -> Result<Bytes> {
         let alive = self.membership.members_alive();
-        let mut shuffled = alive;
-        shuffled.shuffle(&mut rand::thread_rng());
-        for peer in shuffled.iter().take(3) {
+        let candidates = self
+            .peer_index
+            .rank_candidates(key, &alive, self.peer_max_candidates, self.peer_max_candidates);
+        let yes_count = candidates.yes.len();
+        let maybe_count = candidates.maybe.len();
+        if yes_count > 0 {
+            self.stats.peer_bloom_yes.inc();
+        } else if !alive.is_empty() {
+            self.stats.peer_bloom_no_holder.inc();
+        }
+        let ordered = candidates.merged(self.peer_max_candidates);
+        for (idx, peer) in ordered.iter().enumerate() {
+            let was_yes = idx < yes_count;
+            let _ = maybe_count;
             let worker_addr = match &peer.ucx_worker_addr_b64 {
                 Some(encoded) => match BASE64_STANDARD.decode(encoded) {
                     Ok(decoded) => Some(decoded),
@@ -394,12 +397,9 @@ impl Fetcher {
             self.stats
                 .chunk_peer_fetch_seconds
                 .observe(t_peer.elapsed().as_secs_f64());
-            match peer_res
-            {
+            match peer_res {
                 Ok(data) => {
                     if data.len() as u64 != expected_len {
-                        // Peer served a chunk of the wrong size. Don't poison
-                        // our cache with it; try the next peer.
                         tracing::warn!(
                             peer = %peer.transport_url,
                             key = ?key,
@@ -417,6 +417,9 @@ impl Fetcher {
                 }
                 Err(BcError::NotFound(_)) => {
                     self.stats.peer_fetches_miss.inc();
+                    if was_yes {
+                        self.stats.peer_bloom_false_positive.inc();
+                    }
                     continue;
                 }
                 Err(e) => {
@@ -443,8 +446,6 @@ impl Fetcher {
             )
             .await?;
         if data.len() as u64 != expected_len {
-            // Origin returned a short chunk. This is normal only at EOF, but
-            // expected_len was already clipped to file_size by the caller.
             return Err(BcError::Other(format!(
                 "blob returned wrong length: got {} want {} for {}@{}",
                 data.len(),
@@ -464,13 +465,16 @@ impl Fetcher {
         let cache = self.cache.clone();
         let stats = self.stats.clone();
         let inflight = self.inflight_writes.clone();
+        let peer_index = self.peer_index.clone();
         let k = key.clone();
+        let digest = key_digest(&k);
         tokio::spawn(async move {
             let t_ins = std::time::Instant::now();
             let _ = tokio::task::spawn_blocking(move || cache.insert(k, &data)).await;
             stats
                 .chunk_cache_insert_seconds
                 .observe(t_ins.elapsed().as_secs_f64());
+            peer_index.note_local_insert(&digest);
             inflight.remove(&key);
         });
     }
@@ -554,6 +558,8 @@ impl Fetcher {
             membership: self.membership.clone(),
             stats: self.stats.clone(),
             chunk_size: self.chunk_size,
+            peer_index: self.peer_index.clone(),
+            peer_max_candidates: self.peer_max_candidates,
             inflight: self.inflight.clone(),
             chunk_sem: self.chunk_sem.clone(),
             inflight_writes: self.inflight_writes.clone(),
