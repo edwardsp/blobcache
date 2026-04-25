@@ -13,6 +13,7 @@ mod config;
 mod error;
 mod fetcher;
 mod fuse_fs;
+mod hydrate;
 mod nic;
 mod peerindex;
 mod stats;
@@ -350,6 +351,12 @@ fn main() -> anyhow::Result<()> {
         stats_addr,
         cache.clone(),
         membership.clone(),
+        fetcher.clone(),
+        blobs.clone(),
+        mounts.clone(),
+        cfg.cache.chunk_size,
+        node_id.clone(),
+        advertise.clone(),
     ));
 
     let handle = rt.handle().clone();

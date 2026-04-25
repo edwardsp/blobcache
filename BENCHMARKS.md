@@ -1508,3 +1508,135 @@ but the worst case (true zero-stagger) is still 35 % and 0 timeouts.
   different chunks in parallel. Designed to make first-time model loads
   saturate aggregate cluster bandwidth instead of any single node's
   Azure egress.
+
+---
+
+## v2.7.0 — Hydrate API: parallel sharded cache pre-warm
+
+### What it is
+
+`POST /hydrate` is an explicit "warm the cluster cache for this
+mount + path" endpoint. The node that receives the request becomes
+the **coordinator**: it lists matching blobs, enumerates every chunk,
+shards them round-robin across all alive cluster members (including
+itself), and fan-outs `POST /hydrate-shard` to each peer with that
+peer's chunk batch. Each worker pulls its assigned chunks through
+the local `Fetcher` (same code path as a FUSE read-miss), which
+inserts them into the local cache and updates the bloom advert.
+
+### Why round-robin (not HRW)
+
+HRW per-chunk and round-robin both produce roughly even shards
+(1/N each). The user-visible difference is zero once a chunk is
+hydrated: any subsequent read finds a holder in 1 RTT either way,
+because the bloom-yes routing introduced in v2.5.0 already steers
+reads to whichever node holds the chunk, regardless of how it was
+originally placed. RR was chosen for simplicity and deterministic
+benchmarking (every peer receives exactly `ceil(total/N)` chunks).
+
+### API
+
+```http
+POST /hydrate
+Content-Type: application/json
+{
+  "mount":     "deepseek",
+  "path":      "model-00050-of-000163.safetensors",
+  "recursive": false
+}
+```
+
+`path` is interpreted relative to `mount.prefix`. If `recursive`
+is true (default), `path` is treated as a directory prefix and
+every blob under it is hydrated in one call.
+
+Response includes per-peer `assigned_chunks`, `fetched`, `bytes`,
+`elapsed_ms`, and any errors — useful for diagnosing slow members.
+
+### Hydrate throughput (8 pods, RDMA, gb300)
+
+Test file: 2.42 GB, 577 chunks of 4 MiB each.
+Coordinator: pod-6mh7f. Storage: cold (file never read before).
+
+| metric                       | value                |
+|------------------------------|---------------------:|
+| total_bytes                  | 2,419,599,560        |
+| total_chunks                 | 577                  |
+| coordinator wall-clock       | 1.53 s               |
+| server-side `elapsed_ms`     | 632 ms               |
+| aggregate throughput         | **3,651 MiB/s**      |
+| chunks per peer (RR)         | 72-73 (perfectly even) |
+| per-peer elapsed             | 14-35 ms hot, 632 ms cold |
+
+For comparison, a single-node baseline reading the same 4.16 GB
+file over a single Azure connection took 9.6 s (433 MiB/s). On a
+larger 4.16 GB / 992-chunk file, hydrate completes in 1.58 s
+wall (700 ms server-side), giving **5,663 MiB/s aggregate** and
+a **6.1× speedup** over single-node.
+
+Per-peer fetch counts during the cold hydrate of the 577-chunk
+file:
+
+| pod   | Δblob_fetches | Δpeer_fetches_ok | role |
+|-------|--------------:|-----------------:|------|
+| 6mh7f |            89 |               64 | shard 0 (also coordinator) |
+| 79p8w |            64 |               66 | shard 1 |
+| 9szsp |            82 |               61 | shard 2 |
+| bd85l |            77 |               59 | shard 3 |
+| brw8c |            71 |               60 | shard 4 |
+| dr58v |            67 |               66 | shard 5 |
+| gqvfb |            58 |               63 | shard 6 |
+| p2zpc |            69 |               59 | shard 7 |
+| **sum** |       **577** |          **498** | |
+
+The blob-fetch sum exactly matches the chunk count (577), which
+is the desired property: every byte is pulled from Azure exactly
+once, and the work is split evenly across all 8 nodes' egress
+bandwidth. The non-zero peer_fetches_ok during hydrate comes from
+stampede coordination — when two shards happen to land on the
+same Azure object at the same time, the v2.6.0 leader/follower
+mechanism prevents duplicate Azure pulls.
+
+### Post-hydrate warm read
+
+After hydration, a read from any pod is served entirely by the
+peer cache. Test: read the full 2.42 GB file from pod-9szsp
+~12 s after hydrate (two `bloom_pull_secs` cycles to ensure
+every node's view of every other node's bloom is current).
+
+| metric                         | value             |
+|--------------------------------|------------------:|
+| read elapsed                   | 2.17 s            |
+| throughput                     | **1,063 MiB/s**   |
+| Δblob_fetches (cluster-wide)   | **0**             |
+| Δpeer_fetches_ok on reader     | 434               |
+| chunks served from local cache | 143 (already on 9szsp from its hydrate shard) |
+
+`Δblob_fetches = 0` is the key correctness signal: hydrate plus a
+post-hydrate bloom-propagation wait completely eliminates Azure
+traffic for subsequent reads. Without the wait (test repeated
+immediately after hydrate, before the 5 s `bloom_pull_secs` cycle),
+the reader's bloom view is stale and it falls back to the blob
+for chunks the bloom hasn't advertised yet — observed earlier in
+testing as 235 spurious blob fetches on a fresh cluster restart.
+
+### Operational notes
+
+- The coordinator's `/hydrate` reply is synchronous: it returns
+  only after every peer has finished its shard. For very large
+  hydrates (multi-TB), wrap the request in a background job and
+  poll cluster metrics for progress (no progress endpoint yet).
+- After hydrate, callers should wait at least one
+  `bloom_pull_secs` cycle (default 5 s) before issuing read traffic
+  if they want guaranteed peer-only reads. In practice, a 10-15 s
+  margin is comfortable.
+- The shard endpoint (`/hydrate-shard`) is intentionally callable
+  on its own — useful for re-driving a single failed peer without
+  re-running the full coordinator pass.
+
+### Known follow-ups
+
+- Async hydrate with progress endpoint (long-running multi-TB jobs).
+- Built-in bloom-propagation wait so callers don't need to sleep.
+- Hydrate-on-mount: optional config flag to hydrate a directory at
+  startup, eliminating cold-start latency entirely.

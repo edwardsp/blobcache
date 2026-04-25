@@ -353,9 +353,15 @@ pub async fn serve(
     addr: std::net::SocketAddr,
     cache: Arc<crate::cache::DiskCache>,
     membership: crate::cluster::Membership,
+    fetcher: Arc<crate::fetcher::Fetcher>,
+    blobs: Arc<std::collections::HashMap<String, Arc<crate::azure::BlobClient>>>,
+    mounts: Arc<std::collections::HashMap<String, crate::config::MountConfig>>,
+    chunk_size: u64,
+    me_id: String,
+    me_transport_url: String,
 ) -> crate::error::Result<()> {
     use bytes::Bytes;
-    use http_body_util::Full;
+    use http_body_util::{BodyExt, Full};
     use hyper::body::Incoming;
     use hyper::server::conn::http1;
     use hyper::service::service_fn;
@@ -365,6 +371,11 @@ pub async fn serve(
     use std::sync::atomic::Ordering;
     use tokio::net::TcpListener;
 
+    let hydrate_http = reqwest::Client::builder()
+        .pool_idle_timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| crate::error::BcError::Other(format!("hydrate http build: {e}")))?;
+
     let listener = TcpListener::bind(addr).await?;
     tracing::info!(%addr, "stats endpoint listening");
     loop {
@@ -372,6 +383,12 @@ pub async fn serve(
         let s = stats.clone();
         let cache = cache.clone();
         let membership = membership.clone();
+        let fetcher = fetcher.clone();
+        let blobs = blobs.clone();
+        let mounts = mounts.clone();
+        let me_id = me_id.clone();
+        let me_url = me_transport_url.clone();
+        let hydrate_http = hydrate_http.clone();
         tokio::spawn(async move {
             let io = TokioIo::new(stream);
             let _ = http1::Builder::new()
@@ -381,6 +398,12 @@ pub async fn serve(
                         let s = s.clone();
                         let cache = cache.clone();
                         let membership = membership.clone();
+                        let fetcher = fetcher.clone();
+                        let blobs = blobs.clone();
+                        let mounts = mounts.clone();
+                        let me_id = me_id.clone();
+                        let me_url = me_url.clone();
+                        let hydrate_http = hydrate_http.clone();
                         async move {
                             let resp = match (req.method(), req.uri().path()) {
                                 (&Method::GET, "/metrics") => {
@@ -443,6 +466,102 @@ pub async fn serve(
                                     let v =
                                         serde_json::json!({"members": membership.members_all()});
                                     let body = serde_json::to_vec(&v).unwrap();
+                                    Response::builder()
+                                        .status(200)
+                                        .header("content-type", "application/json")
+                                        .body(Full::new(Bytes::from(body)))
+                                        .unwrap()
+                                }
+                                (&Method::POST, "/hydrate") => {
+                                    let body = match req.into_body().collect().await {
+                                        Ok(c) => c.to_bytes(),
+                                        Err(e) => {
+                                            return Ok::<_, Infallible>(
+                                                Response::builder()
+                                                    .status(400)
+                                                    .body(Full::new(Bytes::from(format!(
+                                                        "body read: {e}"
+                                                    ))))
+                                                    .unwrap(),
+                                            );
+                                        }
+                                    };
+                                    let hreq: crate::hydrate::HydrateRequest =
+                                        match serde_json::from_slice(&body) {
+                                            Ok(r) => r,
+                                            Err(e) => {
+                                                return Ok::<_, Infallible>(
+                                                    Response::builder()
+                                                        .status(400)
+                                                        .body(Full::new(Bytes::from(format!(
+                                                            "json: {e}"
+                                                        ))))
+                                                        .unwrap(),
+                                                );
+                                            }
+                                        };
+                                    match crate::hydrate::run_coordinator(
+                                        hreq,
+                                        chunk_size,
+                                        fetcher.clone(),
+                                        blobs.clone(),
+                                        mounts.clone(),
+                                        membership.clone(),
+                                        me_id.clone(),
+                                        me_url.clone(),
+                                        hydrate_http.clone(),
+                                    )
+                                    .await
+                                    {
+                                        Ok(r) => {
+                                            let body = serde_json::to_vec(&r).unwrap();
+                                            Response::builder()
+                                                .status(200)
+                                                .header("content-type", "application/json")
+                                                .body(Full::new(Bytes::from(body)))
+                                                .unwrap()
+                                        }
+                                        Err(e) => Response::builder()
+                                            .status(500)
+                                            .body(Full::new(Bytes::from(format!("{e}"))))
+                                            .unwrap(),
+                                    }
+                                }
+                                (&Method::POST, "/hydrate-shard") => {
+                                    let body = match req.into_body().collect().await {
+                                        Ok(c) => c.to_bytes(),
+                                        Err(e) => {
+                                            return Ok::<_, Infallible>(
+                                                Response::builder()
+                                                    .status(400)
+                                                    .body(Full::new(Bytes::from(format!(
+                                                        "body read: {e}"
+                                                    ))))
+                                                    .unwrap(),
+                                            );
+                                        }
+                                    };
+                                    let sreq: crate::hydrate::HydrateShardRequest =
+                                        match serde_json::from_slice(&body) {
+                                            Ok(r) => r,
+                                            Err(e) => {
+                                                return Ok::<_, Infallible>(
+                                                    Response::builder()
+                                                        .status(400)
+                                                        .body(Full::new(Bytes::from(format!(
+                                                            "json: {e}"
+                                                        ))))
+                                                        .unwrap(),
+                                                );
+                                            }
+                                        };
+                                    let r = crate::hydrate::run_shard(
+                                        sreq,
+                                        fetcher.clone(),
+                                        mounts.clone(),
+                                    )
+                                    .await;
+                                    let body = serde_json::to_vec(&r).unwrap();
                                     Response::builder()
                                         .status(200)
                                         .header("content-type", "application/json")
