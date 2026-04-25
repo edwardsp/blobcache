@@ -27,6 +27,10 @@ pub struct Stats {
     pub peer_bloom_false_positive: IntCounter,
     pub peer_bloom_pulls_total: IntCounter,
     pub peer_bloom_pull_errors_total: IntCounter,
+    pub peer_stampede_leader: IntCounter,
+    pub peer_stampede_follower: IntCounter,
+    pub peer_stampede_follower_ok: IntCounter,
+    pub peer_stampede_follower_timeout: IntCounter,
     pub peer_stats: Arc<PeerStats>,
     pub cluster_stats: Arc<ClusterStats>,
     pub members_alive: IntGauge,
@@ -133,6 +137,26 @@ impl Stats {
             "failed peer bloom pulls",
         )
         .unwrap();
+        let peer_stampede_leader = IntCounter::new(
+            "blobcache_peer_stampede_leader_total",
+            "fetches where this node is the HRW-top stampede leader",
+        )
+        .unwrap();
+        let peer_stampede_follower = IntCounter::new(
+            "blobcache_peer_stampede_follower_total",
+            "fetches where this node routes to HRW-top with wait_ms as a follower",
+        )
+        .unwrap();
+        let peer_stampede_follower_ok = IntCounter::new(
+            "blobcache_peer_stampede_follower_ok_total",
+            "stampede follower fetches that returned data within wait_ms",
+        )
+        .unwrap();
+        let peer_stampede_follower_timeout = IntCounter::new(
+            "blobcache_peer_stampede_follower_timeout_total",
+            "stampede follower fetches that fell through to blob (peer didn't deliver in time)",
+        )
+        .unwrap();
         let chunk_requests = IntCounter::new(
             "blobcache_peer_chunk_requests_total",
             "chunk requests served",
@@ -230,6 +254,10 @@ impl Stats {
             &peer_bloom_false_positive,
             &peer_bloom_pulls_total,
             &peer_bloom_pull_errors_total,
+            &peer_stampede_leader,
+            &peer_stampede_follower,
+            &peer_stampede_follower_ok,
+            &peer_stampede_follower_timeout,
             &chunk_requests,
             &chunk_bytes_served,
             #[cfg(feature = "ucx")]
@@ -283,6 +311,10 @@ impl Stats {
             peer_bloom_false_positive,
             peer_bloom_pulls_total,
             peer_bloom_pull_errors_total,
+            peer_stampede_leader,
+            peer_stampede_follower,
+            peer_stampede_follower_ok,
+            peer_stampede_follower_timeout,
             members_alive,
             members_dead,
             chunk_total_seconds,

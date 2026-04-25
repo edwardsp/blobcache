@@ -1,14 +1,14 @@
 use crate::cache::{ChunkKey, DiskCache};
 use crate::cluster::NodeInfo;
 use dashmap::DashMap;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use sha2::{Digest, Sha256};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 const BLOOM_K: usize = 4;
 pub const BLOOM_BITS_DEFAULT: usize = 1 << 23;
 
+#[derive(Clone)]
 pub struct Bloom {
     bits: Vec<u64>,
     m_bits: usize,
@@ -94,12 +94,33 @@ pub struct RemoteBloom {
     pub bloom: Bloom,
 }
 
+// Local view bundles bloom and version under a single RwLock so that
+// /cluster/bloom can serve a coherent (version, bytes) pair. v2.5.0 had a
+// publish race where local_version() and local_serialised() were two separate
+// lock acquisitions: a rebuild between them could publish stale bits with the
+// new version, freezing remote peers' caches with stale-but-trusted data for
+// up to bloom_pull_secs.
+struct Local {
+    version: u64,
+    bloom: Bloom,
+}
+
 pub struct PeerIndex {
     pub me_id: String,
     pub bloom_bits: usize,
-    local: Arc<RwLock<Bloom>>,
-    local_version: Arc<AtomicU64>,
-    remote: Arc<DashMap<String, RemoteBloom>>,
+    local: RwLock<Local>,
+    // Inserts during rebuild (between live_keys() snapshot and the swap of the
+    // freshly-built bloom) would be lost without an overlay: the snapshot can
+    // miss them, and the in-place insert into the soon-to-be-overwritten bloom
+    // is wiped by the swap. note_local_insert pushes here; rebuild drains
+    // these into the new bloom inside the same write-lock as the swap.
+    pending: Mutex<Vec<[u8; 32]>>,
+    remote: DashMap<String, RemoteBloom>,
+    // Optional callback fired whenever local_version advances. main.rs wires
+    // this to membership.set_bloom_version so peers see a fresh version
+    // immediately after a local insert (rather than waiting up to
+    // bloom_rebuild_secs for the periodic rebuild to bump it).
+    on_version_change: RwLock<Option<Arc<dyn Fn(u64) + Send + Sync>>>,
 }
 
 impl PeerIndex {
@@ -107,32 +128,76 @@ impl PeerIndex {
         Arc::new(Self {
             me_id,
             bloom_bits,
-            local: Arc::new(RwLock::new(Bloom::new(bloom_bits))),
-            local_version: Arc::new(AtomicU64::new(1)),
-            remote: Arc::new(DashMap::new()),
+            local: RwLock::new(Local {
+                version: 1,
+                bloom: Bloom::new(bloom_bits),
+            }),
+            pending: Mutex::new(Vec::new()),
+            remote: DashMap::new(),
+            on_version_change: RwLock::new(None),
         })
     }
 
+    pub fn set_on_version_change<F>(&self, hook: F)
+    where
+        F: Fn(u64) + Send + Sync + 'static,
+    {
+        *self.on_version_change.write() = Some(Arc::new(hook));
+    }
+
     pub fn note_local_insert(&self, digest: &[u8; 32]) {
-        self.local.write().insert(digest);
+        // Push into pending FIRST so a concurrent rebuild that snapshotted
+        // live_keys() before our cache.insert() landed will still pick this
+        // digest up via its drain-under-lock step.
+        self.pending.lock().push(*digest);
+        let new_version = {
+            let mut g = self.local.write();
+            g.bloom.insert(digest);
+            g.version = g.version.saturating_add(1);
+            g.version
+        };
+        if let Some(hook) = self.on_version_change.read().as_ref() {
+            hook(new_version);
+        }
     }
 
     pub fn rebuild_local_from_cache(&self, cache: &DiskCache) {
+        // Build the new bloom OUTSIDE the lock from a snapshot of live keys.
+        // For a 100 GiB cache at 4 MiB chunks that's ~25k SHA-256s; doing it
+        // under the write lock would block /cluster/bloom GETs and inserts
+        // for tens of milliseconds.
         let keys = cache.live_keys();
         let mut new = Bloom::new(self.bloom_bits);
-        for k in keys.iter() {
+        for k in &keys {
             new.insert(&key_digest(k));
         }
-        *self.local.write() = new;
-        self.local_version.fetch_add(1, Ordering::Relaxed);
+        // Drain pending under the SAME write lock that swaps the bloom in,
+        // so concurrent inserts cannot land between the drain and the swap.
+        let new_version = {
+            let mut g = self.local.write();
+            let drained: Vec<[u8; 32]> = self.pending.lock().drain(..).collect();
+            for d in &drained {
+                new.insert(d);
+            }
+            g.bloom = new;
+            g.version = g.version.saturating_add(1);
+            g.version
+        };
+        if let Some(hook) = self.on_version_change.read().as_ref() {
+            hook(new_version);
+        }
     }
 
     pub fn local_version(&self) -> u64 {
-        self.local_version.load(Ordering::Relaxed)
+        self.local.read().version
     }
 
-    pub fn local_serialised(&self) -> Vec<u8> {
-        self.local.read().to_bytes()
+    // Atomic (version, bytes) snapshot; replaces the v2.5.0 two-call pattern
+    // local_serialised() + local_version() that could publish a (new_version,
+    // stale_bytes) tuple if rebuild ran between the two calls.
+    pub fn local_snapshot(&self) -> (u64, Vec<u8>) {
+        let g = self.local.read();
+        (g.version, g.bloom.to_bytes())
     }
 
     pub fn ingest_remote(&self, peer_id: &str, version: u64, bytes: &[u8]) -> bool {
@@ -154,6 +219,25 @@ impl PeerIndex {
         self.remote.remove(peer_id);
     }
 
+    // Returns the HRW-top peer id among `alive` plus self, used by the
+    // stampede-leader path so a follower knows whether to act as leader (fetch
+    // from blob) or as follower (ask the leader with wait_ms and piggyback on
+    // its singleflight). Includes self in the ranking so the choice is
+    // cluster-wide deterministic.
+    pub fn hrw_top_id(&self, key: &ChunkKey, alive: &[NodeInfo]) -> String {
+        let digest = key_digest(key);
+        let mut best_id = self.me_id.clone();
+        let mut best_score = hrw_score(&self.me_id, &digest);
+        for n in alive {
+            let s = hrw_score(&n.id, &digest);
+            if s > best_score {
+                best_score = s;
+                best_id = n.id.clone();
+            }
+        }
+        best_id
+    }
+
     pub fn rank_candidates(
         &self,
         key: &ChunkKey,
@@ -172,10 +256,8 @@ impl PeerIndex {
         for (_, n) in scored.iter() {
             match self.remote.get(&n.id) {
                 Some(r) => {
-                    if r.bloom.contains(&digest) {
-                        if yes.len() < max_yes {
-                            yes.push((*n).clone());
-                        }
+                    if r.bloom.contains(&digest) && yes.len() < max_yes {
+                        yes.push((*n).clone());
                     }
                 }
                 None => {
@@ -189,22 +271,13 @@ impl PeerIndex {
     }
 }
 
+// CandidateSet now exposes yes/maybe separately so the fetcher can apply
+// independent attempt budgets (max_yes_attempts vs max_maybe_attempts). v2.5.0
+// merged them under one cap which meant four bloom-positive false-positives
+// would walk straight to blob with no maybe-budget left.
 pub struct CandidateSet {
     pub yes: Vec<NodeInfo>,
     pub maybe: Vec<NodeInfo>,
-}
-
-impl CandidateSet {
-    pub fn merged(self, max_total: usize) -> Vec<NodeInfo> {
-        let mut out = self.yes;
-        for n in self.maybe {
-            if out.len() >= max_total {
-                break;
-            }
-            out.push(n);
-        }
-        out.into_iter().take(max_total).collect()
-    }
 }
 
 fn hrw_score(peer_id: &str, digest: &[u8; 32]) -> u64 {

@@ -25,7 +25,7 @@ use std::pin::Pin;
 use std::ptr;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 use tokio::io::unix::AsyncFd;
@@ -190,6 +190,17 @@ impl Drop for SlabSlot {
 
 pub struct RdmaPeerService {
     _shared: Arc<RdmaRuntimeShared>,
+    // Set after Fetcher is built (chicken-and-egg: Fetcher needs PeerClient,
+    // PeerClient needs RdmaPeerService running so worker_addr_blob is in
+    // gossip). The runtime thread reads this via Arc clone on each inbound
+    // request that carries wait_ms>0.
+    chunk_provider_slot: Arc<OnceLock<crate::transport::ChunkProvider>>,
+}
+
+impl RdmaPeerService {
+    pub fn set_chunk_provider(&self, provider: crate::transport::ChunkProvider) {
+        let _ = self.chunk_provider_slot.set(provider);
+    }
 }
 
 #[derive(Clone)]
@@ -224,6 +235,7 @@ enum RdmaCmd {
         peer_addr_blob: Vec<u8>,
         key: ChunkKey,
         length: u32,
+        wait_ms: u32,
         reply: oneshot::Sender<Result<Bytes>>,
     },
     Health {
@@ -250,6 +262,10 @@ impl RdmaPeerService {
         let (started_tx, started_rx) = std::sync::mpsc::sync_channel::<Result<Vec<u8>>>(1);
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
+        let chunk_provider_slot: Arc<OnceLock<crate::transport::ChunkProvider>> =
+            Arc::new(OnceLock::new());
+        let cps_for_thread = chunk_provider_slot.clone();
+
         let thread = std::thread::Builder::new()
             .name("ucx-runtime".into())
             .spawn(move || {
@@ -274,6 +290,7 @@ impl RdmaPeerService {
                         shutdown_rx,
                         slab_slot_size,
                         slab_n_slots,
+                        cps_for_thread,
                     )
                     .await
                     {
@@ -302,7 +319,14 @@ impl RdmaPeerService {
             "ucx peer transport ready via worker-address wireup"
         );
 
-        Ok((Self { _shared: shared }, client, worker_addr_blob))
+        Ok((
+            Self {
+                _shared: shared,
+                chunk_provider_slot,
+            },
+            client,
+            worker_addr_blob,
+        ))
     }
 }
 
@@ -322,6 +346,7 @@ impl RdmaPeerClient {
         peer_addr_blob: &[u8],
         key: &ChunkKey,
         length: u32,
+        wait_ms: u32,
     ) -> Result<Bytes> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
@@ -330,6 +355,7 @@ impl RdmaPeerClient {
                 peer_addr_blob: peer_addr_blob.to_vec(),
                 key: key.clone(),
                 length,
+                wait_ms,
                 reply: tx,
             })
             .map_err(|_| BcError::Peer("ucx runtime thread gone".into()))?;
@@ -360,6 +386,7 @@ async fn run_runtime(
     mut shutdown_rx: oneshot::Receiver<()>,
     slab_slot_size: usize,
     slab_n_slots: usize,
+    chunk_provider_slot: Arc<OnceLock<crate::transport::ChunkProvider>>,
 ) -> Result<()> {
     let ucx = match UcxRuntime::new() {
         Ok(ucx) => ucx,
@@ -433,7 +460,7 @@ async fn run_runtime(
                 dispatch_cmd(state.clone(), cmd);
             }
             _ = inbound_ready.notified() => {
-                drain_inbound(state.clone(), cache.clone(), stats.clone());
+                drain_inbound(state.clone(), cache.clone(), stats.clone(), chunk_provider_slot.clone());
             }
             _ = safety_tick.tick() => {
                 if let Err(e) = reap_broken_eps(state.clone()).await {
@@ -460,9 +487,10 @@ fn dispatch_cmd(state: SharedRuntimeState, cmd: RdmaCmd) {
                 peer_addr_blob,
                 key,
                 length,
+                wait_ms,
                 reply,
             } => {
-                let result = client_fetch(state.clone(), &peer_id, &peer_addr_blob, &key, length).await;
+                let result = client_fetch(state.clone(), &peer_id, &peer_addr_blob, &key, length, wait_ms).await;
                 let _ = reply.send(result);
             }
             RdmaCmd::Health {
@@ -499,6 +527,7 @@ fn drain_inbound(
     state: SharedRuntimeState,
     cache: Arc<DiskCache>,
     stats: Arc<crate::stats::PeerStats>,
+    chunk_provider_slot: Arc<OnceLock<crate::transport::ChunkProvider>>,
 ) {
     let worker = state.borrow().worker;
     let mut drained = 0usize;
@@ -515,10 +544,11 @@ fn drain_inbound(
         let state_c = state.clone();
         let cache_c = cache.clone();
         let stats_c = stats.clone();
+        let cps_c = chunk_provider_slot.clone();
 
         tokio::task::spawn_local(async move {
             if let Err(e) =
-                handle_inbound_request(state_c, cache_c, stats_c, msg, recv_len, sender_tag).await
+                handle_inbound_request(state_c, cache_c, stats_c, msg, recv_len, sender_tag, cps_c).await
             {
                 tracing::warn!(error = %e, "inbound UCX request handler failed");
             }
@@ -538,6 +568,7 @@ async fn handle_inbound_request(
     msg: ucp_tag_message_h,
     recv_len: usize,
     sender_tag: u64,
+    chunk_provider_slot: Arc<OnceLock<crate::transport::ChunkProvider>>,
 ) -> Result<()> {
     let t_total = std::time::Instant::now();
     let worker = state.borrow().worker;
@@ -597,7 +628,43 @@ async fn handle_inbound_request(
             stats.chunk_bytes_served.inc_by(served as u64);
             buf
         }
-        None => encode_response(STATUS_MISS, &[])?,
+        None => {
+            // v2.6.0 stampede-leader path: on cache miss, if the requester
+            // asked us to wait (wait_ms>0) and a ChunkProvider is wired,
+            // call into Fetcher::serve_peer_chunk which will subscribe to an
+            // existing singleflight or become leader and fetch from blob.
+            // Avoids the cold-start herd where 8 nodes hit the same cold
+            // chunk and all 8 call into Azure.
+            let provider_resp = if request.wait_ms > 0 && request.length > 0 {
+                if let Some(provider) = chunk_provider_slot.get() {
+                    let len_u64 = request.length as u64;
+                    let key_for_p = request.key.clone();
+                    let wait = request.wait_ms;
+                    provider(key_for_p, len_u64, wait).await
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            match provider_resp {
+                Some(b) => {
+                    let served = b.len();
+                    if served > req_len {
+                        encode_response(STATUS_MISS, &[])?
+                    } else {
+                        let total = 8 + served;
+                        let mut buf: Vec<u8> = Vec::with_capacity(total);
+                        buf.extend_from_slice(&STATUS_OK.to_le_bytes());
+                        buf.extend_from_slice(&(served as u32).to_le_bytes());
+                        buf.extend_from_slice(&b);
+                        stats.chunk_bytes_served.inc_by(served as u64);
+                        buf
+                    }
+                }
+                None => encode_response(STATUS_MISS, &[])?,
+            }
+        }
     };
 
     let t_send = std::time::Instant::now();
@@ -648,6 +715,10 @@ struct ChunkRequest {
     key: ChunkKey,
     length: u32,
     requester_peer_id: String,
+    // v2.6.0: stampede-leader hint. 0 means "normal fetch, just check cache";
+    // >0 invites the server to subscribe to its own singleflight (or become
+    // leader and fetch from blob) for up to `wait_ms` ms before replying MISS.
+    wait_ms: u32,
 }
 
 struct RuntimeState {
@@ -823,6 +894,7 @@ async fn client_fetch(
     peer_addr_blob: &[u8],
     key: &ChunkKey,
     length: u32,
+    wait_ms: u32,
 ) -> Result<Bytes> {
     if length == 0 || length > MAX_RESPONSE_BYTES {
         return Err(BcError::Peer(format!("bad chunk length {length}")));
@@ -845,7 +917,7 @@ async fn client_fetch(
     }
 
     let result =
-        client_fetch_inner(worker, checked_out.ep, key, length, &requester_peer_id, &slab).await;
+        client_fetch_inner(worker, checked_out.ep, key, length, wait_ms, &requester_peer_id, &slab).await;
     if should_mark_endpoint_broken(&result) {
         state.borrow_mut().mark_peer_ep_broken(peer_id);
     }
@@ -861,6 +933,7 @@ async fn client_fetch_inner(
     ep: ucp_ep_h,
     key: &ChunkKey,
     length: u32,
+    wait_ms: u32,
     requester_peer_id: &str,
     slab: &Rc<RecvSlab>,
 ) -> Result<Bytes> {
@@ -874,7 +947,7 @@ async fn client_fetch_inner(
     // (Box<[u8]> backing via MaybeUninit); only [..resp_len] is read.
     let total = 8 + length as usize;
     let mut slot = slab.checkout().await?;
-    let req = encode_request(key, length, requester_peer_id)?;
+    let req = encode_request(key, length, requester_peer_id, wait_ms)?;
     // Post recv FIRST (so server's reply isn't dropped if it races our send),
     // post send, then await both concurrently. Sequential .await on recv would
     // deadlock: server can't reply until we send the request.
@@ -991,7 +1064,7 @@ fn release_callback_arg(callback_arg: *mut Arc<AtomicBool>) {
     }
 }
 
-fn encode_request(key: &ChunkKey, length: u32, requester_peer_id: &str) -> Result<Vec<u8>> {
+fn encode_request(key: &ChunkKey, length: u32, requester_peer_id: &str, wait_ms: u32) -> Result<Vec<u8>> {
     let mount = key.mount.as_bytes();
     let blob = key.blob.as_bytes();
     let requester = requester_peer_id.as_bytes();
@@ -1005,7 +1078,7 @@ fn encode_request(key: &ChunkKey, length: u32, requester_peer_id: &str) -> Resul
         return Err(BcError::Peer("requester peer id too long".into()));
     }
 
-    let mut req = Vec::with_capacity(4 + 1 + mount.len() + 2 + blob.len() + 8 + 4 + 2 + requester.len());
+    let mut req = Vec::with_capacity(4 + 1 + mount.len() + 2 + blob.len() + 8 + 4 + 2 + requester.len() + 4);
     req.extend_from_slice(&MAGIC.to_be_bytes());
     req.push(mount.len() as u8);
     req.extend_from_slice(mount);
@@ -1015,6 +1088,7 @@ fn encode_request(key: &ChunkKey, length: u32, requester_peer_id: &str) -> Resul
     req.extend_from_slice(&length.to_be_bytes());
     req.extend_from_slice(&(requester.len() as u16).to_be_bytes());
     req.extend_from_slice(requester);
+    req.extend_from_slice(&wait_ms.to_be_bytes());
     Ok(req)
 }
 
@@ -1038,6 +1112,17 @@ fn decode_request(data: &[u8]) -> Result<ChunkRequest> {
     let requester_len = read_be_u16(data, &mut idx)? as usize;
     let requester_peer_id = read_utf8(data, &mut idx, requester_len, "requester_peer_id")?;
 
+    // v2.6.0: backward-compatible decode. Old peers (v2.5.0) send no
+    // trailing bytes; new peers append wait_ms as a u32 BE. Treat absent
+    // trailer as wait_ms=0 so a v2.6.0 server keeps serving v2.5.0 clients
+    // during a rolling restart.
+    let wait_ms = if idx + 4 <= data.len() {
+        let v = read_be_u32(data, &mut idx)?;
+        v
+    } else {
+        0
+    };
+
     if idx != data.len() {
         return Err(BcError::Peer("trailing bytes in request".into()));
     }
@@ -1046,6 +1131,7 @@ fn decode_request(data: &[u8]) -> Result<ChunkRequest> {
         key: ChunkKey { mount, blob, offset },
         length,
         requester_peer_id,
+        wait_ms,
     })
 }
 

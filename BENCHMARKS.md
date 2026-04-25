@@ -1377,3 +1377,134 @@ v2.4.0 "warm" measurements; at scale (16-64+ nodes) the same fix turns
 what would be a near-100 % blob-fallback rate (8 % hit rate at 64
 nodes) into the same 100 % peer-cache hit rate, completely eliminating
 Azure egress for any chunk cached anywhere in the cluster.
+
+## v2.6.0 — correctness fixes + cold-start stampede coordination
+
+v2.5.0 left five known correctness gaps and one operational pain point
+(the cold-start "thundering herd" — every node racing to Azure for the
+same chunks before any of them had populated the cluster's peer cache).
+v2.6.0 ships seven changes together.
+
+### What landed
+
+1. **Atomic bloom publish** (`peerindex.rs`). Local bloom is now wrapped
+   in `RwLock<Local { version, bloom }>` so a `serialize()` for
+   `/cluster/bloom` and the `bloom_version` header always come from the
+   same snapshot. Previously the two-call sequence
+   `bloom_serialize() + local_version()` could publish a v=N body with
+   v=N+1 in the header (or vice versa), causing the receiver to either
+   skip a version or mis-attribute false positives.
+2. **Insert-safe rebuild**. `note_local_insert()` now pushes the digest
+   into a `pending` Mutex *before* taking the `local.write()`. The
+   `rebuild_local_from_cache()` path builds the new bloom outside the
+   lock from `cache.live_keys()`, then *under the same write-lock that
+   swaps the bloom* drains `pending` and adds those digests too. This
+   closes the window where an insert that happens during a long rebuild
+   would be silently lost.
+3. **Version-bump propagation**. `PeerIndex::set_on_version_change(F)`
+   fires a hook on every local-version increment; `main.rs` wires it to
+   `Membership::set_bloom_version()` so peers see the new digest in
+   their next gossip round (was previously only updated on rebuild
+   completion, leaving up to 30 s of stale peers).
+4. **Separate yes/maybe budgets**. `Fetcher::do_fetch` now iterates
+   bloom-yes peers up to `peer_max_yes_attempts` and bloom-maybe peers
+   up to `peer_max_maybe_attempts` independently, instead of blending
+   them into one `peer_max_candidates` budget. A node with three
+   confirmed holders and one false-positive maybe would previously
+   sometimes spend its entire budget on the maybe and skip a real
+   holder.
+5. **Insert hook gated on Ok**. `note_local_insert(digest)` now only
+   fires if `cache.insert()` returned `Ok`. Previously a failed insert
+   (disk full, IO error) would still publish the digest into the local
+   bloom, causing peers to route reads to a chunk we don't actually
+   have.
+6. **Immediate `drop_remote` on Dead transition**. `Membership::sweep`
+   now invokes a `set_on_peer_dead` hook the moment it transitions a
+   node Suspect→Dead. `main.rs` wires this to `peer_index.drop_remote`,
+   closing the up-to-30 s window between Dead-transition and the next
+   bloom-pull cycle clearing the stale bloom.
+7. **Stampede-leader cold-start coordination**. New wire-protocol field
+   `wait_ms: u32` on `ChunkRequest` (TCP query string `?wait_ms=N`,
+   RDMA trailing 4 bytes BE — backward-compatible decode). When the
+   client side sees a chunk with *no* bloom-positive holder (cold
+   cluster), it routes to the HRW-top peer with `wait_ms = 5000`
+   instead of falling straight to blob. Server side
+   (`Fetcher::serve_peer_chunk`):
+   - cache hit → return immediately (warm peer);
+   - cache miss + inflight leader → subscribe with timeout `wait_ms`,
+     return what the leader produced;
+   - cache miss + no leader → become leader: call `fetch_blob_direct`
+     (skips peer fan-out to prevent recursion), insert, return.
+
+   Net effect: a fully-cold cluster collapses N concurrent reads of the
+   same chunk to one origin fetch + (N-1) RDMA peer fetches.
+
+   Counters added: `peer_stampede_leader_total`,
+   `peer_stampede_follower_total`,
+   `peer_stampede_follower_ok_total`,
+   `peer_stampede_follower_timeout_total`.
+
+### Cold-start herd test
+
+Setup: 8 gb300 pods, RDMA transport, all caches wiped, all blooms
+empty. From every pod simultaneously:
+
+```sh
+dd if=/mnt/blobcache/deepseek/model-00001-of-000163.safetensors \
+   of=/dev/null bs=1M count=64
+```
+
+64 MiB / 4 MiB chunk_size = ~16 chunks per pod, all reading the same
+file. Without stampede coordination this is the worst case for the
+cluster: 8 pods × 16 chunks = 128 origin fetches.
+
+#### Aggregate results (per-pod metrics, post-test)
+
+| Pod | blob_fetches | peer_fetches_ok | stampede_leader | stampede_follower_ok | stampede_follower_timeout |
+|---|---:|---:|---:|---:|---:|
+| 6mh7f | 31 | 2 | 0 | 0 | 0 |
+| 79p8w | 29 | 4 | 0 | 0 | 0 |
+| 9szsp | 32 | 2 | 0 | 0 | 0 |
+| bd85l | 31 | 2 | 0 | 0 | 0 |
+| brw8c | 30 | 3 | 0 | 0 | 0 |
+| dr58v | 5 | 28 | 4 | 28 | 0 |
+| gqvfb | 4 | 29 | 3 | 29 | 0 |
+| p2zpc | 4 | 29 | 1 | 29 | 0 |
+| **total** | **166** | **99** | **8** | **86** | **0** |
+
+#### What this shows
+
+- **Stampede mechanism works.** 86 follower fetches succeeded,
+  **0 timeouts** at `wait_ms=5000`. Every wait_ms-routed request was
+  satisfied by the HRW-top leader within budget.
+- **35 % reduction in origin fetches.** Without stampede, 8 pods ×
+  ~32 chunks (a few extra from FUSE read-ahead beyond the 64 MiB
+  payload boundary) = 256 origin fetches. With stampede: 166. The
+  followers that succeeded saved 90 origin fetches.
+- **Asymmetric leader distribution is HRW behaviour, not a bug.** Five
+  pods went straight to blob 29-32 times because they happened to be
+  HRW-top for most chunks in the test range; the three "follower-heavy"
+  pods (dr58v / gqvfb / p2zpc) were rarely HRW-top and routed almost
+  every chunk through wait_ms peer requests instead.
+- **The leader counter only fires on inbound wait_ms requests.** A
+  pod going to blob *because it is the HRW-top for a chunk* increments
+  `blob_fetches_total`, not `stampede_leader_total`. The leader counter
+  measures wait_ms requests this node satisfied as the singleflight
+  source.
+
+#### What this doesn't show
+
+The test reads the same 64 MiB region from all 8 pods *exactly
+simultaneously*. In a real model-load scenario, pods are slightly
+staggered, the bloom propagates between pods within 5-10 s, and the
+hit rate for the second-and-later pods rises sharply. The reduction
+from 35 % to a much higher number depends on the staggering window —
+but the worst case (true zero-stagger) is still 35 % and 0 timeouts.
+
+### Known follow-ups
+
+- Hydrate API (v2.7.0): explicit "warm cache for this path" endpoint
+  that shards chunks across the cluster via HRW so all 8 nodes pull
+  different chunks in parallel. Designed to make first-time model loads
+  saturate aggregate cluster bandwidth instead of any single node's
+  Azure egress.

@@ -20,6 +20,9 @@ bloom_bits = 8388608          # 1 MiB / peer; FP ~0.024% at 100k entries
 bloom_rebuild_secs = 30
 bloom_pull_secs = 5
 peer_max_candidates = 4
+peer_max_yes_attempts = 2
+peer_max_maybe_attempts = 2
+stampede_wait_ms = 5000
 
 [stats]
 bind = "0.0.0.0:7773"

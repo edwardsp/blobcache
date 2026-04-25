@@ -33,6 +33,13 @@ pub struct Fetcher {
     pub chunk_size: u64,
     pub peer_index: Arc<PeerIndex>,
     pub peer_max_candidates: usize,
+    pub peer_max_yes_attempts: usize,
+    pub peer_max_maybe_attempts: usize,
+    pub stampede_wait_ms: u32,
+    // Mount lookup table so the stampede-leader path (serve_peer_chunk) can
+    // reconstruct the blob path from a ChunkKey when no MountConfig is on
+    // the call stack (the request arrived from a peer, not from FUSE).
+    pub mounts: Arc<HashMap<String, MountConfig>>,
     inflight: Arc<Mutex<HashMap<ChunkKey, InflightTx>>>,
     chunk_sem: Arc<Semaphore>,
     inflight_writes: Arc<DashMap<ChunkKey, Bytes>>,
@@ -91,6 +98,10 @@ impl Fetcher {
         prefetch_concurrency: usize,
         peer_index: Arc<PeerIndex>,
         peer_max_candidates: usize,
+        peer_max_yes_attempts: usize,
+        peer_max_maybe_attempts: usize,
+        stampede_wait_ms: u32,
+        mounts: Arc<HashMap<String, MountConfig>>,
     ) -> Self {
         let permits = chunk_concurrency.max(1);
         let pf_permits = prefetch_concurrency.max(1);
@@ -103,6 +114,10 @@ impl Fetcher {
             chunk_size,
             peer_index,
             peer_max_candidates: peer_max_candidates.max(1),
+            peer_max_yes_attempts: peer_max_yes_attempts.max(1),
+            peer_max_maybe_attempts: peer_max_maybe_attempts.max(1),
+            stampede_wait_ms,
+            mounts,
             inflight: Arc::new(Mutex::new(HashMap::new())),
             chunk_sem: Arc::new(Semaphore::new(permits)),
             inflight_writes: Arc::new(DashMap::new()),
@@ -343,93 +358,258 @@ impl Fetcher {
         expected_len: u64,
     ) -> Result<Bytes> {
         let alive = self.membership.members_alive();
-        let candidates = self
-            .peer_index
-            .rank_candidates(key, &alive, self.peer_max_candidates, self.peer_max_candidates);
+        let candidates = self.peer_index.rank_candidates(
+            key,
+            &alive,
+            self.peer_max_yes_attempts,
+            self.peer_max_maybe_attempts,
+        );
         let yes_count = candidates.yes.len();
-        let maybe_count = candidates.maybe.len();
         if yes_count > 0 {
             self.stats.peer_bloom_yes.inc();
         } else if !alive.is_empty() {
             self.stats.peer_bloom_no_holder.inc();
         }
-        let ordered = candidates.merged(self.peer_max_candidates);
-        for (idx, peer) in ordered.iter().enumerate() {
-            let was_yes = idx < yes_count;
-            let _ = maybe_count;
-            let worker_addr = match &peer.ucx_worker_addr_b64 {
-                Some(encoded) => match BASE64_STANDARD.decode(encoded) {
-                    Ok(decoded) => Some(decoded),
-                    Err(e) => {
-                        tracing::warn!(
-                            peer = %peer.id,
-                            transport = %peer.transport_url,
-                            error = %e,
-                            "peer advertised invalid UCX worker address; skipping"
-                        );
-                        continue;
-                    }
-                },
-                None => match &*self.peers {
-                    PeerClient::Tcp(_) => None,
-                    #[cfg(feature = "ucx")]
-                    PeerClient::Rdma(_) => {
-                        tracing::warn!(
-                            peer = %peer.id,
-                            transport = %peer.transport_url,
-                            "rdma peer missing UCX worker address; skipping"
-                        );
-                        continue;
-                    }
-                },
-            };
-            let t_peer = std::time::Instant::now();
-            let peer_res = self
-                .peers
-                .fetch_chunk(
-                    &peer.id,
-                    &peer.transport_url,
-                    worker_addr.as_deref(),
-                    key,
-                    expected_len as u32,
-                )
-                .await;
-            self.stats
-                .chunk_peer_fetch_seconds
-                .observe(t_peer.elapsed().as_secs_f64());
-            match peer_res {
-                Ok(data) => {
-                    if data.len() as u64 != expected_len {
-                        tracing::warn!(
-                            peer = %peer.transport_url,
-                            key = ?key,
-                            got = data.len(),
-                            want = expected_len,
-                            "peer chunk wrong length, skipping"
-                        );
-                        self.stats.peer_fetches_err.inc();
-                        continue;
-                    }
-                    self.stats.peer_fetches_ok.inc();
-                    self.stats.peer_fetch_bytes.inc_by(data.len() as u64);
-                    self.spawn_insert(key.clone(), data.clone());
-                    return Ok(data);
-                }
-                Err(BcError::NotFound(_)) => {
-                    self.stats.peer_fetches_miss.inc();
-                    if was_yes {
-                        self.stats.peer_bloom_false_positive.inc();
-                    }
-                    continue;
-                }
-                Err(e) => {
-                    tracing::debug!(peer=%peer.transport_url, error=%e, "peer fetch err");
-                    self.stats.peer_fetches_err.inc();
-                    continue;
-                }
+        // Try yes-set first (peers whose advertised bloom contains this
+        // chunk), then maybe-set (peers with no bloom yet, e.g. just joined).
+        // Each set has its own budget so a flood of false-positives in yes
+        // can't starve the maybe-set.
+        let mut ordered: Vec<(usize, &crate::cluster::NodeInfo)> = Vec::new();
+        for (i, p) in candidates.yes.iter().enumerate() {
+            ordered.push((i, p));
+        }
+        let yes_len = candidates.yes.len();
+        for (i, p) in candidates.maybe.iter().enumerate() {
+            ordered.push((yes_len + i, p));
+        }
+        for (idx, peer) in ordered.iter() {
+            let was_yes = *idx < yes_len;
+            if let Some(data) = self
+                .try_peer_fetch(peer, key, expected_len, was_yes, 0)
+                .await?
+            {
+                return Ok(data);
             }
         }
 
+        // v2.6.0 stampede-leader cold-start coordination: if no peer claims
+        // (or might claim) the chunk, route to the cluster-wide HRW-top
+        // owner with wait_ms so that the first to reach blob becomes the
+        // leader and everyone else piggybacks on its singleflight. This
+        // avoids the cold-start herd: 8 nodes reading the same model file
+        // would otherwise each issue an independent blob GET because their
+        // blooms are still empty.
+        if yes_count == 0 && self.stampede_wait_ms > 0 && !alive.is_empty() {
+            let hrw_top_id = self.peer_index.hrw_top_id(key, &alive);
+            if hrw_top_id != self.peer_index.me_id {
+                if let Some(peer) = alive.iter().find(|n| n.id == hrw_top_id) {
+                    self.stats.peer_stampede_follower.inc();
+                    if let Some(data) = self
+                        .try_peer_fetch(peer, key, expected_len, false, self.stampede_wait_ms)
+                        .await?
+                    {
+                        self.stats.peer_stampede_follower_ok.inc();
+                        return Ok(data);
+                    }
+                    self.stats.peer_stampede_follower_timeout.inc();
+                }
+            } else {
+                self.stats.peer_stampede_leader.inc();
+            }
+        }
+
+        let real_path = if mount.prefix.is_empty() {
+            blob_path.to_string()
+        } else {
+            format!("{}/{}", mount.prefix.trim_end_matches('/'), blob_path)
+        };
+        let blob_client = self.blob_for(&mount.name)?;
+        let data = blob_client
+            .get_blob_range(
+                &mount.account,
+                &mount.container,
+                &real_path,
+                key.offset,
+                self.chunk_size,
+            )
+            .await?;
+        if data.len() as u64 != expected_len {
+            return Err(BcError::Other(format!(
+                "blob returned wrong length: got {} want {} for {}@{}",
+                data.len(),
+                expected_len,
+                blob_path,
+                key.offset
+            )));
+        }
+        self.stats.blob_fetches.inc();
+        self.stats.blob_fetch_bytes.inc_by(data.len() as u64);
+        self.spawn_insert(key.clone(), data.clone());
+        Ok(data)
+    }
+
+    async fn try_peer_fetch(
+        &self,
+        peer: &crate::cluster::NodeInfo,
+        key: &ChunkKey,
+        expected_len: u64,
+        was_yes: bool,
+        wait_ms: u32,
+    ) -> Result<Option<Bytes>> {
+        let worker_addr = match &peer.ucx_worker_addr_b64 {
+            Some(encoded) => match BASE64_STANDARD.decode(encoded) {
+                Ok(decoded) => Some(decoded),
+                Err(e) => {
+                    tracing::warn!(
+                        peer = %peer.id,
+                        transport = %peer.transport_url,
+                        error = %e,
+                        "peer advertised invalid UCX worker address; skipping"
+                    );
+                    return Ok(None);
+                }
+            },
+            None => match &*self.peers {
+                PeerClient::Tcp(_) => None,
+                #[cfg(feature = "ucx")]
+                PeerClient::Rdma(_) => {
+                    tracing::warn!(
+                        peer = %peer.id,
+                        transport = %peer.transport_url,
+                        "rdma peer missing UCX worker address; skipping"
+                    );
+                    return Ok(None);
+                }
+            },
+        };
+        let t_peer = std::time::Instant::now();
+        let peer_res = self
+            .peers
+            .fetch_chunk(
+                &peer.id,
+                &peer.transport_url,
+                worker_addr.as_deref(),
+                key,
+                expected_len as u32,
+                wait_ms,
+            )
+            .await;
+        self.stats
+            .chunk_peer_fetch_seconds
+            .observe(t_peer.elapsed().as_secs_f64());
+        match peer_res {
+            Ok(data) => {
+                if data.len() as u64 != expected_len {
+                    tracing::warn!(
+                        peer = %peer.transport_url,
+                        key = ?key,
+                        got = data.len(),
+                        want = expected_len,
+                        "peer chunk wrong length, skipping"
+                    );
+                    self.stats.peer_fetches_err.inc();
+                    return Ok(None);
+                }
+                self.stats.peer_fetches_ok.inc();
+                self.stats.peer_fetch_bytes.inc_by(data.len() as u64);
+                self.spawn_insert(key.clone(), data.clone());
+                Ok(Some(data))
+            }
+            Err(BcError::NotFound(_)) => {
+                self.stats.peer_fetches_miss.inc();
+                if was_yes {
+                    self.stats.peer_bloom_false_positive.inc();
+                }
+                Ok(None)
+            }
+            Err(e) => {
+                tracing::debug!(peer=%peer.transport_url, error=%e, "peer fetch err");
+                self.stats.peer_fetches_err.inc();
+                Ok(None)
+            }
+        }
+    }
+
+    // Stampede-leader entry point: invoked by PeerService when a remote peer
+    // sends a fetch with wait_ms>0 and we cache-miss. Subscribes to our own
+    // singleflight if a leader is already running for this key, otherwise
+    // becomes leader and fetches from blob (skipping the peer-fan-out step
+    // to avoid a recursive RDMA roundtrip back to the original requester).
+    pub async fn serve_peer_chunk(
+        &self,
+        key: ChunkKey,
+        expected_len: u64,
+        wait_ms: u32,
+    ) -> Option<Bytes> {
+        let cache_for_get = self.cache.clone();
+        let key_for_get = key.clone();
+        if let Ok(Some(b)) =
+            tokio::task::spawn_blocking(move || cache_for_get.try_get(&key_for_get)).await
+        {
+            if b.len() as u64 == expected_len {
+                return Some(b);
+            }
+        }
+
+        let (leader, mut rx_opt) = {
+            let mut g = self.inflight.lock();
+            if let Some(tx) = g.get(&key) {
+                (false, Some(tx.subscribe()))
+            } else {
+                let (tx, _rx) = broadcast::channel::<std::result::Result<Bytes, String>>(1);
+                g.insert(key.clone(), tx);
+                (true, None)
+            }
+        };
+
+        if !leader {
+            let rx = rx_opt.as_mut().expect("follower must have receiver");
+            let dur = std::time::Duration::from_millis(wait_ms as u64);
+            match tokio::time::timeout(dur, rx.recv()).await {
+                Ok(Ok(Ok(data))) if data.len() as u64 == expected_len => return Some(data),
+                _ => return None,
+            }
+        }
+
+        let mount_cfg = match self.mounts.get(&key.mount).cloned() {
+            Some(m) => m,
+            None => {
+                let mut g = self.inflight.lock();
+                if let Some(tx) = g.remove(&key) {
+                    let _ = tx.send(Err("unknown mount".into()));
+                }
+                return None;
+            }
+        };
+
+        let guard = LeaderGuard {
+            inflight: self.inflight.clone(),
+            key: key.clone(),
+            armed: true,
+        };
+        let result = self
+            .fetch_blob_direct(&mount_cfg, &key.blob, &key, expected_len)
+            .await;
+        if let Some(tx) = guard.disarm() {
+            let msg = match &result {
+                Ok(b) => Ok(b.clone()),
+                Err(e) => Err(e.to_string()),
+            };
+            let _ = tx.send(msg);
+        }
+        result.ok()
+    }
+
+    // Blob-only fetch path used by the stampede-leader: no peer fan-out
+    // (to avoid recursive RDMA back to the requester), no candidate
+    // ranking. Caches the result and bumps the bloom on success.
+    async fn fetch_blob_direct(
+        &self,
+        mount: &MountConfig,
+        blob_path: &str,
+        key: &ChunkKey,
+        expected_len: u64,
+    ) -> Result<Bytes> {
         let real_path = if mount.prefix.is_empty() {
             blob_path.to_string()
         } else {
@@ -470,11 +650,25 @@ impl Fetcher {
         let digest = key_digest(&k);
         tokio::spawn(async move {
             let t_ins = std::time::Instant::now();
-            let _ = tokio::task::spawn_blocking(move || cache.insert(k, &data)).await;
+            let insert_res =
+                tokio::task::spawn_blocking(move || cache.insert(k, &data)).await;
             stats
                 .chunk_cache_insert_seconds
                 .observe(t_ins.elapsed().as_secs_f64());
-            peer_index.note_local_insert(&digest);
+            // Only advertise this chunk in our bloom if the cache write
+            // actually succeeded; otherwise peers would be told we own a
+            // chunk we cannot serve and waste a fetch round-trip.
+            match insert_res {
+                Ok(Ok(())) => {
+                    peer_index.note_local_insert(&digest);
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(error = %e, "cache insert failed; skipping bloom advertise");
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "cache insert task panicked; skipping bloom advertise");
+                }
+            }
             inflight.remove(&key);
         });
     }
@@ -560,6 +754,10 @@ impl Fetcher {
             chunk_size: self.chunk_size,
             peer_index: self.peer_index.clone(),
             peer_max_candidates: self.peer_max_candidates,
+            peer_max_yes_attempts: self.peer_max_yes_attempts,
+            peer_max_maybe_attempts: self.peer_max_maybe_attempts,
+            stampede_wait_ms: self.stampede_wait_ms,
+            mounts: self.mounts.clone(),
             inflight: self.inflight.clone(),
             chunk_sem: self.chunk_sem.clone(),
             inflight_writes: self.inflight_writes.clone(),

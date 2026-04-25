@@ -63,6 +63,12 @@ pub struct TransportConfig {
     pub bloom_pull_secs: u64,
     #[serde(default = "default_peer_max_candidates")]
     pub peer_max_candidates: usize,
+    #[serde(default = "default_peer_max_yes_attempts")]
+    pub peer_max_yes_attempts: usize,
+    #[serde(default = "default_peer_max_maybe_attempts")]
+    pub peer_max_maybe_attempts: usize,
+    #[serde(default = "default_stampede_wait_ms")]
+    pub stampede_wait_ms: u32,
 }
 fn default_chunk_concurrency() -> usize {
     32
@@ -93,6 +99,15 @@ fn default_bloom_pull_secs() -> u64 {
 }
 fn default_peer_max_candidates() -> usize {
     4
+}
+fn default_peer_max_yes_attempts() -> usize {
+    2
+}
+fn default_peer_max_maybe_attempts() -> usize {
+    2
+}
+fn default_stampede_wait_ms() -> u32 {
+    5000
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

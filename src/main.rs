@@ -24,11 +24,11 @@ use crate::auth::Credential;
 use crate::azure::BlobClient;
 use crate::cache::DiskCache;
 use crate::cluster::{Membership, NodeInfo, NodeState};
-use crate::config::Config;
+use crate::config::{Config, MountConfig};
 use crate::fetcher::Fetcher;
 use crate::peerindex::PeerIndex;
 use crate::stats::Stats;
-use crate::transport::PeerService;
+use crate::transport::{ChunkProvider, PeerService};
 
 #[derive(Parser, Debug)]
 #[command(name = "blobcached", about = "Distributed FUSE blob cache daemon")]
@@ -220,6 +220,28 @@ fn main() -> anyhow::Result<()> {
 
     let peer_index = PeerIndex::new(node_id.clone(), cfg.transport.bloom_bits);
 
+    // Wire bloom-version propagation: PeerIndex notifies Membership of version
+    // bumps so peers see the new digest in the next gossip round and pull it.
+    peer_index.set_on_version_change({
+        let m = membership.clone();
+        move |v| m.set_bloom_version(v)
+    });
+
+    // Wire dead-peer cleanup: when sweep marks a node Dead, immediately drop
+    // its bloom from PeerIndex so we stop routing reads to it (closes the
+    // 30s gap between Dead-transition and the next bloom-pull cycle).
+    membership.set_on_peer_dead({
+        let pi = peer_index.clone();
+        move |id: &str| pi.drop_remote(id)
+    });
+
+    let mounts: Arc<std::collections::HashMap<String, MountConfig>> = Arc::new(
+        cfg.mounts
+            .iter()
+            .map(|m| (m.name.clone(), m.clone()))
+            .collect(),
+    );
+
     let fetcher = Arc::new(Fetcher::new(
         cache.clone(),
         blobs.clone(),
@@ -233,7 +255,29 @@ fn main() -> anyhow::Result<()> {
         cfg.transport.prefetch_concurrency,
         peer_index.clone(),
         cfg.transport.peer_max_candidates,
+        cfg.transport.peer_max_yes_attempts,
+        cfg.transport.peer_max_maybe_attempts,
+        cfg.transport.stampede_wait_ms,
+        mounts.clone(),
     ));
+
+    // ChunkProvider wraps Fetcher::serve_peer_chunk so the peer-service
+    // (TCP or RDMA) can route stampede-follower wait_ms requests back into
+    // the local singleflight + leader fetch path. Built AFTER Fetcher exists.
+    let provider: ChunkProvider = {
+        let f = fetcher.clone();
+        Arc::new(move |key, len, wait_ms| {
+            let f = f.clone();
+            Box::pin(async move { f.serve_peer_chunk(key, len, wait_ms).await })
+        })
+    };
+
+    #[cfg(feature = "ucx")]
+    if matches!(cfg.transport.kind.as_str(), "rdma") {
+        if let Some((service, _client)) = rdma_bootstrap.as_ref() {
+            service.set_chunk_provider(provider.clone());
+        }
+    }
 
     let transport_addr: std::net::SocketAddr = cfg
         .transport
@@ -253,7 +297,8 @@ fn main() -> anyhow::Result<()> {
 
     match cfg.transport.kind.as_str() {
         "tcp" => {
-            let peer_svc = PeerService::new(cache.clone(), cluster_hash, stats.peer_stats.clone());
+            let peer_svc = PeerService::new(cache.clone(), cluster_hash, stats.peer_stats.clone())
+                .with_chunk_provider(provider.clone());
             rt.spawn({
                 let svc = peer_svc.clone();
                 async move {

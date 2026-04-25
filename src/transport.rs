@@ -6,7 +6,9 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use std::convert::Infallible;
+use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 
@@ -15,11 +17,26 @@ use crate::error::{BcError, Result};
 
 pub const PROTO_VERSION: &str = "v1";
 
+// Chunk provider invoked by PeerService when a wait_ms request misses cache.
+// Returns Some(bytes) if the chunk could be produced (via singleflight
+// subscription or by becoming the leader for a blob fetch) within the
+// caller-supplied deadline; None to signal "give up, return 404 to the peer".
+pub type ChunkProvider = Arc<
+    dyn Fn(
+            ChunkKey,
+            u64,
+            u32,
+        ) -> Pin<Box<dyn Future<Output = Option<Bytes>> + Send + 'static>>
+        + Send
+        + Sync,
+>;
+
 #[derive(Clone)]
 pub struct PeerService {
     cache: Arc<DiskCache>,
     cluster_hash_hex: String,
     pub stats: Arc<crate::stats::PeerStats>,
+    chunk_provider: Option<ChunkProvider>,
 }
 
 impl PeerService {
@@ -32,7 +49,13 @@ impl PeerService {
             cache,
             cluster_hash_hex: hex32(&cluster_hash),
             stats,
+            chunk_provider: None,
         }
+    }
+
+    pub fn with_chunk_provider(mut self, provider: ChunkProvider) -> Self {
+        self.chunk_provider = Some(provider);
+        self
     }
 
     pub async fn serve(self, addr: SocketAddr) -> Result<()> {
@@ -102,12 +125,29 @@ impl PeerService {
             blob,
             offset,
         };
+        let wait_ms: u32 = qs
+            .get("wait_ms")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let expected_len: u64 = qs
+            .get("len")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
         let t_cg = std::time::Instant::now();
         let got = self.cache.try_get(&key);
         self.stats
             .server_cache_get_seconds
             .observe(t_cg.elapsed().as_secs_f64());
-        let resp = match got {
+        let resolved = match got {
+            Some(b) => Some(b),
+            None => match (&self.chunk_provider, wait_ms, expected_len) {
+                (Some(provider), w, l) if w > 0 && l > 0 => {
+                    provider(key.clone(), l, w).await
+                }
+                _ => None,
+            },
+        };
+        let resp = match resolved {
             Some(b) => {
                 self.stats.chunk_bytes_served.inc_by(b.len() as u64);
                 Response::builder()
@@ -144,12 +184,20 @@ impl TcpPeerClient {
         Self { http }
     }
 
-    pub async fn fetch_chunk(&self, peer_url: &str, key: &ChunkKey) -> Result<Bytes> {
+    pub async fn fetch_chunk(
+        &self,
+        peer_url: &str,
+        key: &ChunkKey,
+        expected_len: u32,
+        wait_ms: u32,
+    ) -> Result<Bytes> {
         let url = format!(
-            "{peer_url}/v1/chunk/{}?blob={}&offset={}",
+            "{peer_url}/v1/chunk/{}?blob={}&offset={}&len={}&wait_ms={}",
             urlencoding_encode(&key.mount),
             urlencoding_encode(&key.blob),
-            key.offset
+            key.offset,
+            expected_len,
+            wait_ms,
         );
         let resp = self.http.get(&url).send().await?;
         let status = resp.status();
@@ -201,17 +249,17 @@ impl PeerClient {
         #[cfg(feature = "ucx")] peer_worker_addr: Option<&[u8]>,
         #[cfg(not(feature = "ucx"))] _peer_worker_addr: Option<&[u8]>,
         key: &ChunkKey,
-        #[cfg(feature = "ucx")] length: u32,
-        #[cfg(not(feature = "ucx"))] _length: u32,
+        length: u32,
+        wait_ms: u32,
     ) -> Result<Bytes> {
         match self {
-            Self::Tcp(c) => c.fetch_chunk(peer_url, key).await,
+            Self::Tcp(c) => c.fetch_chunk(peer_url, key, length, wait_ms).await,
             #[cfg(feature = "ucx")]
             Self::Rdma(c) => {
                 let worker_addr = peer_worker_addr.ok_or_else(|| {
                     BcError::Peer(format!("missing ucx worker address for peer {peer_id}"))
                 })?;
-                c.fetch_chunk(peer_id, worker_addr, key, length).await
+                c.fetch_chunk(peer_id, worker_addr, key, length, wait_ms).await
             }
         }
     }

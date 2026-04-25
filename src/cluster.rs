@@ -60,6 +60,10 @@ pub struct Membership {
     pub stats: Arc<crate::stats::ClusterStats>,
     #[cfg(feature = "ucx")]
     rdma_peer_update_hook: Option<Arc<dyn Fn(&NodeInfo) + Send + Sync>>,
+    // Fired when sweep() transitions a peer to Dead. Lets the PeerIndex
+    // forget that peer's bloom immediately rather than waiting up to
+    // bloom_pull_secs for run_bloom_pull_loop's reconciliation pass.
+    on_peer_dead: Option<Arc<dyn Fn(&str) + Send + Sync>>,
 }
 
 struct Inner {
@@ -81,7 +85,15 @@ impl Membership {
             stats,
             #[cfg(feature = "ucx")]
             rdma_peer_update_hook: None,
+            on_peer_dead: None,
         }
+    }
+
+    pub fn set_on_peer_dead<F>(&mut self, hook: F)
+    where
+        F: Fn(&str) + Send + Sync + 'static,
+    {
+        self.on_peer_dead = Some(Arc::new(hook));
     }
 
     #[cfg(feature = "ucx")]
@@ -206,25 +218,34 @@ impl Membership {
 
     pub fn sweep(&self) {
         let now = unix_now();
-        let mut g = self.inner.write();
-        for (id, n) in g.members.iter_mut() {
-            if id == &self.me_id {
-                continue;
-            }
-            let age = now.saturating_sub(n.last_seen_unix);
-            let new_state = if age > HEARTBEAT_TIMEOUT_SECS * 2 {
-                NodeState::Dead
-            } else if age > HEARTBEAT_TIMEOUT_SECS {
-                NodeState::Suspect
-            } else {
-                NodeState::Alive
-            };
-            if new_state != n.state {
-                tracing::info!(id, ?new_state, age_secs = age, "state change");
-                if matches!(new_state, NodeState::Dead) {
-                    self.stats.failures.inc();
+        let mut newly_dead: Vec<String> = Vec::new();
+        {
+            let mut g = self.inner.write();
+            for (id, n) in g.members.iter_mut() {
+                if id == &self.me_id {
+                    continue;
                 }
-                n.state = new_state;
+                let age = now.saturating_sub(n.last_seen_unix);
+                let new_state = if age > HEARTBEAT_TIMEOUT_SECS * 2 {
+                    NodeState::Dead
+                } else if age > HEARTBEAT_TIMEOUT_SECS {
+                    NodeState::Suspect
+                } else {
+                    NodeState::Alive
+                };
+                if new_state != n.state {
+                    tracing::info!(id, ?new_state, age_secs = age, "state change");
+                    if matches!(new_state, NodeState::Dead) {
+                        self.stats.failures.inc();
+                        newly_dead.push(id.clone());
+                    }
+                    n.state = new_state;
+                }
+            }
+        }
+        if let Some(hook) = &self.on_peer_dead {
+            for id in &newly_dead {
+                hook(id);
             }
         }
     }
@@ -315,8 +336,7 @@ impl GossipServer {
                             }
                             (&Method::GET, "/cluster/bloom") => match &pi {
                                 Some(idx) => {
-                                    let body = idx.local_serialised();
-                                    let v = idx.local_version();
+                                    let (v, body) = idx.local_snapshot();
                                     Response::builder().status(200)
                                         .header("content-type", "application/octet-stream")
                                         .header("x-blobcache-bloom-version", v.to_string())
