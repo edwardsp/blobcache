@@ -1,0 +1,267 @@
+# HELP blobcache_blob_fetch_bytes_total blob fetched bytes
+# TYPE blobcache_blob_fetch_bytes_total counter
+blobcache_blob_fetch_bytes_total 206714278266
+# HELP blobcache_blob_fetches_total blob fetches
+# TYPE blobcache_blob_fetches_total counter
+blobcache_blob_fetches_total 49411
+# HELP blobcache_blob_request_giveups_total blob requests that exhausted max_retries
+# TYPE blobcache_blob_request_giveups_total counter
+blobcache_blob_request_giveups_total 0
+# HELP blobcache_blob_request_retries_total blob request retries by retryable condition (label: status code or "net")
+# TYPE blobcache_blob_request_retries_total counter
+blobcache_blob_request_retries_total{status="503"} 4757
+# HELP blobcache_blob_request_status_total final HTTP status of blob requests after retries (label: status code or "err")
+# TYPE blobcache_blob_request_status_total counter
+blobcache_blob_request_status_total{status="206"} 49416
+# HELP blobcache_blob_retry_sleep_seconds_total cumulative seconds slept in exponential backoff between blob retries
+# TYPE blobcache_blob_retry_sleep_seconds_total counter
+blobcache_blob_retry_sleep_seconds_total 2401.5650000000005
+# HELP blobcache_cache_bytes cache bytes in use
+# TYPE blobcache_cache_bytes gauge
+blobcache_cache_bytes 309895949629
+# HELP blobcache_cache_evictions_total cache evictions
+# TYPE blobcache_cache_evictions_total counter
+blobcache_cache_evictions_total 0
+# HELP blobcache_cache_hits_total cache hits
+# TYPE blobcache_cache_hits_total counter
+blobcache_cache_hits_total 0
+# HELP blobcache_cache_inserts_total cache inserts
+# TYPE blobcache_cache_inserts_total counter
+blobcache_cache_inserts_total 74079
+# HELP blobcache_cache_misses_total cache misses
+# TYPE blobcache_cache_misses_total counter
+blobcache_cache_misses_total 74085
+# HELP blobcache_chunk_cache_get_seconds wall time in cache.try_get spawn_blocking
+# TYPE blobcache_chunk_cache_get_seconds histogram
+blobcache_chunk_cache_get_seconds_bucket{le="0.0001"} 1194
+blobcache_chunk_cache_get_seconds_bucket{le="0.00025"} 1197
+blobcache_chunk_cache_get_seconds_bucket{le="0.0005"} 1197
+blobcache_chunk_cache_get_seconds_bucket{le="0.001"} 1216
+blobcache_chunk_cache_get_seconds_bucket{le="0.002"} 1552
+blobcache_chunk_cache_get_seconds_bucket{le="0.005"} 1991
+blobcache_chunk_cache_get_seconds_bucket{le="0.01"} 2126
+blobcache_chunk_cache_get_seconds_bucket{le="0.025"} 2151
+blobcache_chunk_cache_get_seconds_bucket{le="0.05"} 2162
+blobcache_chunk_cache_get_seconds_bucket{le="0.1"} 2178
+blobcache_chunk_cache_get_seconds_bucket{le="0.25"} 7138
+blobcache_chunk_cache_get_seconds_bucket{le="0.5"} 42704
+blobcache_chunk_cache_get_seconds_bucket{le="1"} 49402
+blobcache_chunk_cache_get_seconds_bucket{le="+Inf"} 49402
+blobcache_chunk_cache_get_seconds_sum 17803.716277584885
+blobcache_chunk_cache_get_seconds_count 49402
+# HELP blobcache_chunk_cache_insert_seconds wall time in cache.insert spawn_blocking
+# TYPE blobcache_chunk_cache_insert_seconds histogram
+blobcache_chunk_cache_insert_seconds_bucket{le="0.0001"} 0
+blobcache_chunk_cache_insert_seconds_bucket{le="0.00025"} 0
+blobcache_chunk_cache_insert_seconds_bucket{le="0.0005"} 73
+blobcache_chunk_cache_insert_seconds_bucket{le="0.001"} 126
+blobcache_chunk_cache_insert_seconds_bucket{le="0.002"} 47168
+blobcache_chunk_cache_insert_seconds_bucket{le="0.005"} 50062
+blobcache_chunk_cache_insert_seconds_bucket{le="0.01"} 50225
+blobcache_chunk_cache_insert_seconds_bucket{le="0.025"} 50381
+blobcache_chunk_cache_insert_seconds_bucket{le="0.05"} 50522
+blobcache_chunk_cache_insert_seconds_bucket{le="0.1"} 50616
+blobcache_chunk_cache_insert_seconds_bucket{le="0.25"} 50805
+blobcache_chunk_cache_insert_seconds_bucket{le="0.5"} 51129
+blobcache_chunk_cache_insert_seconds_bucket{le="1"} 51673
+blobcache_chunk_cache_insert_seconds_bucket{le="+Inf"} 74080
+blobcache_chunk_cache_insert_seconds_sum 144433.39177083236
+blobcache_chunk_cache_insert_seconds_count 74080
+# HELP blobcache_chunk_fetch_total_seconds wall time in fetch_chunk()
+# TYPE blobcache_chunk_fetch_total_seconds histogram
+blobcache_chunk_fetch_total_seconds_bucket{le="0.0001"} 0
+blobcache_chunk_fetch_total_seconds_bucket{le="0.00025"} 0
+blobcache_chunk_fetch_total_seconds_bucket{le="0.0005"} 0
+blobcache_chunk_fetch_total_seconds_bucket{le="0.001"} 0
+blobcache_chunk_fetch_total_seconds_bucket{le="0.002"} 0
+blobcache_chunk_fetch_total_seconds_bucket{le="0.005"} 0
+blobcache_chunk_fetch_total_seconds_bucket{le="0.01"} 0
+blobcache_chunk_fetch_total_seconds_bucket{le="0.025"} 0
+blobcache_chunk_fetch_total_seconds_bucket{le="0.05"} 0
+blobcache_chunk_fetch_total_seconds_bucket{le="0.1"} 0
+blobcache_chunk_fetch_total_seconds_bucket{le="0.25"} 0
+blobcache_chunk_fetch_total_seconds_bucket{le="0.5"} 1
+blobcache_chunk_fetch_total_seconds_bucket{le="1"} 23
+blobcache_chunk_fetch_total_seconds_bucket{le="+Inf"} 49402
+blobcache_chunk_fetch_total_seconds_sum 3251405.5241300953
+blobcache_chunk_fetch_total_seconds_count 49402
+# HELP blobcache_chunk_peer_fetch_seconds wall time in peers.fetch_chunk await
+# TYPE blobcache_chunk_peer_fetch_seconds histogram
+blobcache_chunk_peer_fetch_seconds_bucket{le="0.0001"} 0
+blobcache_chunk_peer_fetch_seconds_bucket{le="0.00025"} 0
+blobcache_chunk_peer_fetch_seconds_bucket{le="0.0005"} 0
+blobcache_chunk_peer_fetch_seconds_bucket{le="0.001"} 0
+blobcache_chunk_peer_fetch_seconds_bucket{le="0.002"} 0
+blobcache_chunk_peer_fetch_seconds_bucket{le="0.005"} 0
+blobcache_chunk_peer_fetch_seconds_bucket{le="0.01"} 0
+blobcache_chunk_peer_fetch_seconds_bucket{le="0.025"} 0
+blobcache_chunk_peer_fetch_seconds_bucket{le="0.05"} 0
+blobcache_chunk_peer_fetch_seconds_bucket{le="0.1"} 0
+blobcache_chunk_peer_fetch_seconds_bucket{le="0.25"} 0
+blobcache_chunk_peer_fetch_seconds_bucket{le="0.5"} 1
+blobcache_chunk_peer_fetch_seconds_bucket{le="1"} 21
+blobcache_chunk_peer_fetch_seconds_bucket{le="+Inf"} 24669
+blobcache_chunk_peer_fetch_seconds_sum 2617915.349472027
+blobcache_chunk_peer_fetch_seconds_count 24669
+# HELP blobcache_cluster_config_mismatches_total config hash mismatches
+# TYPE blobcache_cluster_config_mismatches_total counter
+blobcache_cluster_config_mismatches_total 0
+# HELP blobcache_cluster_failures_total peer failures observed
+# TYPE blobcache_cluster_failures_total counter
+blobcache_cluster_failures_total 0
+# HELP blobcache_cluster_gossip_rounds_total gossip rounds
+# TYPE blobcache_cluster_gossip_rounds_total counter
+blobcache_cluster_gossip_rounds_total 140
+# HELP blobcache_cluster_joins_total peer joins observed
+# TYPE blobcache_cluster_joins_total counter
+blobcache_cluster_joins_total 1
+# HELP blobcache_cluster_members_alive alive members
+# TYPE blobcache_cluster_members_alive gauge
+blobcache_cluster_members_alive 2
+# HELP blobcache_cluster_members_dead dead members
+# TYPE blobcache_cluster_members_dead gauge
+blobcache_cluster_members_dead 0
+# HELP blobcache_fuse_read_bytes_total fuse read bytes
+# TYPE blobcache_fuse_read_bytes_total counter
+blobcache_fuse_read_bytes_total 0
+# HELP blobcache_fuse_read_seconds wall time in FUSE read callback
+# TYPE blobcache_fuse_read_seconds histogram
+blobcache_fuse_read_seconds_bucket{le="0.0001"} 0
+blobcache_fuse_read_seconds_bucket{le="0.00025"} 0
+blobcache_fuse_read_seconds_bucket{le="0.0005"} 0
+blobcache_fuse_read_seconds_bucket{le="0.001"} 0
+blobcache_fuse_read_seconds_bucket{le="0.002"} 0
+blobcache_fuse_read_seconds_bucket{le="0.005"} 0
+blobcache_fuse_read_seconds_bucket{le="0.01"} 0
+blobcache_fuse_read_seconds_bucket{le="0.025"} 0
+blobcache_fuse_read_seconds_bucket{le="0.05"} 0
+blobcache_fuse_read_seconds_bucket{le="0.1"} 0
+blobcache_fuse_read_seconds_bucket{le="0.25"} 0
+blobcache_fuse_read_seconds_bucket{le="0.5"} 0
+blobcache_fuse_read_seconds_bucket{le="1"} 0
+blobcache_fuse_read_seconds_bucket{le="+Inf"} 0
+blobcache_fuse_read_seconds_sum 0
+blobcache_fuse_read_seconds_count 0
+# HELP blobcache_fuse_reads_total fuse read calls
+# TYPE blobcache_fuse_reads_total counter
+blobcache_fuse_reads_total 0
+# HELP blobcache_peer_bloom_false_positive_total bloom-positive peers that returned NotFound
+# TYPE blobcache_peer_bloom_false_positive_total counter
+blobcache_peer_bloom_false_positive_total 0
+# HELP blobcache_peer_bloom_no_holder_total fetches with peers known but no bloom-positive holder
+# TYPE blobcache_peer_bloom_no_holder_total counter
+blobcache_peer_bloom_no_holder_total 49402
+# HELP blobcache_peer_bloom_pull_errors_total failed peer bloom pulls
+# TYPE blobcache_peer_bloom_pull_errors_total counter
+blobcache_peer_bloom_pull_errors_total 1
+# HELP blobcache_peer_bloom_pulls_total successful peer bloom pulls
+# TYPE blobcache_peer_bloom_pulls_total counter
+blobcache_peer_bloom_pulls_total 11
+# HELP blobcache_peer_bloom_yes_total fetches where at least one peer bloom indicated holder
+# TYPE blobcache_peer_bloom_yes_total counter
+blobcache_peer_bloom_yes_total 0
+# HELP blobcache_peer_chunk_bytes_served_total chunk bytes served
+# TYPE blobcache_peer_chunk_bytes_served_total counter
+blobcache_peer_chunk_bytes_served_total 103248031311
+# HELP blobcache_peer_chunk_requests_total chunk requests served
+# TYPE blobcache_peer_chunk_requests_total counter
+blobcache_peer_chunk_requests_total 24683
+# HELP blobcache_peer_fetch_bytes_total peer fetched bytes
+# TYPE blobcache_peer_fetch_bytes_total counter
+blobcache_peer_fetch_bytes_total 103185865667
+# HELP blobcache_peer_fetches_err_total peer fetch errors
+# TYPE blobcache_peer_fetches_err_total counter
+blobcache_peer_fetches_err_total 0
+# HELP blobcache_peer_fetches_miss_total peer fetch misses
+# TYPE blobcache_peer_fetches_miss_total counter
+blobcache_peer_fetches_miss_total 0
+# HELP blobcache_peer_fetches_ok_total peer fetches ok
+# TYPE blobcache_peer_fetches_ok_total counter
+blobcache_peer_fetches_ok_total 24669
+# HELP blobcache_peer_server_cache_get_seconds wall time in server-side cache.try_get for peer chunk requests
+# TYPE blobcache_peer_server_cache_get_seconds histogram
+blobcache_peer_server_cache_get_seconds_bucket{le="0.0001"} 23379
+blobcache_peer_server_cache_get_seconds_bucket{le="0.00025"} 23783
+blobcache_peer_server_cache_get_seconds_bucket{le="0.0005"} 23959
+blobcache_peer_server_cache_get_seconds_bucket{le="0.001"} 24390
+blobcache_peer_server_cache_get_seconds_bucket{le="0.002"} 24606
+blobcache_peer_server_cache_get_seconds_bucket{le="0.005"} 24623
+blobcache_peer_server_cache_get_seconds_bucket{le="0.01"} 24631
+blobcache_peer_server_cache_get_seconds_bucket{le="0.025"} 24667
+blobcache_peer_server_cache_get_seconds_bucket{le="0.05"} 24679
+blobcache_peer_server_cache_get_seconds_bucket{le="0.1"} 24683
+blobcache_peer_server_cache_get_seconds_bucket{le="0.25"} 24683
+blobcache_peer_server_cache_get_seconds_bucket{le="0.5"} 24683
+blobcache_peer_server_cache_get_seconds_bucket{le="1"} 24683
+blobcache_peer_server_cache_get_seconds_bucket{le="+Inf"} 24683
+blobcache_peer_server_cache_get_seconds_sum 3.1199701720000137
+blobcache_peer_server_cache_get_seconds_count 24683
+# HELP blobcache_peer_server_handler_seconds wall time per inbound peer chunk request handler
+# TYPE blobcache_peer_server_handler_seconds histogram
+blobcache_peer_server_handler_seconds_bucket{le="0.0001"} 0
+blobcache_peer_server_handler_seconds_bucket{le="0.00025"} 0
+blobcache_peer_server_handler_seconds_bucket{le="0.0005"} 0
+blobcache_peer_server_handler_seconds_bucket{le="0.001"} 0
+blobcache_peer_server_handler_seconds_bucket{le="0.002"} 0
+blobcache_peer_server_handler_seconds_bucket{le="0.005"} 4
+blobcache_peer_server_handler_seconds_bucket{le="0.01"} 42
+blobcache_peer_server_handler_seconds_bucket{le="0.025"} 47
+blobcache_peer_server_handler_seconds_bucket{le="0.05"} 67
+blobcache_peer_server_handler_seconds_bucket{le="0.1"} 6700
+blobcache_peer_server_handler_seconds_bucket{le="0.25"} 20445
+blobcache_peer_server_handler_seconds_bucket{le="0.5"} 24341
+blobcache_peer_server_handler_seconds_bucket{le="1"} 24462
+blobcache_peer_server_handler_seconds_bucket{le="+Inf"} 24683
+blobcache_peer_server_handler_seconds_sum 5326.933151965993
+blobcache_peer_server_handler_seconds_count 24683
+# HELP blobcache_peer_server_send_seconds wall time sending response bytes to peer
+# TYPE blobcache_peer_server_send_seconds histogram
+blobcache_peer_server_send_seconds_bucket{le="0.0001"} 48
+blobcache_peer_server_send_seconds_bucket{le="0.00025"} 6620
+blobcache_peer_server_send_seconds_bucket{le="0.0005"} 10374
+blobcache_peer_server_send_seconds_bucket{le="0.001"} 15232
+blobcache_peer_server_send_seconds_bucket{le="0.002"} 20647
+blobcache_peer_server_send_seconds_bucket{le="0.005"} 24428
+blobcache_peer_server_send_seconds_bucket{le="0.01"} 24581
+blobcache_peer_server_send_seconds_bucket{le="0.025"} 24615
+blobcache_peer_server_send_seconds_bucket{le="0.05"} 24651
+blobcache_peer_server_send_seconds_bucket{le="0.1"} 24669
+blobcache_peer_server_send_seconds_bucket{le="0.25"} 24683
+blobcache_peer_server_send_seconds_bucket{le="0.5"} 24683
+blobcache_peer_server_send_seconds_bucket{le="1"} 24683
+blobcache_peer_server_send_seconds_bucket{le="+Inf"} 24683
+blobcache_peer_server_send_seconds_sum 30.43632650799997
+blobcache_peer_server_send_seconds_count 24683
+# HELP blobcache_peer_stampede_follower_ok_total stampede follower fetches that returned data within wait_ms
+# TYPE blobcache_peer_stampede_follower_ok_total counter
+blobcache_peer_stampede_follower_ok_total 24669
+# HELP blobcache_peer_stampede_follower_timeout_total stampede follower fetches that fell through to blob (peer didn't deliver in time)
+# TYPE blobcache_peer_stampede_follower_timeout_total counter
+blobcache_peer_stampede_follower_timeout_total 0
+# HELP blobcache_peer_stampede_follower_total fetches where this node routes to HRW-top with wait_ms as a follower
+# TYPE blobcache_peer_stampede_follower_total counter
+blobcache_peer_stampede_follower_total 24669
+# HELP blobcache_peer_stampede_leader_total fetches where this node is the HRW-top stampede leader
+# TYPE blobcache_peer_stampede_leader_total counter
+blobcache_peer_stampede_leader_total 24733
+# HELP blobcache_prefetch_completed_err_total prefetch chunk fetches that failed
+# TYPE blobcache_prefetch_completed_err_total counter
+blobcache_prefetch_completed_err_total 0
+# HELP blobcache_prefetch_completed_ok_total prefetch chunk fetches that completed successfully
+# TYPE blobcache_prefetch_completed_ok_total counter
+blobcache_prefetch_completed_ok_total 0
+# HELP blobcache_prefetch_skipped_cached_total prefetch candidates skipped because already cached
+# TYPE blobcache_prefetch_skipped_cached_total counter
+blobcache_prefetch_skipped_cached_total 0
+# HELP blobcache_prefetch_skipped_inflight_total prefetch candidates skipped because fetch already in flight
+# TYPE blobcache_prefetch_skipped_inflight_total counter
+blobcache_prefetch_skipped_inflight_total 0
+# HELP blobcache_prefetch_spawned_total prefetch chunk fetches spawned by sequential detector
+# TYPE blobcache_prefetch_spawned_total counter
+blobcache_prefetch_spawned_total 0
+# HELP blobcache_rdma_non_rdma_lane_total rdma endpoints that resolved to non-RDMA lanes
+# TYPE blobcache_rdma_non_rdma_lane_total counter
+blobcache_rdma_non_rdma_lane_total 0
+# HELP blobcache_singleflight_waits_total fetches deduped via singleflight
+# TYPE blobcache_singleflight_waits_total counter
+blobcache_singleflight_waits_total 0
