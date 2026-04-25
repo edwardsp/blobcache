@@ -223,6 +223,9 @@ fn main() -> anyhow::Result<()> {
         stats.clone(),
         cfg.cache.chunk_size,
         cfg.transport.chunk_concurrency,
+        cfg.transport.prefetch_depth,
+        cfg.transport.prefetch_threshold,
+        cfg.transport.prefetch_concurrency,
     ));
 
     let transport_addr: std::net::SocketAddr = cfg

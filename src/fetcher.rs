@@ -41,6 +41,23 @@ pub struct Fetcher {
     // arriving in the 1.25 ms window between data-return and disk-commit
     // sees the bytes instead of triggering a redundant peer fetch.
     inflight_writes: Arc<DashMap<ChunkKey, Bytes>>,
+    // Per-(mount,blob) sequential-read tracker. Drives readahead: once the
+    // caller has issued `prefetch_threshold` consecutive forward reads we
+    // spawn background fetches for the next `prefetch_depth` chunks. This
+    // exists because FUSE serialises read() at the kernel boundary and
+    // delivers one ~128 KiB sub-read at a time, which collapses our
+    // chunk_concurrency budget to 1 effective in-flight blob fetch per
+    // stream and caps single-stream cold throughput at ~50 MiB/s.
+    seq_state: Arc<DashMap<String, SeqState>>,
+    prefetch_sem: Arc<Semaphore>,
+    prefetch_depth: u32,
+    prefetch_threshold: u32,
+}
+
+#[derive(Clone, Copy)]
+struct SeqState {
+    last_end: u64,
+    consecutive: u32,
 }
 
 // RAII guard for the leader slot in `inflight`. On drop (panic, cancel, or
@@ -81,8 +98,12 @@ impl Fetcher {
         stats: Arc<Stats>,
         chunk_size: u64,
         chunk_concurrency: usize,
+        prefetch_depth: u32,
+        prefetch_threshold: u32,
+        prefetch_concurrency: usize,
     ) -> Self {
         let permits = chunk_concurrency.max(1);
+        let pf_permits = prefetch_concurrency.max(1);
         Self {
             cache,
             blobs,
@@ -93,6 +114,10 @@ impl Fetcher {
             inflight: Arc::new(Mutex::new(HashMap::new())),
             chunk_sem: Arc::new(Semaphore::new(permits)),
             inflight_writes: Arc::new(DashMap::new()),
+            seq_state: Arc::new(DashMap::new()),
+            prefetch_sem: Arc::new(Semaphore::new(pf_permits)),
+            prefetch_depth,
+            prefetch_threshold: prefetch_threshold.max(1),
         }
     }
 
@@ -475,6 +500,8 @@ impl Fetcher {
         let first_chunk = (offset / cs) * cs;
         let last_chunk = ((end - 1) / cs) * cs;
 
+        self.maybe_trigger_prefetch(mount, blob_path, offset, end, file_size);
+
         let mut tasks = Vec::new();
         let mut o = first_chunk;
         while o <= last_chunk {
@@ -530,6 +557,89 @@ impl Fetcher {
             inflight: self.inflight.clone(),
             chunk_sem: self.chunk_sem.clone(),
             inflight_writes: self.inflight_writes.clone(),
+            seq_state: self.seq_state.clone(),
+            prefetch_sem: self.prefetch_sem.clone(),
+            prefetch_depth: self.prefetch_depth,
+            prefetch_threshold: self.prefetch_threshold,
+        }
+    }
+
+    // Update the per-stream sequential tracker and, once the caller has shown
+    // `prefetch_threshold` consecutive forward reads, spawn background fetches
+    // for the next `prefetch_depth` chunks past the current one. Skips chunks
+    // already cached or in flight so re-reads don't fan out duplicate work.
+    fn maybe_trigger_prefetch(
+        &self,
+        mount: &MountConfig,
+        blob_path: &str,
+        req_offset: u64,
+        req_end: u64,
+        file_size: u64,
+    ) {
+        if self.prefetch_depth == 0 {
+            return;
+        }
+        let cs = self.chunk_size;
+        let key = format!("{}\0{}", mount.name, blob_path);
+        let consecutive = {
+            let mut e = self
+                .seq_state
+                .entry(key)
+                .or_insert(SeqState { last_end: 0, consecutive: 0 });
+            // Sequential = read starts exactly where the previous one ended,
+            // or within one chunk ahead (covers FUSE sub-read reordering and
+            // small skipped slack from prefetch-warmed reads).
+            let forward = req_offset >= e.last_end && req_offset - e.last_end <= cs;
+            if forward {
+                e.consecutive = e.consecutive.saturating_add(1);
+            } else {
+                e.consecutive = 1;
+            }
+            e.last_end = req_end;
+            e.consecutive
+        };
+        if consecutive < self.prefetch_threshold {
+            return;
+        }
+
+        let cur_chunk = if req_end == 0 { 0 } else { ((req_end - 1) / cs) * cs };
+        for i in 1..=self.prefetch_depth as u64 {
+            let off = cur_chunk + i * cs;
+            if off >= file_size {
+                break;
+            }
+            let chunk_len = cs.min(file_size - off);
+            let ck = ChunkKey {
+                mount: mount.name.clone(),
+                blob: blob_path.to_string(),
+                offset: off,
+            };
+            if self.cache.entry_size(&ck).is_some() {
+                self.stats.prefetch_skipped_cached.inc();
+                continue;
+            }
+            if self.inflight_writes.contains_key(&ck) {
+                self.stats.prefetch_skipped_inflight.inc();
+                continue;
+            }
+            if self.inflight.lock().contains_key(&ck) {
+                self.stats.prefetch_skipped_inflight.inc();
+                continue;
+            }
+            let me = self.clone_handles();
+            let mc = mount.clone();
+            let bp = blob_path.to_string();
+            let sem = self.prefetch_sem.clone();
+            self.stats.prefetch_spawned.inc();
+            tokio::spawn(async move {
+                let Ok(_permit) = sem.acquire_owned().await else {
+                    return;
+                };
+                match me.fetch_chunk(&mc, &bp, off, chunk_len).await {
+                    Ok(_) => me.stats.prefetch_completed_ok.inc(),
+                    Err(_) => me.stats.prefetch_completed_err.inc(),
+                }
+            });
         }
     }
 }

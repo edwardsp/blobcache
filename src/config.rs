@@ -47,6 +47,12 @@ pub struct TransportConfig {
     pub chunk_concurrency: usize,
     #[serde(default = "default_peer_concurrency")]
     pub peer_concurrency: usize,
+    #[serde(default = "default_prefetch_depth")]
+    pub prefetch_depth: u32,
+    #[serde(default = "default_prefetch_threshold")]
+    pub prefetch_threshold: u32,
+    #[serde(default = "default_prefetch_concurrency")]
+    pub prefetch_concurrency: usize,
     #[serde(default = "default_transport_kind")]
     pub kind: String,
 }
@@ -55,6 +61,15 @@ fn default_chunk_concurrency() -> usize {
 }
 fn default_peer_concurrency() -> usize {
     8
+}
+fn default_prefetch_depth() -> u32 {
+    16
+}
+fn default_prefetch_threshold() -> u32 {
+    3
+}
+fn default_prefetch_concurrency() -> usize {
+    32
 }
 fn default_transport_kind() -> String {
     "tcp".into()

@@ -13,6 +13,9 @@ seeds = []
 bind = "0.0.0.0:7772"
 chunk_concurrency = 32
 peer_concurrency = 8
+prefetch_depth = 16
+prefetch_threshold = 3
+prefetch_concurrency = 32
 
 [stats]
 bind = "0.0.0.0:7773"

@@ -17,6 +17,11 @@ pub struct Stats {
     pub fuse_reads: IntCounter,
     pub fuse_read_bytes: IntCounter,
     pub singleflight_waits: IntCounter,
+    pub prefetch_spawned: IntCounter,
+    pub prefetch_skipped_cached: IntCounter,
+    pub prefetch_skipped_inflight: IntCounter,
+    pub prefetch_completed_ok: IntCounter,
+    pub prefetch_completed_err: IntCounter,
     pub peer_stats: Arc<PeerStats>,
     pub cluster_stats: Arc<ClusterStats>,
     pub members_alive: IntGauge,
@@ -71,6 +76,31 @@ impl Stats {
         let singleflight_waits = IntCounter::new(
             "blobcache_singleflight_waits_total",
             "fetches deduped via singleflight",
+        )
+        .unwrap();
+        let prefetch_spawned = IntCounter::new(
+            "blobcache_prefetch_spawned_total",
+            "prefetch chunk fetches spawned by sequential detector",
+        )
+        .unwrap();
+        let prefetch_skipped_cached = IntCounter::new(
+            "blobcache_prefetch_skipped_cached_total",
+            "prefetch candidates skipped because already cached",
+        )
+        .unwrap();
+        let prefetch_skipped_inflight = IntCounter::new(
+            "blobcache_prefetch_skipped_inflight_total",
+            "prefetch candidates skipped because fetch already in flight",
+        )
+        .unwrap();
+        let prefetch_completed_ok = IntCounter::new(
+            "blobcache_prefetch_completed_ok_total",
+            "prefetch chunk fetches that completed successfully",
+        )
+        .unwrap();
+        let prefetch_completed_err = IntCounter::new(
+            "blobcache_prefetch_completed_err_total",
+            "prefetch chunk fetches that failed",
         )
         .unwrap();
         let chunk_requests = IntCounter::new(
@@ -160,6 +190,11 @@ impl Stats {
             &fuse_reads,
             &fuse_read_bytes,
             &singleflight_waits,
+            &prefetch_spawned,
+            &prefetch_skipped_cached,
+            &prefetch_skipped_inflight,
+            &prefetch_completed_ok,
+            &prefetch_completed_err,
             &chunk_requests,
             &chunk_bytes_served,
             #[cfg(feature = "ucx")]
@@ -203,6 +238,11 @@ impl Stats {
             fuse_reads,
             fuse_read_bytes,
             singleflight_waits,
+            prefetch_spawned,
+            prefetch_skipped_cached,
+            prefetch_skipped_inflight,
+            prefetch_completed_ok,
+            prefetch_completed_err,
             members_alive,
             members_dead,
             chunk_total_seconds,

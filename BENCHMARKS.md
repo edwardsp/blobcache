@@ -931,3 +931,229 @@ or per-NIC daemon processes — not parameter tuning. Pinning a
 single-threaded daemon to one socket is actively counter-productive
 at low concurrency because the pinned cores are already crowded with
 AKS system processes.
+
+---
+
+# v2.4.0 — sequential prefetch on cold-load sequential reads
+
+## TL;DR
+
+A real-world, multi-node sequential cold load of the
+`nvidia/DeepSeek-R1-0528-NVFP4-v2` model (385 GiB, 163 safetensors files)
+exposed a single-stream cold-fetch bottleneck of ~50 MiB/s — independent
+of N (up to N=8 nodes simultaneously) and independent of daemon
+`chunk_size` (4 MiB → 64 MiB all measured at 47-49 MiB/s). The bottleneck
+is FUSE serialising `read()` at the kernel boundary into ~128 KiB
+sub-reads, which collapses the daemon's `chunk_concurrency=32` budget
+to one effective in-flight blob fetch per stream.
+
+v2.4.0 adds a per-stream sequential-readahead detector to `Fetcher`. Once
+a `(mount, blob)` has been read forward 3 consecutive times (counted at
+`fetch_range` granularity), the next 16 chunks past the current one are
+spawned as background fetches under a dedicated semaphore (default
+`prefetch_concurrency = 32`), each skipped if already cached or in
+flight. With prefetch on, the same workload runs 3-4.7× faster per pod
+and aggregate scales linearly to **1.65 GiB/s across 8 nodes**.
+
+Headline (8-file × 8-pod cold sequential, chunk_size=4 MiB):
+
+| N | per-pod baseline (MiB/s) | per-pod prefetch (MiB/s) | speedup | aggregate prefetch (MiB/s) |
+|---|---|---|---|---|
+| 1 | 48.6 | 148.7 | 3.06× | 148.7 |
+| 2 | 49.5 | 219.2 | 4.43× | 438.4 |
+| 4 | 47.7 | 181.8 | 3.81× | 727.3 |
+| 8 | 44.5 | 210.7 | 4.74× | 1685.6 |
+
+## Workload
+
+Real model, real container:
+
+| | |
+|---|---|
+| Model | `nvidia/DeepSeek-R1-0528-NVFP4-v2` |
+| Storage account | `myaccount`, container `models`, prefix `models/test-prefix/` |
+| Files | 163 safetensors shards, 385 GiB total |
+| Per-pod read | first 8 model shards, sequential, `dd bs=4M`, ≈21.3 GiB |
+| Cluster | 8× `Standard_GB300` (Grace + Blackwell), `agentpool=gb300` |
+| Daemon transport | RDMA (UCX over IB), `chunk_concurrency=32` |
+| Cache | 450 GiB per node on RAID-0 NVMe, no eviction (model fits) |
+| Process | full pod restart + cache wipe between every N (cold-cache discipline) |
+
+Bench harness: `bench-deepseek.sh` per pod (`dd` 8 files into `/dev/null`,
+emit `MIB_PER_SEC`); `launch-bench.sh` runs N copies in parallel via
+`kubectl exec` and reports per-pod and wall-clock numbers.
+
+## Phase 1 — baseline (v2.3.3, no prefetch)
+
+8 pods, 8 model files each, all cold:
+
+| N | per-pod MiB/s | wall_s | aggregate MiB/s |
+|---|---|---|---|
+| 1 | 48.6 | 419 | 48.6 |
+| 2 | 49.5 | 411 | 99 |
+| 4 | 47.7 | 427 | 191 |
+| 8 | 44.5 | 458 | 356 |
+
+Per-pod throughput is **flat in N**. Linear aggregate scaling to N=8
+proves the blob origin has zero contention at this scale, but per-pod
+throughput is capped by something inside the daemon.
+
+### Diagnostic: it's not the blob, it's not the cache, it's not the app block size
+
+Same single pod, three independent measurements that triangulate the
+bottleneck:
+
+| Probe | Throughput | What it measures |
+|---|---|---|
+| 1 stream cold blob, FUSE 4 MiB reads | **50 MiB/s** | combined FUSE + fetcher + blob path |
+| 4 parallel cold blob streams from one pod | **197 MiB/s** | linear scaling × 4 → blob is **not** the bottleneck |
+| 1 stream warm cache (re-read of same file) | **1817 MiB/s** | FUSE + page-cache ceiling, 36× headroom over cold |
+| 1 stream cold peer-fetch (RDMA) | ~90 MiB/s | peer link is ~2× faster than blob even with 83 % miss rate (peer chosen randomly, often doesn't have the chunk) |
+
+Then a daemon `chunk_size` sweep (single pod, N=1, 8 files, cold):
+
+| chunk_size | per-pod MiB/s | wall_s |
+|---|---|---|
+| 4 MiB (baseline) | 48.6 | 419 |
+| 16 MiB | 47.6 | 427 |
+| 64 MiB | 48.0 | 424 |
+
+Bigger chunks **do not help**: the limit is the number of blob fetches
+in flight per stream, not the size of each fetch. And an `dd bs=` sweep
+on the application side (4 MiB → 128 MiB) moved throughput by less than
+3 MiB/s — the kernel and FUSE serialise reads downstream of the
+application's block size, so there's no application knob that helps
+either.
+
+### Root cause
+
+FUSE delivers `read()` to userspace one ~128 KiB sub-read at a time and
+waits for each to return before issuing the next. `Fetcher::fetch_range`
+is parallelised across chunks via `chunk_concurrency=32` semaphore
+permits, but only ever sees one chunk at a time per stream, so it never
+fans out. `chunks_in_flight` was effectively 1 across every cold-stream
+benchmark we ran. **The 32× concurrency budget was unused.**
+
+## Phase 2 — prefetch (v2.4.0)
+
+`src/fetcher.rs` adds `seq_state: DashMap<String, SeqState>` keyed by
+`(mount.name, blob_path)` and a `prefetch_sem: Semaphore`
+(default `prefetch_concurrency = 32`). On every `fetch_range(offset,
+length)`:
+
+1. Look up the per-stream `SeqState { last_end, consecutive }`.
+2. Forward (`req_offset >= last_end && req_offset - last_end <= chunk_size`)
+   → `consecutive += 1`. Anything else → `consecutive = 1`.
+3. Update `last_end = req_offset + length`.
+4. If `consecutive >= prefetch_threshold` (default 3), spawn background
+   fetches for the next `prefetch_depth` (default 16) chunks past the
+   chunk that contains the current read's end. Each prefetch skips if
+   `cache.entry_size().is_some() || inflight_writes.contains(key) ||
+   inflight.lock().contains(key)` — so re-reads, in-flight singleflight
+   chunks, and chunks already inserted in disk-side cache do not
+   double-fetch. Prefetch tasks acquire `prefetch_sem` so they cannot
+   starve foreground fetches under a tight `chunk_concurrency` budget.
+
+Five new Prometheus counters (`blobcache_prefetch_*`) expose
+`spawned`, `skipped_cached`, `skipped_inflight`, `completed_ok`,
+`completed_err` so behaviour is auditable in production.
+
+Three new TOML knobs under `[transport]`:
+
+```toml
+prefetch_depth = 16          # K = chunks ahead per spawn
+prefetch_threshold = 3       # consecutive forward reads to arm prefetch
+prefetch_concurrency = 32    # dedicated semaphore (separate from chunk_concurrency)
+```
+
+### Same workload, same chunk_size, prefetch on
+
+8 pods, 8 model files each, full pod restart + cache wipe between every N:
+
+| N | per-pod MiB/s | wall_s | aggregate MiB/s | speedup vs baseline |
+|---|---|---|---|---|
+| 1 | 148.7 | 137.8 | 148.7 | **3.06×** |
+| 2 | 219.2 | 93.9 | 438.4 | **4.43×** |
+| 4 | 181.8 | 115.5 | 727.3 | **3.81×** |
+| 8 | 210.7 | 97.5 | 1685.6 | **4.74×** |
+
+(The N=4 dip relative to N=2 and N=8 is reproducible — likely an
+artefact of which 4-pod subset of nodes we picked and their relative
+distance on the IB fabric; per-pod throughput at N=8 is uniform across
+all 8 pods, ±0.3 MiB/s.)
+
+Per-pod throughput **rises** with N once prefetch is on, because peers
+race ahead of each other via prefetch and the followers' on-demand
+fetches start hitting warm peer caches. With baseline (no prefetch),
+peers raced too, but they raced in 4 MiB chunks one at a time, so two
+pods reading the same file simply both fell through to blob.
+
+### Prefetch metrics from the N=8 run (one representative pod)
+
+```
+blobcache_prefetch_spawned_total           523337
+blobcache_prefetch_completed_ok_total      523337   # 100 % success
+blobcache_prefetch_completed_err_total          0
+blobcache_prefetch_skipped_cached_total    757441   # already on disk → skip
+blobcache_prefetch_skipped_inflight_total 1264323   # already mid-fetch → skip
+blobcache_blob_fetches_total                 4349   # vs ~5440 chunks/pod expected
+blobcache_peer_fetches_ok_total               813   # peers actually contributing now
+blobcache_peer_fetches_miss_total           13522
+blobcache_singleflight_waits_total          28487   # cross-stream dedup
+```
+
+Two important observations:
+
+- **Dedup works.** The candidate set per pod was ~2.55 M
+  (`spawned + skipped_cached + skipped_inflight`); only 523k actually
+  ran. Without these checks we'd have multiplied work by ~5×.
+- **Peers contribute on multi-node load.** `peer_fetches_ok` jumped
+  from 0 in the N=1 cold run to 813 in N=8 (≈19 % of all chunk fetches
+  came from a peer rather than blob), because prefetch causes pods to
+  race ahead and serve each other warm.
+
+## Latency
+
+The user-visible latency for a model loader is the time to finish loading
+all weights, captured by `wall_s` above. With prefetch:
+
+| N | wall_s baseline | wall_s prefetch | reduction |
+|---|---|---|---|
+| 1 | 419 s | 138 s | **3.0× faster** |
+| 2 | 411 s | 94 s | 4.4× faster |
+| 4 | 427 s | 116 s | 3.7× faster |
+| 8 | 458 s | 97 s | **4.7× faster** |
+
+For an 8-node cluster cold-loading a 385 GiB model end-to-end, the load
+time drops from ~83 minutes (extrapolated from 458 s × 163 / 8) to
+~17 minutes. That's the bandwidth side. The chunk-level fetch latency
+distribution (`blobcache_chunk_fetch_total_seconds` histogram) is
+unchanged — prefetch doesn't make any individual chunk faster, it just
+overlaps the cost of N chunks behind one foreground read.
+
+## Why we did not touch chunk size
+
+We tested `chunk_size = 4, 16, 64 MiB` head-to-head at N=1, prefetch off:
+all three landed within 1 MiB/s of 48 MiB/s. Bigger chunks just amortise
+the same per-fetch overhead over more bytes; they don't unlock parallelism
+that wasn't already there. The real lever is fanning out beyond the
+single-chunk-at-a-time pacing FUSE imposes — which is exactly what
+prefetch does. We kept the default at 4 MiB.
+
+## What's not in this release
+
+- **Prefetch tuning per workload class.** `K=16` is a sensible default
+  for sequential bulk reads of large files (model loaders, dataset
+  scans) but is wasted overhead for random-access workloads that
+  occasionally trip the consecutive-3 threshold. Future work could
+  decay `consecutive` more aggressively or expose a per-mount knob.
+- **Adaptive `K`.** A workload that's bottlenecked on blob bandwidth
+  (e.g. 16+ pods on the same container) gets no additional benefit
+  from K > 8, and a larger K would just pile up `inflight_writes`
+  pressure. Today this is left to operator configuration.
+- **Latency histograms split by foreground vs prefetch.** `chunk_fetch_total_seconds`
+  is currently aggregated. Splitting would let us tell at-a-glance
+  whether prefetch is keeping up with the foreground stream.
+
+These are not blockers — current defaults give 3-5× speedup on real
+model loads with no operator tuning required.
