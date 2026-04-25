@@ -1821,3 +1821,141 @@ Operationally, the smoking-gun metric for "Azure is unhappy" is:
 - N=1 connection-storm mitigation: add a hydrate-coordinator-side throttle
   on per-source-IP concurrent connections so single-node hydrate doesn't
   generate the 485 k mid-stream resets observed here.
+
+## azcp baseline — what raw Azure Blob throughput looks like without blobcache
+
+The v2.7.1 hydrate matrix above measures blobcache end-to-end (Azure GET →
+chunk cache → bloom advertise → peer fan-out). To know how much per-node
+throughput we're leaving on the table inside `azure.rs` / `fetcher.rs`, we
+need an apples-to-apples baseline: same hardware, same dataset, same storage
+account, same hostNetwork pods, same N values — but with a tuned standalone
+fetcher in place of blobcached. The Rust [`azcp`](reference/azcp/) tool
+(local fork in `reference/`, v0.1.16) is exactly that — Azure Blob client,
+no caching, no peers, no FUSE. One process per node, `--shard i/N` for
+deterministic LPT bin-packing, `--workers 1` (workers and shard don't
+compose — see `reference/azcp/README.md`), aarch64 release binary pushed
+to `/opt/blobcache/azcp` on every gb300 pod.
+
+Identical orchestration to `bench/matrix.sh`: same pod set, same seed-IP
+hold-list, same N sweep, same destination NVMe (`/mnt/nvme/azcp-test/`),
+same MSI auth (`AZURE_CLIENT_ID=38eed020-...`). Runner: `bench/azcp-matrix.sh`,
+analysis: `bench/analyze-azcp.py`, raw data: `bench/results-azcp/N{1,2,4,8,16}/`.
+
+### Per-shard invocation
+
+```
+azcp copy <src>/ /mnt/nvme/azcp-test/ \
+    --recursive --shard $i/$N \
+    --workers 1 --concurrency 32 --block-size 16777216 \
+    --no-progress
+```
+
+`--workers 1` is mandatory because `--workers >1` silently disables the
+outer `--shard` (workers do their own intra-process LPT) — the first
+matrix run hit this and degenerated into 16 nodes each downloading the
+full 385 GiB, generating 7 583 × 503 ServerBusy responses per pod and
+ultimately failing. With `--workers 1`, one node = one shard = one tokio
+runtime, which the azcp README documents as topping out at ~25-28 Gbps
+per process. That ceiling is exactly what we measure below.
+
+### azcp-only matrix (no blobcache, no peers, no cache)
+
+| N | per-shard wall (max) | aggregate from Azure | per-node from Azure | failures |
+|---:|---:|---:|---:|---:|
+| 1  | 122.11 s | 27.08 Gbps ( 3.15 GiB/s) | **27.08 Gbps** | 0 |
+| 2  |  62.57 s | 52.85 Gbps ( 6.15 GiB/s) | 26.42 Gbps | 0 |
+| 4  |  33.50 s | 98.72 Gbps (11.49 GiB/s) | 24.68 Gbps | 0 |
+| 8  |  17.36 s | **190.47 Gbps** (**22.17 GiB/s**) | 23.81 Gbps | 0 |
+| 16 |  19.05 s | 173.60 Gbps (20.21 GiB/s) | 10.85 Gbps | 0 |
+
+Total bytes per N is constant (385.0 GiB — the full model, partitioned by
+LPT into N slices summing to the whole). Aggregate scales linearly through
+N=8 (190 Gbps, 7.0× speedup vs N=1 = 88 % efficiency) and then **plateaus**
+at N=16 — the storage account egress ceiling kicks in around 175-200 Gbps
+for this account, matching the `~230 Gbps before hard 503 storms` figure
+documented in the azcp README. Per-shard wall actually went *up* from N=8
+(17.4 s) to N=16 (19.0 s) because each shard is fighting account-level
+contention even though it's only responsible for ~24 GiB.
+
+### v2.7.1 blobcache hydrate vs azcp baseline (side by side)
+
+| N | hydrate wall | hydrate Azure pull | hydrate per-node | azcp wall | azcp Azure pull | azcp per-node | per-node gap |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1  | 486.32 s |   6.3 Gbps | **6.3 Gbps**  | 122.11 s |  27.08 Gbps | **27.08 Gbps** | **4.3×** |
+| 2  | 168.42 s |   9.1 Gbps |  4.6 Gbps     |  62.57 s |  52.85 Gbps |  26.42 Gbps    | **5.7×** |
+| 4  |  86.08 s |  35.8 Gbps |  9.0 Gbps     |  33.50 s |  98.72 Gbps |  24.68 Gbps    | **2.7×** |
+| 8  |  47.52 s |  64.8 Gbps |  8.1 Gbps     |  17.36 s | 190.47 Gbps |  23.81 Gbps    | **2.9×** |
+| 16 |  30.18 s | 102.0 Gbps |  6.4 Gbps     |  19.05 s | 173.60 Gbps |  10.85 Gbps    | 1.7× (capped) |
+
+Two honest readings:
+
+1. **Per-node**, blobcache v2.7.1's hydrate path moves data 2.7-5.7×
+   slower than tuned standalone azcp on the same hardware against the
+   same account. The largest gap is at low N (N=1, N=2) where blobcache
+   is most exposed because there are no peers to absorb load — exactly
+   the regime that matters for cold cluster startup.
+2. **Aggregate**, the gap closes as we scale, because both are bounded
+   by the same account ceiling. At N=16 azcp is account-capped at
+   174 Gbps and blobcache is at 102 Gbps — still a real gap, but no
+   longer a 4× one. The blobcache N=16 number is also bottlenecked by
+   the coordinator's hash partition + per-peer hydrate-shard RPC
+   serialisation, not just the per-node fetcher.
+
+The N=8 row is the interesting one for engineering attention: azcp pulls
+190 Gbps from 8 nodes (24 Gbps/node, 76 % of single-runtime ceiling) with
+zero throttling; blobcache pulls 65 Gbps (8 Gbps/node, 32 % of the same
+ceiling) with zero throttling either. The 16 Gbps/node delta is pure
+client-side software cost — same TLS, same Azure account, same NVMe sink.
+
+### Per-node throughput gap — root cause inventory
+
+The azcp README documents the specific knobs that matter for high-bandwidth
+Azure Blob fetching, with measured Gbps for each. Diff vs current blobcache:
+
+| Knob | azcp value | blobcache (v2.7.1) | impact |
+|---|---|---|---|
+| `pool_max_idle_per_host` | 512 (explicit) | reqwest default (32) | **High** — 32 idle conns can't keep 32 in-flight ranged GETs warm; we pay TLS handshake on the steady-state hot path. azcp `reference/azcp/src/storage/blob/client.rs:151`. |
+| Block / chunk size | 16 MiB | 4 MiB | **High** — 4× more HTTPS round-trips per byte. With 256 ms p50 chunk latency, 4 MiB ⇒ ~16 MB/s/connection theoretical; 16 MiB ⇒ ~64 MB/s. |
+| Tokio runtimes per process | N (`--workers`), each with its own `reqwest::Client` | 1 shared runtime | **Critical for ≥30 Gbps/node** — azcp explicitly documents a 25-28 Gbps hard ceiling for any single tokio runtime + reqwest pool, regardless of in-flight count. Confirmed in our N=1 (27 Gbps). To exceed this per node, blobcache would need either multiple Client instances behind a sharded pool or a true multi-process fetcher model. |
+| HTTP version | `http1_only()` (deliberate, hyper HTTP/2 has perf cliffs at high concurrency) | reqwest default (HTTP/1.1 with HTTP/2 negotiation possible) | Low — Azure Blob currently negotiates HTTP/1.1 anyway; safe to make explicit. |
+| NUMA pin | `numactl --cpunodebind=$NIC_NUMA --membind=$NIC_NUMA` recommended | none (privileged DS but no pinning) | Medium on dual-socket gb300; +14 Gbps single-process measured by azcp README. |
+| `hostNetwork: true` | required for >70 Gbps single process | already set in `deploy/blobcached.yaml` | ✓ already done |
+
+### Gap-closer priorities (for v2.8 candidate work)
+
+In rough order of expected payoff per LOC, anchored to the measured 4-5×
+per-node gap and azcp's documented per-knob improvements:
+
+1. **`pool_max_idle_per_host = 512`** in `BlobClient::new` (`src/azure.rs`).
+   One-line change. Prevents the connection pool from churning when
+   `chunk_concurrency = 32` is configured. Expected: lifts the per-node
+   floor from 6-9 Gbps toward 15-20 Gbps without any other change.
+2. **Bump `chunk_size` default from 4 MiB → 16 MiB** in `src/config.rs`
+   (or expose it independently from on-disk chunk granularity). 4× fewer
+   HTTPS round-trips per byte. The cluster_hash includes `chunk_size` so
+   this is a coordinated rolling-restart change, not a per-node knob.
+3. **Multi-runtime fetcher** — per-NIC or per-CPU-socket tokio runtime
+   inside `fetcher.rs`, each with its own `BlobClient`. This is the
+   only way to exceed ~28 Gbps/node, which is what we'd need to hit
+   the 200 Gbps NIC. azcp's `--workers` is the reference design.
+4. **Expose azcp's tuning knobs in blobcache config** (`pool_max_idle_per_host`,
+   `block_size`, `parallel_files`, `workers`). Today these are hard-coded
+   defaults; making them configurable lets us A/B without recompiling.
+5. **NUMA-aware spawn** — find the IB device's NUMA node and pin the
+   fetcher runtime(s) to it via `sched_setaffinity` or by spawning under
+   `numactl`. Marginal (+10-15 % per azcp data) but free once you have
+   per-NIC runtimes from #3.
+
+None of these are landing in v2.7.1 — this section exists to document the
+gap and define the v2.8 work.
+
+### Caveat: this is per-node fetcher throughput, not full system value
+
+azcp doesn't have peers, doesn't have a chunk cache, doesn't expose a
+filesystem, and doesn't deduplicate concurrent reads. The whole reason
+blobcache exists is that subsequent reads from peers run at IB speed
+(195 Gbps cluster aggregate at N=16, see "Parallel-read scaling" above)
+without touching Azure at all. The per-node Azure-fetch throughput is
+just the cold-path bootstrap cost — but it's the cost that dominates
+"how long until my cluster is ready", which is the user-visible metric
+the v2.8 work above is targeted at improving.
