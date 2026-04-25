@@ -3,10 +3,12 @@ use chrono::Utc;
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_LENGTH, CONTENT_TYPE};
 use reqwest::{Client, Method, Response, StatusCode};
 use serde::Deserialize;
+use std::sync::Arc;
 use url::Url;
 
 use crate::auth::{sas, shared_key, Credential};
 use crate::error::{BcError, Result};
+use crate::stats::Stats;
 
 pub const API_VERSION: &str = "2024-11-04";
 
@@ -32,10 +34,11 @@ pub struct BlobClient {
     http: Client,
     credential: Credential,
     max_retries: u32,
+    metrics: Option<Arc<Stats>>,
 }
 
 impl BlobClient {
-    pub fn new(credential: Credential) -> Result<Self> {
+    pub fn new(credential: Credential, metrics: Option<Arc<Stats>>) -> Result<Self> {
         let http = Client::builder()
             .pool_max_idle_per_host(512)
             .http1_only()
@@ -43,7 +46,8 @@ impl BlobClient {
         Ok(Self {
             http,
             credential,
-            max_retries: 5,
+            max_retries: 10,
+            metrics,
         })
     }
 
@@ -227,9 +231,24 @@ impl BlobClient {
                     }
                     if is_retryable_status(status) && attempt < max_attempts {
                         let delay = retry_delay_ms(&resp, attempt);
+                        if let Some(m) = &self.metrics {
+                            m.blob_request_retries_total
+                                .with_label_values(&[status.as_str()])
+                                .inc();
+                            m.blob_retry_sleep_seconds_total
+                                .inc_by(delay as f64 / 1000.0);
+                        }
                         drop(resp);
                         tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                         continue;
+                    }
+                    if let Some(m) = &self.metrics {
+                        m.blob_request_status_total
+                            .with_label_values(&[status.as_str()])
+                            .inc();
+                        if is_retryable_status(status) {
+                            m.blob_request_giveups_total.inc();
+                        }
                     }
                     return Ok(resp);
                 }
@@ -238,10 +257,25 @@ impl BlobClient {
                         && (e.is_timeout() || e.is_connect() || e.is_request() || e.is_body()) =>
                 {
                     let delay = backoff_ms(attempt);
+                    if let Some(m) = &self.metrics {
+                        m.blob_request_retries_total
+                            .with_label_values(&["net"])
+                            .inc();
+                        m.blob_retry_sleep_seconds_total
+                            .inc_by(delay as f64 / 1000.0);
+                    }
                     tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                     continue;
                 }
-                Err(e) => return Err(e.into()),
+                Err(e) => {
+                    if let Some(m) = &self.metrics {
+                        m.blob_request_status_total
+                            .with_label_values(&["err"])
+                            .inc();
+                        m.blob_request_giveups_total.inc();
+                    }
+                    return Err(e.into());
+                }
             }
         }
     }

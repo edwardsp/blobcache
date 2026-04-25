@@ -74,7 +74,10 @@ fn main() -> anyhow::Result<()> {
             },
             "credential resolved"
         );
-        blobs.insert(m.name.clone(), Arc::new(BlobClient::new(cred)?));
+        blobs.insert(
+            m.name.clone(),
+            Arc::new(BlobClient::new(cred, Some(stats.clone()))?),
+        );
     }
     let blobs = Arc::new(blobs);
 

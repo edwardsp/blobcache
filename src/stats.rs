@@ -1,4 +1,7 @@
-use prometheus::{Encoder, Histogram, HistogramOpts, IntCounter, IntGauge, Registry, TextEncoder};
+use prometheus::{
+    Encoder, Histogram, HistogramOpts, IntCounter, IntCounterVec, IntGauge, Opts, Registry,
+    TextEncoder,
+};
 use std::sync::Arc;
 
 pub struct Stats {
@@ -10,6 +13,27 @@ pub struct Stats {
     pub cache_bytes: IntGauge,
     pub blob_fetches: IntCounter,
     pub blob_fetch_bytes: IntCounter,
+    // Throttling visibility: when Azure egress saturates the storage account
+    // (typically ~200 Gbps for myaccount), it returns 429/503 with a
+    // Retry-After hint. The blob client retries silently with exponential
+    // backoff. These counters surface that retry traffic so an operator can
+    // see throttling pressure without having to tcpdump.
+    //
+    // - blob_request_status_total{status="200|206|429|503|...|err"} — the
+    //   FINAL status of every blob HTTP attempt that returned (i.e., wasn't
+    //   followed by another retry). "err" is used when the underlying
+    //   reqwest::Error fired (timeout, connect, body) and we gave up.
+    // - blob_request_retries_total{status="429|500|502|503|504|net"} —
+    //   incremented every time we observed a retryable condition AND
+    //   decided to retry. Sum across labels = total retries performed.
+    // - blob_request_giveups_total — exhausted max_retries on a request.
+    // - blob_retry_sleep_seconds_total — cumulative seconds slept in
+    //   exponential-backoff between retry attempts; a high value here while
+    //   throughput is low is the smoking gun for storage-side throttling.
+    pub blob_request_status_total: IntCounterVec,
+    pub blob_request_retries_total: IntCounterVec,
+    pub blob_request_giveups_total: IntCounter,
+    pub blob_retry_sleep_seconds_total: prometheus::Counter,
     pub peer_fetches_ok: IntCounter,
     pub peer_fetches_miss: IntCounter,
     pub peer_fetches_err: IntCounter,
@@ -71,6 +95,32 @@ impl Stats {
         let blob_fetches = IntCounter::new("blobcache_blob_fetches_total", "blob fetches").unwrap();
         let blob_fetch_bytes =
             IntCounter::new("blobcache_blob_fetch_bytes_total", "blob fetched bytes").unwrap();
+        let blob_request_status_total = IntCounterVec::new(
+            Opts::new(
+                "blobcache_blob_request_status_total",
+                "final HTTP status of blob requests after retries (label: status code or \"err\")",
+            ),
+            &["status"],
+        )
+        .unwrap();
+        let blob_request_retries_total = IntCounterVec::new(
+            Opts::new(
+                "blobcache_blob_request_retries_total",
+                "blob request retries by retryable condition (label: status code or \"net\")",
+            ),
+            &["status"],
+        )
+        .unwrap();
+        let blob_request_giveups_total = IntCounter::new(
+            "blobcache_blob_request_giveups_total",
+            "blob requests that exhausted max_retries",
+        )
+        .unwrap();
+        let blob_retry_sleep_seconds_total = prometheus::Counter::new(
+            "blobcache_blob_retry_sleep_seconds_total",
+            "cumulative seconds slept in exponential backoff between blob retries",
+        )
+        .unwrap();
         let peer_fetches_ok =
             IntCounter::new("blobcache_peer_fetches_ok_total", "peer fetches ok").unwrap();
         let peer_fetches_miss =
@@ -237,6 +287,7 @@ impl Stats {
             &cache_inserts,
             &blob_fetches,
             &blob_fetch_bytes,
+            &blob_request_giveups_total,
             &peer_fetches_ok,
             &peer_fetches_miss,
             &peer_fetches_err,
@@ -269,6 +320,12 @@ impl Stats {
         ] {
             r.register(Box::new(m.clone())).unwrap();
         }
+        r.register(Box::new(blob_request_status_total.clone()))
+            .unwrap();
+        r.register(Box::new(blob_request_retries_total.clone()))
+            .unwrap();
+        r.register(Box::new(blob_retry_sleep_seconds_total.clone()))
+            .unwrap();
         for g in [&cache_bytes, &members_alive, &members_dead] {
             r.register(Box::new(g.clone())).unwrap();
         }
@@ -294,6 +351,10 @@ impl Stats {
             cache_bytes,
             blob_fetches,
             blob_fetch_bytes,
+            blob_request_status_total,
+            blob_request_retries_total,
+            blob_request_giveups_total,
+            blob_retry_sleep_seconds_total,
             peer_fetches_ok,
             peer_fetches_miss,
             peer_fetches_err,
