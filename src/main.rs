@@ -76,7 +76,7 @@ fn main() -> anyhow::Result<()> {
         );
         blobs.insert(
             m.name.clone(),
-            Arc::new(BlobClient::new(cred, Some(stats.clone()))?),
+            Arc::new(BlobClient::new(cred, &cfg.azure, Some(stats.clone()))?),
         );
     }
     let blobs = Arc::new(blobs);

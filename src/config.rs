@@ -8,6 +8,8 @@ use crate::error::{BcError, Result};
 pub struct Config {
     pub node_id: Option<String>,
     pub cache: CacheConfig,
+    #[serde(default)]
+    pub azure: AzureConfig,
     pub cluster: ClusterConfig,
     pub transport: TransportConfig,
     pub stats: StatsConfig,
@@ -24,6 +26,24 @@ pub struct CacheConfig {
 }
 fn default_chunk_size() -> u64 {
     4 * 1024 * 1024
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AzureConfig {
+    #[serde(default = "default_pool_max_idle_per_host")]
+    pub pool_max_idle_per_host: usize,
+}
+
+impl Default for AzureConfig {
+    fn default() -> Self {
+        Self {
+            pool_max_idle_per_host: default_pool_max_idle_per_host(),
+        }
+    }
+}
+
+fn default_pool_max_idle_per_host() -> usize {
+    512
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -140,6 +160,11 @@ impl Config {
         if self.cache.chunk_size == 0 || self.cache.chunk_size % 4096 != 0 {
             return Err(BcError::Config(
                 "cache.chunk_size must be multiple of 4096".into(),
+            ));
+        }
+        if self.azure.pool_max_idle_per_host == 0 {
+            return Err(BcError::Config(
+                "azure.pool_max_idle_per_host must be >= 1".into(),
             ));
         }
         if self.mounts.is_empty() {

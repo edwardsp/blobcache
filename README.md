@@ -98,6 +98,9 @@ dir = "/mnt/nvme/blobcache-cache"
 max_bytes = 107374182400      # 100 GiB
 chunk_size = 4194304          # 4 MiB; MUST match across cluster
 
+[azure]
+pool_max_idle_per_host = 512  # reqwest idle sockets per storage account host
+
 [cluster]
 bind = "0.0.0.0:7771"
 seeds = ["http://10.0.0.5:7771"]
@@ -124,6 +127,11 @@ prefix = ""
 
 `cluster.advertise` and `transport.advertise` must be reachable from other
 nodes. With `hostNetwork: true` use the node IP; otherwise use the pod IP.
+
+`cache.chunk_size` is cluster-wide and part of the cluster hash because it
+defines the on-disk chunk layout and peer/cache key boundaries. By contrast,
+`azure.pool_max_idle_per_host` is a local fetcher tuning knob: it changes the
+reqwest connection-pool size without affecting cache compatibility.
 
 A SHA-256 over `chunk_size` and the sorted mount list is exchanged with
 every gossip round; peers with mismatched hashes are rejected at merge time

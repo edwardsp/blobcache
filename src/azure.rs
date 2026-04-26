@@ -7,6 +7,7 @@ use std::sync::Arc;
 use url::Url;
 
 use crate::auth::{sas, shared_key, Credential};
+use crate::config::AzureConfig;
 use crate::error::{BcError, Result};
 use crate::stats::Stats;
 
@@ -38,9 +39,13 @@ pub struct BlobClient {
 }
 
 impl BlobClient {
-    pub fn new(credential: Credential, metrics: Option<Arc<Stats>>) -> Result<Self> {
+    pub fn new(
+        credential: Credential,
+        config: &AzureConfig,
+        metrics: Option<Arc<Stats>>,
+    ) -> Result<Self> {
         let http = Client::builder()
-            .pool_max_idle_per_host(512)
+            .pool_max_idle_per_host(config.pool_max_idle_per_host)
             .http1_only()
             .build()?;
         Ok(Self {

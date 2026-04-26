@@ -1,0 +1,125 @@
+
+=== N=1 ===
+Hydrate: 350 files, 384.5 GiB, 98804 chunks
+  elapsed: 486.32 s   aggregate: 0.79 GiB/s
+  per-peer errors: 32
+  wall (incl. RPC): 487.248 s
+
+Parallel read (per pod wall, file bytes):
+  blobcached-pw9zf           279.21s   384.94 GiB   1.38 GiB/s
+  -> wall p50=279.21s  max=279.21s  total bytes read across cluster: 384.9 GiB
+
+Throttling (delta pre -> post_hydrate, summed across pods):
+  blobcache_blob_request_retries_total{status="net"}                               +485762.0
+  blobcache_blob_request_status_total{status="200"}                                +1.0
+  blobcache_blob_request_status_total{status="206"}                                +98804.0
+  blobcache_blob_retry_sleep_seconds_total                                         +4108963.3
+
+Fetch counts (delta pre -> post_read, summed):
+  blob_fetches:         98805
+  peer_fetches_ok:          0
+  peer_fetches_err:          0
+
+=== N=2 ===
+Hydrate: 350 files, 192.4 GiB, 98804 chunks
+  elapsed: 168.42 s   aggregate: 1.14 GiB/s
+  per-peer errors: 27
+  wall (incl. RPC): 169.309 s
+
+Parallel read (per pod wall, file bytes):
+  blobcached-2lsbr           231.13s   384.94 GiB   1.67 GiB/s
+  blobcached-pw9zf           242.44s   384.94 GiB   1.59 GiB/s
+  -> wall p50=242.44s  max=242.44s  total bytes read across cluster: 769.9 GiB
+
+Throttling (delta pre -> post_hydrate, summed across pods):
+  blobcache_blob_request_retries_total{status="503"}                               +8757.0
+  blobcache_blob_request_status_total{status="200"}                                +1.0
+  blobcache_blob_request_status_total{status="206"}                                +98804.0
+  blobcache_blob_retry_sleep_seconds_total                                         +4416.2
+
+Fetch counts (delta pre -> post_read, summed):
+  blob_fetches:         98804
+  peer_fetches_ok:      98722
+  peer_fetches_err:          0
+
+=== N=4 ===
+Hydrate: 350 files, 385.0 GiB, 98804 chunks
+  elapsed: 86.08 s   aggregate: 4.47 GiB/s
+  per-peer errors: 0
+  wall (incl. RPC): 86.995 s
+
+Parallel read (per pod wall, file bytes):
+  blobcached-2lsbr           245.28s   384.94 GiB   1.57 GiB/s
+  blobcached-pw9zf           223.43s   384.94 GiB   1.72 GiB/s
+  blobcached-rnnps           232.76s   384.94 GiB   1.65 GiB/s
+  blobcached-xm9nr           228.86s   384.94 GiB   1.68 GiB/s
+  -> wall p50=232.76s  max=245.28s  total bytes read across cluster: 1539.8 GiB
+
+Throttling (delta pre -> post_hydrate, summed across pods):
+  blobcache_blob_request_status_total{status="200"}                                +1.0
+  blobcache_blob_request_status_total{status="206"}                                +98804.0
+
+Fetch counts (delta pre -> post_read, summed):
+  blob_fetches:         98804
+  peer_fetches_ok:     296012
+  peer_fetches_err:          0
+
+=== N=8 ===
+Hydrate: 350 files, 385.0 GiB, 98804 chunks
+  elapsed: 47.52 s   aggregate: 8.10 GiB/s
+  per-peer errors: 0
+  wall (incl. RPC): 48.405 s
+
+Parallel read (per pod wall, file bytes):
+  blobcached-2lsbr           217.57s   384.94 GiB   1.77 GiB/s
+  blobcached-g575p           242.54s   384.94 GiB   1.59 GiB/s
+  blobcached-pw9zf           198.94s   384.94 GiB   1.93 GiB/s
+  blobcached-rnnps           238.27s   384.94 GiB   1.62 GiB/s
+  blobcached-rp7qg           207.49s   384.94 GiB   1.86 GiB/s
+  blobcached-xhj4d           232.30s   384.94 GiB   1.66 GiB/s
+  blobcached-xm9nr           235.38s   384.94 GiB   1.64 GiB/s
+  blobcached-zh488           196.65s   384.94 GiB   1.96 GiB/s
+  -> wall p50=232.30s  max=242.54s  total bytes read across cluster: 3079.5 GiB
+
+Throttling (delta pre -> post_hydrate, summed across pods):
+  blobcache_blob_request_status_total{status="200"}                                +1.0
+  blobcache_blob_request_status_total{status="206"}                                +98804.0
+
+Fetch counts (delta pre -> post_read, summed):
+  blob_fetches:         98804
+  peer_fetches_ok:     690511
+  peer_fetches_err:          0
+
+=== N=16 ===
+Hydrate: 350 files, 385.0 GiB, 98804 chunks
+  elapsed: 30.18 s   aggregate: 12.75 GiB/s
+  per-peer errors: 0
+  wall (incl. RPC): 31.080 s
+
+Parallel read (per pod wall, file bytes):
+  blobcached-2lsbr           236.87s   384.94 GiB   1.63 GiB/s
+  blobcached-4md5k           234.91s   384.94 GiB   1.64 GiB/s
+  blobcached-7brf2           214.88s   384.94 GiB   1.79 GiB/s
+  blobcached-bvzl7           234.03s   384.94 GiB   1.64 GiB/s
+  blobcached-fb672           232.04s   384.94 GiB   1.66 GiB/s
+  blobcached-g575p           219.04s   384.94 GiB   1.76 GiB/s
+  blobcached-mknqk           254.42s   384.94 GiB   1.51 GiB/s
+  blobcached-pw9zf           208.97s   384.94 GiB   1.84 GiB/s
+  blobcached-qn5zh           252.06s   384.94 GiB   1.53 GiB/s
+  blobcached-rnnps           193.16s   384.94 GiB   1.99 GiB/s
+  blobcached-rp7qg           164.38s   384.94 GiB   2.34 GiB/s
+  blobcached-sbpf9           191.50s   384.94 GiB   2.01 GiB/s
+  blobcached-xfzqv           236.70s   384.94 GiB   1.63 GiB/s
+  blobcached-xhj4d           241.07s   384.94 GiB   1.60 GiB/s
+  blobcached-xm9nr           228.15s   384.94 GiB   1.69 GiB/s
+  blobcached-zh488           181.28s   384.94 GiB   2.12 GiB/s
+  -> wall p50=232.04s  max=254.42s  total bytes read across cluster: 6159.1 GiB
+
+Throttling (delta pre -> post_hydrate, summed across pods):
+  blobcache_blob_request_status_total{status="200"}                                +1.0
+  blobcache_blob_request_status_total{status="206"}                                +98804.0
+
+Fetch counts (delta pre -> post_read, summed):
+  blob_fetches:         98805
+  peer_fetches_ok:    1479441
+  peer_fetches_err:          0

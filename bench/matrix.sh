@@ -18,6 +18,10 @@ set -euo pipefail
 
 NS="blobcache"
 RESULTS_DIR="$(cd "$(dirname "$0")" && pwd)/results"
+BLOBCACHED_BIN="${BLOBCACHED_BIN:-/tmp/blobcached.aarch64}"
+CACHE_MAX_BYTES="${CACHE_MAX_BYTES:-483183820800}"
+CACHE_CHUNK_SIZE="${CACHE_CHUNK_SIZE:-4194304}"
+AZURE_POOL_MAX_IDLE_PER_HOST="${AZURE_POOL_MAX_IDLE_PER_HOST:-512}"
 # Cluster bootstrap invariant: the 3 hardcoded seed IPs (10.0.0.5/6/7)
 # live on these specific nodes. They MUST remain labeled at every N>=1
 # or no pod can join gossip. Order matches the seed list in pod configs.
@@ -80,6 +84,64 @@ scale_to() {
 current_pods() {
   kubectl -n "$NS" get pods -l app=blobcached --field-selector=status.phase=Running \
     -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.podIP}{"\n"}{end}'
+}
+
+render_pod_config() {
+  local pod=$1 ip=$2 out=$3
+  cat > "$out" <<EOF
+node_id = "node-${pod#blobcached-}"
+
+[cache]
+dir = "/mnt/nvme/blobcache-cache"
+max_bytes = $CACHE_MAX_BYTES
+chunk_size = $CACHE_CHUNK_SIZE
+
+[azure]
+pool_max_idle_per_host = $AZURE_POOL_MAX_IDLE_PER_HOST
+
+[cluster]
+bind = "0.0.0.0:7771"
+seeds = ["http://10.0.0.5:7771","http://10.0.0.6:7771","http://10.0.0.7:7771"]
+advertise = "http://$ip:7771"
+
+[transport]
+kind = "rdma"
+bind = "0.0.0.0:7772"
+advertise = ["http://$ip:7772"]
+chunk_concurrency = 32
+peer_concurrency = 8
+bloom_bits = 8388608
+bloom_rebuild_secs = 30
+bloom_pull_secs = 5
+peer_max_candidates = 4
+
+[stats]
+bind = "0.0.0.0:7773"
+
+[[mounts]]
+name = "deepseek"
+mountpoint = "/mnt/blobcache/deepseek"
+account = "myaccount"
+container = "models"
+prefix = "models/test-prefix/"
+EOF
+}
+
+ensure_blobcached() {
+  [[ -x "$BLOBCACHED_BIN" ]] || { log "missing blobcached binary at $BLOBCACHED_BIN"; return 1; }
+  log "pushing blobcached binary + config to current pods"
+  local tmpdir
+  tmpdir=$(mktemp -d)
+  while IFS=$'\t' read -r pod ip; do
+    [[ -z "$pod" || -z "$ip" ]] && continue
+    render_pod_config "$pod" "$ip" "$tmpdir/${pod}.toml"
+    kubectl -n "$NS" cp "$BLOBCACHED_BIN" "$pod:/opt/blobcache/blobcached.new" >/dev/null
+    kubectl -n "$NS" cp "$tmpdir/${pod}.toml" "$pod:/opt/blobcache/blobcached.toml.new" >/dev/null
+    kubectl -n "$NS" exec "$pod" -- bash -c \
+      'mv -f /opt/blobcache/blobcached.new /opt/blobcache/blobcached && chmod +x /opt/blobcache/blobcached && mv -f /opt/blobcache/blobcached.toml.new /opt/blobcache/blobcached.toml' \
+      >/dev/null
+  done < <(current_pods)
+  rm -rf "$tmpdir"
 }
 
 wipe_and_restart() {
@@ -168,13 +230,19 @@ run_parallel_read() {
 }
 
 main() {
-  local Ns=("${@:-16 8 4 2 1}")
+  local Ns
+  if [[ $# -gt 0 ]]; then
+    Ns=("$@")
+  else
+    Ns=(16 8 4 2 1)
+  fi
   for N in "${Ns[@]}"; do
     local out="$RESULTS_DIR/N${N}"
     rm -rf "$out"; mkdir -p "$out"
     log "================ N=$N START ================"
 
     scale_to "$N"
+    ensure_blobcached || { log "skip N=$N (failed to stage blobcached)"; continue; }
     wipe_and_restart
     wait_cluster_ready "$N" || { log "skip N=$N (no convergence)"; continue; }
 
