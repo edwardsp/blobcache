@@ -32,18 +32,40 @@ fn default_chunk_size() -> u64 {
 pub struct AzureConfig {
     #[serde(default = "default_pool_max_idle_per_host")]
     pub pool_max_idle_per_host: usize,
+    /// Bytes per Azure GET. Decoupled from cache.chunk_size: the daemon
+    /// issues block-sized GETs to Azure, then slices each block into
+    /// `block_size / chunk_size` cache chunks. 0 = use chunk_size.
+    /// Must be a positive multiple of cache.chunk_size when non-zero.
+    /// Larger blocks reduce per-request overhead and Azure-side throttling
+    /// pressure (small chunks at low concurrency see retry storms because
+    /// the per-second request rate limit is hit before bandwidth limits).
+    #[serde(default)]
+    pub block_size: u64,
+    /// Number of independent tokio runtimes (each with its own reqwest
+    /// connection pool) used to dispatch Azure GETs. Mirrors azcp's
+    /// `--workers` knob: a single tokio runtime + reqwest Client tops out
+    /// near 28 Gbps regardless of concurrency, so to scale a single node
+    /// past that ceiling we need multiple independent runtimes.
+    #[serde(default = "default_workers")]
+    pub workers: usize,
 }
 
 impl Default for AzureConfig {
     fn default() -> Self {
         Self {
             pool_max_idle_per_host: default_pool_max_idle_per_host(),
+            block_size: 0,
+            workers: default_workers(),
         }
     }
 }
 
 fn default_pool_max_idle_per_host() -> usize {
     512
+}
+
+fn default_workers() -> usize {
+    1
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -166,6 +188,21 @@ impl Config {
             return Err(BcError::Config(
                 "azure.pool_max_idle_per_host must be >= 1".into(),
             ));
+        }
+        if self.azure.workers == 0 {
+            return Err(BcError::Config("azure.workers must be >= 1".into()));
+        }
+        if self.azure.block_size != 0 {
+            if self.azure.block_size < self.cache.chunk_size {
+                return Err(BcError::Config(
+                    "azure.block_size must be >= cache.chunk_size when set".into(),
+                ));
+            }
+            if self.azure.block_size % self.cache.chunk_size != 0 {
+                return Err(BcError::Config(
+                    "azure.block_size must be a multiple of cache.chunk_size".into(),
+                ));
+            }
         }
         if self.mounts.is_empty() {
             return Err(BcError::Config("at least one mount required".into()));

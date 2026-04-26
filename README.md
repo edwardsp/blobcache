@@ -100,6 +100,8 @@ chunk_size = 4194304          # 4 MiB; MUST match across cluster
 
 [azure]
 pool_max_idle_per_host = 512  # reqwest idle sockets per storage account host
+workers = 1                   # independent tokio runtimes for blob fetch (v2.9; 4-8 lifts the per-runtime ~28 Gbps ceiling)
+block_size = 0                # azure GET size; 0 = use cache.chunk_size (v2.9; reserved for future block aggregation)
 
 [cluster]
 bind = "0.0.0.0:7771"
@@ -130,8 +132,12 @@ nodes. With `hostNetwork: true` use the node IP; otherwise use the pod IP.
 
 `cache.chunk_size` is cluster-wide and part of the cluster hash because it
 defines the on-disk chunk layout and peer/cache key boundaries. By contrast,
-`azure.pool_max_idle_per_host` is a local fetcher tuning knob: it changes the
-reqwest connection-pool size without affecting cache compatibility.
+`azure.pool_max_idle_per_host`, `azure.workers`, and `azure.block_size` are
+local fetcher tuning knobs that do not enter the cluster hash. `azure.workers`
+spawns N independent tokio runtimes, each with its own `BlobClient` pool, and
+the fetcher hot path round-robins ranged GETs across them; this breaks the
+~28 Gbps per-process ceiling that single-runtime reqwest hits on this
+hardware (see [BENCHMARKS.md § v2.9](BENCHMARKS.md#v29--azureworkers-multi-runtime-fetcher-pool)).
 
 A SHA-256 over `chunk_size` and the sorted mount list is exchanged with
 every gossip round; peers with mismatched hashes are rejected at merge time

@@ -1,0 +1,19 @@
+[19:18:41] === 16M-conc8 : chunk=16777216 conc=8 ===
+[19:20:06] pushed; wiping + restarting
+[19:20:53] cluster ready (16 alive)
+[19:20:56] HYDRATE coord=blobcached-75mcn
+[19:21:34] hydrate wall = 38.663 s
+[19:21:37] === 16M-conc8 DONE ===
+[19:21:37] === 16M-conc16 : chunk=16777216 conc=16 ===
+[19:23:12] pushed; wiping + restarting
+[19:24:19] cluster ready (16 alive)
+[19:24:22] HYDRATE coord=blobcached-75mcn
+[19:24:52] hydrate wall = 30.677 s
+[19:24:55] === 16M-conc16 DONE ===
+[19:24:55] === 4M-conc64 : chunk=4194304 conc=64 ===
+[19:26:18] pushed; wiping + restarting
+[19:27:45] cluster ready (16 alive)
+[19:27:48] HYDRATE coord=blobcached-75mcn
+[19:28:35] hydrate wall = 47.507 s
+[19:28:38] === 4M-conc64 DONE ===
+[19:28:38] ALL DONE

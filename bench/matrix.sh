@@ -22,6 +22,7 @@ BLOBCACHED_BIN="${BLOBCACHED_BIN:-/tmp/blobcached.aarch64}"
 CACHE_MAX_BYTES="${CACHE_MAX_BYTES:-483183820800}"
 CACHE_CHUNK_SIZE="${CACHE_CHUNK_SIZE:-4194304}"
 AZURE_POOL_MAX_IDLE_PER_HOST="${AZURE_POOL_MAX_IDLE_PER_HOST:-512}"
+CHUNK_CONCURRENCY="${CHUNK_CONCURRENCY:-32}"
 # Cluster bootstrap invariant: the 3 hardcoded seed IPs (10.0.0.5/6/7)
 # live on these specific nodes. They MUST remain labeled at every N>=1
 # or no pod can join gossip. Order matches the seed list in pod configs.
@@ -108,7 +109,7 @@ advertise = "http://$ip:7771"
 kind = "rdma"
 bind = "0.0.0.0:7772"
 advertise = ["http://$ip:7772"]
-chunk_concurrency = 32
+chunk_concurrency = $CHUNK_CONCURRENCY
 peer_concurrency = 8
 bloom_bits = 8388608
 bloom_rebuild_secs = 30

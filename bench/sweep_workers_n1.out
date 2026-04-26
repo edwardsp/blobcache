@@ -1,0 +1,32 @@
+[22:34:40] pod count = 1 / 1
+[22:35:00] === w1 : workers=1 ===
+[22:35:15] pushed; wiping + restarting
+[22:35:33] pod ready (stats port serving)
+[22:35:35] HYDRATE coord=blobcached-s6hf4
+[22:37:32] hydrate wall = 117.696 s
+[22:37:34] === w1 DONE ===
+[22:37:34] === w2 : workers=2 ===
+[22:37:45] pushed; wiping + restarting
+[22:38:39] pod ready (stats port serving)
+[22:38:41] HYDRATE coord=blobcached-s6hf4
+[22:40:00] hydrate wall = 79.794 s
+[22:40:02] === w2 DONE ===
+[22:40:02] === w4 : workers=4 ===
+[22:40:13] pushed; wiping + restarting
+[22:41:32] pod ready (stats port serving)
+[22:41:34] HYDRATE coord=blobcached-s6hf4
+[22:42:43] hydrate wall = 69.446 s
+[22:42:45] === w4 DONE ===
+[22:42:45] === w8 : workers=8 ===
+[22:42:56] pushed; wiping + restarting
+[22:44:32] pod ready (stats port serving)
+[22:44:34] HYDRATE coord=blobcached-s6hf4
+[22:45:37] hydrate wall = 63.477 s
+[22:45:39] === w8 DONE ===
+[22:45:39] === w16 : workers=16 ===
+[22:45:49] pushed; wiping + restarting
+[22:47:48] pod ready (stats port serving)
+[22:47:50] HYDRATE coord=blobcached-s6hf4
+[22:48:56] hydrate wall = 65.638 s
+[22:48:58] === w16 DONE ===
+[22:48:58] ALL DONE

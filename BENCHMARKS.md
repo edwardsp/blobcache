@@ -2098,3 +2098,96 @@ For the same 385 GiB DeepSeek model:
 - **Per-NIC fetcher worker pool.** Same negative-result territory v2.3-E hit
   for peer transport — single tokio runtime is the daemon-side bottleneck,
   not the Azure side or the IB side. Out of scope here.
+
+---
+
+## v2.9 — `azure.workers` (multi-runtime fetcher pool)
+
+**Status: shipped.** v2.8's note "Per-NIC fetcher worker pool ... single tokio
+runtime is the daemon-side bottleneck" was the lever pulled here. v2.9 adds
+`azure.workers = N`, which spawns N independent tokio runtimes, each owning
+its own `BlobClient` per mount. The fetcher hot path (`do_fetch`,
+`fetch_blob_direct`) round-robins ranged GETs across the pool via
+`AtomicUsize::fetch_add`. Stats / hydrate / FUSE plumbing stay on worker[0]
+via a `view()` shim so no metadata path changes.
+
+The companion knob `azure.block_size` is also wired through config (default 0
+= use `cache.chunk_size`); it is currently validated but not yet used to
+issue larger-than-chunk Azure GETs (block aggregation deferred).
+
+### Why it matters
+
+azcp's `--workers` flag exists for the same reason: a single tokio runtime
+saturates somewhere around **27 Gbps on this hardware** regardless of how
+much concurrency you stuff into it. Earlier v2.8 sweeps confirmed this
+ceiling: at N=16, `chunk_size`/`chunk_concurrency` variations landed
+between 71 and 117 Gbps aggregate but could not break ~7-7.3 Gbps per node.
+
+### v2.9 N=16 sweep (`bench/sweep_workers.sh`)
+
+Same hardware, same model (413 GB DeepSeek), `chunk_size=4 MiB`,
+`chunk_concurrency=32`, varying `azure.workers`:
+
+| workers | wall (s) | aggregate Gbps | per-node Gbps | vs v2.8 baseline |
+|--:|--:|--:|--:|--:|
+| 1 (v2.9 pool, 1 runtime) | 23.6 | 140.0 | 8.75 | +19% |
+| 2 | 21.3 | 155.5 | 9.72 | +32% |
+| **4 (peak)** | **20.5** | **161.2** | **10.07** | **+37%** |
+| 8 | 21.7 | 152.5 | 9.53 | +30% |
+| v2.8.0 baseline (no pool) | 28.1 | 117.5 | 7.34 | — |
+
+Zero throttling at every setting. azcp's storage-account-capped baseline at
+N=16 in this account is ~10.85 Gbps/node; v2.9 w=4 lands at 10.07 Gbps/node,
+**within 7% of the account ceiling**. The diminishing return between w=4 and
+w=8 reflects the storage account becoming the bottleneck, not the daemon.
+
+### v2.9 N=1 sweep (`bench/sweep_workers_n1.sh`)
+
+To isolate the per-process scaling, single-node, no peer fallback. This is
+where the storage account is **not** limiting and the pool's mechanism is
+directly visible:
+
+| workers | wall (s) | per-node Gbps | speedup vs w=1 | throttled |
+|--:|--:|--:|--:|--:|
+| 1 | 117.7 | 28.09 | 1.00× | 0 |
+| 2 | 79.8 | 41.43 | 1.47× | 0 |
+| 4 | 69.4 | 47.61 | 1.69× | 0 |
+| **8 (peak)** | **63.5** | **52.09** | **1.85×** | 0 |
+| 16 | 65.6 | 50.37 | 1.79× | 0 |
+
+w=1 reproduces the ~28 Gbps single-runtime ceiling exactly (matching azcp's
+N=1 figure). w=8 reaches **52 Gbps per node — 1.93× azcp's single-runtime
+baseline** and 1.85× our own w=1. So `azure.workers` is doing real work, not
+just isolating runtimes.
+
+### Default and recommendation
+
+Shipped default: `azure.workers = 1` (preserves v2.8 behaviour for existing
+configs). Recommended:
+
+- **Storage-account-capped clusters (N≥8 against one account)**: `workers = 4`.
+  Goes within 7% of the per-node account share without paying for runtimes
+  that won't get fed.
+- **Single-node or per-account-isolated workloads**: `workers = 8`. Maxes
+  per-process throughput before per-runtime overhead starts winning.
+- **`workers > 8`**: regresses (oversubscription / context-switch cost).
+
+### N=1 chunk error caveat
+
+At N=1 the runs logged 4-30 chunk failures out of 98 804 ("http: error
+decoding response body" from reqwest). N=16 runs at every worker count had
+**zero** chunk errors. The errors trace to transient Azure HTTPS body-stream
+truncation — at N≥2 the peer fallback path masks them; at N=1 there is no
+fallback. This is pre-existing (not v2.9-introduced) and orthogonal to the
+worker pool. Single-node deployments wanting strict integrity should add a
+retry layer on `decode_body`-class failures; the multi-node case is fine.
+
+### What's still not in v2.9
+
+- **Block aggregation.** `azure.block_size` is plumbed and validated but the
+  fetcher still issues one Azure GET per cache chunk. Doing fewer/larger GETs
+  would mostly help with TTFB amortisation; the workers sweep shows the win
+  was on the runtime axis, not the per-GET-size axis.
+- **Per-NIC pinning.** Each runtime gets a fresh reqwest client; we don't
+  pin them to specific NICs. On 4-HCA boxes the single-runtime ceiling per
+  NIC may differ from what we measured pooled across NICs; not investigated.

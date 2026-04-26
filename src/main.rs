@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 mod auth;
 mod azure;
+mod blob_fetcher_pool;
 mod cache;
 mod cluster;
 mod config;
@@ -21,8 +22,7 @@ mod transport;
 #[cfg(feature = "ucx")]
 mod transport_ucx;
 
-use crate::auth::Credential;
-use crate::azure::BlobClient;
+use crate::blob_fetcher_pool::BlobFetcherPool;
 use crate::cache::DiskCache;
 use crate::cluster::{Membership, NodeInfo, NodeState};
 use crate::config::{Config, MountConfig};
@@ -55,31 +55,14 @@ fn main() -> anyhow::Result<()> {
     let stats = Stats::new();
     let cache = DiskCache::open(cfg.cache.dir.clone(), cfg.cache.max_bytes)?;
 
-    // C4: resolve credentials per mount. Each mount may target a different
-    // account/container with its own auth (SAS for one, MSI bearer for
-    // another); a shared client would attach the wrong Authorization header.
-    let mut blobs: std::collections::HashMap<String, Arc<BlobClient>> =
-        std::collections::HashMap::new();
-    for m in &cfg.mounts {
-        let cred = Credential::resolve(&m.account, m.sas_token.as_deref())
-            .with_context(|| format!("resolve credentials for mount {}", m.name))?;
-        tracing::info!(
-            mount = %m.name,
-            account = %m.account,
-            credential = %match &cred {
-                Credential::SharedKey { .. } => "SharedKey",
-                Credential::Sas { .. } => "SAS",
-                Credential::Bearer(_) => "Bearer (managed identity)",
-                Credential::Anonymous => "Anonymous",
-            },
-            "credential resolved"
-        );
-        blobs.insert(
-            m.name.clone(),
-            Arc::new(BlobClient::new(cred, &cfg.azure, Some(stats.clone()))?),
-        );
-    }
-    let blobs = Arc::new(blobs);
+    let pool = BlobFetcherPool::new(&cfg.mounts, &cfg.azure, stats.clone(), cfg.azure.workers)
+        .context("build blob fetcher pool")?;
+    tracing::info!(
+        workers = pool.worker_count(),
+        block_size = cfg.azure.block_size,
+        "blob fetcher pool ready"
+    );
+    let blobs = pool.view();
 
     let cluster_hash = cfg.cluster_hash();
     let cluster_hash_hex = hex32(&cluster_hash);
@@ -248,11 +231,12 @@ fn main() -> anyhow::Result<()> {
 
     let fetcher = Arc::new(Fetcher::new(
         cache.clone(),
-        blobs.clone(),
+        pool.clone(),
         peers.clone(),
         membership.clone(),
         stats.clone(),
         cfg.cache.chunk_size,
+        cfg.azure.block_size,
         cfg.transport.chunk_concurrency,
         cfg.transport.prefetch_depth,
         cfg.transport.prefetch_threshold,

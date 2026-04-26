@@ -7,6 +7,8 @@ chunk_size = 4194304          # 4 MiB
 
 [azure]
 pool_max_idle_per_host = 512
+workers = 1                   # v2.9: independent tokio runtimes for blob fetch; try 4-8 for higher per-node hydrate throughput
+block_size = 0                # v2.9: azure GET size in bytes; 0 = use cache.chunk_size
 
 [cluster]
 bind = "0.0.0.0:7771"

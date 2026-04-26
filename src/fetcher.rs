@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{broadcast, Semaphore};
 
-use crate::azure::BlobClient;
+use crate::blob_fetcher_pool::BlobFetcherPool;
 use crate::cache::{ChunkKey, DiskCache};
 use crate::cluster::Membership;
 use crate::config::MountConfig;
@@ -26,11 +26,12 @@ type InflightTx = broadcast::Sender<std::result::Result<Bytes, String>>;
 
 pub struct Fetcher {
     pub cache: Arc<DiskCache>,
-    pub blobs: Arc<HashMap<String, Arc<BlobClient>>>,
+    pub pool: Arc<BlobFetcherPool>,
     pub peers: Arc<PeerClient>,
     pub membership: Membership,
     pub stats: Arc<Stats>,
     pub chunk_size: u64,
+    pub block_size: u64,
     pub peer_index: Arc<PeerIndex>,
     pub peer_max_candidates: usize,
     pub peer_max_yes_attempts: usize,
@@ -87,11 +88,12 @@ impl Drop for LeaderGuard {
 impl Fetcher {
     pub fn new(
         cache: Arc<DiskCache>,
-        blobs: Arc<HashMap<String, Arc<BlobClient>>>,
+        pool: Arc<BlobFetcherPool>,
         peers: Arc<PeerClient>,
         membership: Membership,
         stats: Arc<Stats>,
         chunk_size: u64,
+        configured_block_size: u64,
         chunk_concurrency: usize,
         prefetch_depth: u32,
         prefetch_threshold: u32,
@@ -105,13 +107,19 @@ impl Fetcher {
     ) -> Self {
         let permits = chunk_concurrency.max(1);
         let pf_permits = prefetch_concurrency.max(1);
+        let block_size = if configured_block_size == 0 {
+            chunk_size
+        } else {
+            configured_block_size
+        };
         Self {
             cache,
-            blobs,
+            pool,
             peers,
             membership,
             stats,
             chunk_size,
+            block_size,
             peer_index,
             peer_max_candidates: peer_max_candidates.max(1),
             peer_max_yes_attempts: peer_max_yes_attempts.max(1),
@@ -126,12 +134,6 @@ impl Fetcher {
             prefetch_depth,
             prefetch_threshold: prefetch_threshold.max(1),
         }
-    }
-
-    fn blob_for(&self, mount_name: &str) -> Result<&Arc<BlobClient>> {
-        self.blobs
-            .get(mount_name)
-            .ok_or_else(|| BcError::Other(format!("no blob client for mount {mount_name}")))
     }
 
     pub async fn fetch_chunk(
@@ -423,9 +425,10 @@ impl Fetcher {
         } else {
             format!("{}/{}", mount.prefix.trim_end_matches('/'), blob_path)
         };
-        let blob_client = self.blob_for(&mount.name)?;
-        let data = blob_client
+        let data = self
+            .pool
             .get_blob_range(
+                &mount.name,
                 &mount.account,
                 &mount.container,
                 &real_path,
@@ -615,9 +618,10 @@ impl Fetcher {
         } else {
             format!("{}/{}", mount.prefix.trim_end_matches('/'), blob_path)
         };
-        let blob_client = self.blob_for(&mount.name)?;
-        let data = blob_client
+        let data = self
+            .pool
             .get_blob_range(
+                &mount.name,
                 &mount.account,
                 &mount.container,
                 &real_path,
@@ -747,11 +751,12 @@ impl Fetcher {
     fn clone_handles(&self) -> Self {
         Self {
             cache: self.cache.clone(),
-            blobs: self.blobs.clone(),
+            pool: self.pool.clone(),
             peers: self.peers.clone(),
             membership: self.membership.clone(),
             stats: self.stats.clone(),
             chunk_size: self.chunk_size,
+            block_size: self.block_size,
             peer_index: self.peer_index.clone(),
             peer_max_candidates: self.peer_max_candidates,
             peer_max_yes_attempts: self.peer_max_yes_attempts,
