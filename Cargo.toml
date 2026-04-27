@@ -68,3 +68,6 @@ ucx = ["dep:ucx1-sys"]
 debug = 1
 lto = "thin"
 codegen-units = 1
+
+[patch.crates-io]
+ucx1-sys = { git = "https://github.com/edwardsp/async-ucx", branch = "system-link" }
