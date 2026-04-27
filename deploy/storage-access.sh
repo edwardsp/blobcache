@@ -11,7 +11,7 @@ REPO_ROOT="$(cd "$HERE/.." && pwd)"
 [[ -f "$REPO_ROOT/.env" ]] && set -a && . "$REPO_ROOT/.env" && set +a
 
 ACCOUNT="${STORAGE_ACCOUNT:?set STORAGE_ACCOUNT (in .env or env) to your storage account name}"
-RG="${RESOURCE_GROUP:?set RESOURCE_GROUP (in .env or env) to the storage account's resource group}"
+RG="${RESOURCE_GROUP:?set RESOURCE_GROUP (in .env or env) to the storage account resource group}"
 
 case "${1:-}" in
   on)
