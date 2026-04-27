@@ -6,3 +6,18 @@ Cargo.lock.tmp
 *.swp
 .envrc.local
 *.log
+
+# Local environment overrides — never committed.
+# See .env.template for the canonical list of variables.
+.env
+.env.local
+
+# Benchmark harness artifacts (per-run pod configs, prom snapshots).
+# Kept locally for provenance; not part of the redistributable repo.
+bench/results
+bench/results-*
+bench/sweep
+bench/sweep-*
+bench/sweep_*.out
+bench/sweep_workers*.out
+bench/deploy-configs

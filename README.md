@@ -218,7 +218,7 @@ kubectl -n blobcache cp blobcached.toml    <pod>:/opt/blobcache/blobcached.toml
 
 ## Storage account public-access toggle
 
-`myaccount` uses `defaultAction: Deny` with the AKS subnet allowed.
+The example storage account uses `defaultAction: Deny` with the AKS subnet allowed.
 The `deploy/storage-access.sh` helper toggles only `publicNetworkAccess`:
 
 ```sh
@@ -276,7 +276,7 @@ src/
   stats.rs          # Prometheus + JSON HTTP server
 deploy/
   blobcached.yaml   # NVMe RAID DS + blobcached DS
-  storage-access.sh # ARM toggle for myaccount public access
+  storage-access.sh # ARM toggle for the storage account's public access
 examples/
   blobcached.toml   # sample config
 ```

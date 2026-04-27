@@ -16,31 +16,43 @@
 # Designed to be re-runnable. Caches are fully wiped between Ns.
 set -euo pipefail
 
-NS="blobcache"
-RESULTS_DIR="$(cd "$(dirname "$0")" && pwd)/results"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$HERE/.." && pwd)"
+[[ -f "$REPO_ROOT/.env" ]] && set -a && . "$REPO_ROOT/.env" && set +a
+
+: "${STORAGE_ACCOUNT:?set STORAGE_ACCOUNT in .env}"
+: "${CONTAINER:?set CONTAINER in .env}"
+: "${MODEL_PREFIX:?set MODEL_PREFIX in .env}"
+: "${AGENT_POOL:?set AGENT_POOL in .env}"
+: "${GOSSIP_SEEDS:?set GOSSIP_SEEDS (comma-separated http://IP:7771 list) in .env}"
+
+NS="${NAMESPACE:-blobcache}"
+TEST_LABEL_KEY="${TEST_NODE_LABEL_KEY:-blobcache.test/enabled}"
+TEST_LABEL_VALUE="${TEST_NODE_LABEL_VALUE:-true}"
+RESULTS_DIR="$HERE/results"
 BLOBCACHED_BIN="${BLOBCACHED_BIN:-/tmp/blobcached.aarch64}"
 CACHE_MAX_BYTES="${CACHE_MAX_BYTES:-483183820800}"
 CACHE_CHUNK_SIZE="${CACHE_CHUNK_SIZE:-4194304}"
 AZURE_POOL_MAX_IDLE_PER_HOST="${AZURE_POOL_MAX_IDLE_PER_HOST:-512}"
 CHUNK_CONCURRENCY="${CHUNK_CONCURRENCY:-32}"
-# Cluster bootstrap invariant: the 3 hardcoded seed IPs (10.0.0.5/6/7)
-# live on these specific nodes. They MUST remain labeled at every N>=1
-# or no pod can join gossip. Order matches the seed list in pod configs.
-SEEDS_LABEL_KEEP=(
-  "aks-cluster-00000000-vmss00001h"
-  "aks-cluster-00000000-vmss000010"
-  "aks-cluster-00000000-vmss00001g"
-)
-ALL_NODES=(
-  aks-cluster-00000000-vmss000010 aks-cluster-00000000-vmss000011
-  aks-cluster-00000000-vmss000012 aks-cluster-00000000-vmss000013
-  aks-cluster-00000000-vmss000014 aks-cluster-00000000-vmss000015
-  aks-cluster-00000000-vmss000016 aks-cluster-00000000-vmss000018
-  aks-cluster-00000000-vmss000019 aks-cluster-00000000-vmss00001b
-  aks-cluster-00000000-vmss00001c aks-cluster-00000000-vmss00001d
-  aks-cluster-00000000-vmss00001e aks-cluster-00000000-vmss00001f
-  aks-cluster-00000000-vmss00001g aks-cluster-00000000-vmss00001h
-)
+
+seeds_toml() { python3 -c 'import os,sys;print(",".join("\""+s.strip()+"\"" for s in os.environ["GOSSIP_SEEDS"].split(",") if s.strip()))'; }
+SEEDS_TOML="$(seeds_toml)"
+
+# All nodes in the target agent pool, sorted for determinism.
+mapfile -t ALL_NODES < <(kubectl get nodes \
+  -l "kubernetes.azure.com/agentpool=$AGENT_POOL" \
+  -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | sort)
+
+# Cluster bootstrap invariant: GOSSIP_SEEDS hardcodes a few seed IPs that
+# live on specific nodes. Those nodes MUST stay labeled at every N>=1 or
+# no pod can join gossip. Set SEED_NODES (comma-separated) to pin a stable
+# subset; otherwise default to the first 3 of ALL_NODES.
+if [[ -n "${SEED_NODES:-}" ]]; then
+  IFS=',' read -ra SEEDS_LABEL_KEEP <<< "$SEED_NODES"
+else
+  SEEDS_LABEL_KEEP=("${ALL_NODES[@]:0:3}")
+fi
 
 log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
 
@@ -68,9 +80,9 @@ scale_to() {
   for k in "${keep[@]}"; do keep_set[$k]=1; done
   for node in "${ALL_NODES[@]}"; do
     if [[ -n "${keep_set[$node]:-}" ]]; then
-      kubectl label --overwrite node "$node" blobcache.test/enabled=true >/dev/null
+      kubectl label --overwrite node "$node" "$TEST_LABEL_KEY=$TEST_LABEL_VALUE" >/dev/null
     else
-      kubectl label node "$node" blobcache.test/enabled- >/dev/null 2>&1 || true
+      kubectl label node "$node" "$TEST_LABEL_KEY-" >/dev/null 2>&1 || true
     fi
   done
   for _ in {1..60}; do
@@ -102,7 +114,7 @@ pool_max_idle_per_host = $AZURE_POOL_MAX_IDLE_PER_HOST
 
 [cluster]
 bind = "0.0.0.0:7771"
-seeds = ["http://10.0.0.5:7771","http://10.0.0.6:7771","http://10.0.0.7:7771"]
+seeds = [$SEEDS_TOML]
 advertise = "http://$ip:7771"
 
 [transport]
@@ -122,9 +134,9 @@ bind = "0.0.0.0:7773"
 [[mounts]]
 name = "deepseek"
 mountpoint = "/mnt/blobcache/deepseek"
-account = "myaccount"
-container = "models"
-prefix = "models/test-prefix/"
+account = "$STORAGE_ACCOUNT"
+container = "$CONTAINER"
+prefix = "$MODEL_PREFIX"
 EOF
 }
 

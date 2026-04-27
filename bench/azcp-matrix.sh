@@ -16,31 +16,39 @@
 # the only thing that changes is the fetcher.
 set -euo pipefail
 
-NS="blobcache"
-RESULTS_DIR="$(cd "$(dirname "$0")" && pwd)/results-azcp"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$HERE/.." && pwd)"
+[[ -f "$REPO_ROOT/.env" ]] && set -a && . "$REPO_ROOT/.env" && set +a
+
+: "${STORAGE_ACCOUNT:?set STORAGE_ACCOUNT in .env}"
+: "${CONTAINER:?set CONTAINER in .env}"
+: "${MODEL_PREFIX:?set MODEL_PREFIX in .env}"
+: "${AGENT_POOL:?set AGENT_POOL in .env}"
+: "${AZURE_CLIENT_ID:?set AZURE_CLIENT_ID in .env}"
+
+NS="${NAMESPACE:-blobcache}"
+TEST_LABEL_KEY="${TEST_NODE_LABEL_KEY:-blobcache.test/enabled}"
+TEST_LABEL_VALUE="${TEST_NODE_LABEL_VALUE:-true}"
+RESULTS_DIR="$HERE/results-azcp"
 DEST="/mnt/nvme/azcp-test"
-SRC="https://myaccount.blob.core.windows.net/models/models/test-prefix/"
+SRC="https://${STORAGE_ACCOUNT}.blob.core.windows.net/${CONTAINER}/${MODEL_PREFIX}"
 AZCP="/opt/blobcache/azcp"
-CLIENT_ID="00000000-0000-0000-0000-000000000000"
+CLIENT_ID="${AZURE_CLIENT_ID}"
+
+# All nodes in the target agent pool, sorted for determinism.
+mapfile -t ALL_NODES < <(kubectl get nodes \
+  -l "kubernetes.azure.com/agentpool=$AGENT_POOL" \
+  -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | sort)
 
 # Same seed-IP nodes as bench/matrix.sh - keep cluster integrity intact even
 # while we're not actually using blobcached for these tests, so we can A/B
-# back to the hydrate matrix without re-labeling.
-SEEDS_LABEL_KEEP=(
-  "aks-cluster-00000000-vmss00001h"
-  "aks-cluster-00000000-vmss000010"
-  "aks-cluster-00000000-vmss00001g"
-)
-ALL_NODES=(
-  aks-cluster-00000000-vmss000010 aks-cluster-00000000-vmss000011
-  aks-cluster-00000000-vmss000012 aks-cluster-00000000-vmss000013
-  aks-cluster-00000000-vmss000014 aks-cluster-00000000-vmss000015
-  aks-cluster-00000000-vmss000016 aks-cluster-00000000-vmss000018
-  aks-cluster-00000000-vmss000019 aks-cluster-00000000-vmss00001b
-  aks-cluster-00000000-vmss00001c aks-cluster-00000000-vmss00001d
-  aks-cluster-00000000-vmss00001e aks-cluster-00000000-vmss00001f
-  aks-cluster-00000000-vmss00001g aks-cluster-00000000-vmss00001h
-)
+# back to the hydrate matrix without re-labeling. SEED_NODES (comma-separated)
+# pins a stable subset; otherwise default to the first 3 of ALL_NODES.
+if [[ -n "${SEED_NODES:-}" ]]; then
+  IFS=',' read -ra SEEDS_LABEL_KEEP <<< "$SEED_NODES"
+else
+  SEEDS_LABEL_KEEP=("${ALL_NODES[@]:0:3}")
+fi
 
 log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
 
@@ -68,9 +76,9 @@ scale_to() {
   for k in "${keep[@]}"; do keep_set[$k]=1; done
   for node in "${ALL_NODES[@]}"; do
     if [[ -n "${keep_set[$node]:-}" ]]; then
-      kubectl label --overwrite node "$node" blobcache.test/enabled=true >/dev/null
+      kubectl label --overwrite node "$node" "$TEST_LABEL_KEY=$TEST_LABEL_VALUE" >/dev/null
     else
-      kubectl label node "$node" blobcache.test/enabled- >/dev/null 2>&1 || true
+      kubectl label node "$node" "$TEST_LABEL_KEY-" >/dev/null 2>&1 || true
     fi
   done
   for _ in {1..60}; do

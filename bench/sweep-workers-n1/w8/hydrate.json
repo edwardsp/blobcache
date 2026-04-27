@@ -1,1 +1,0 @@
-{"mount":"deepseek","path":"","total_files":350,"total_chunks":98804,"total_bytes":413340567567,"elapsed_ms":63165,"aggregate_mibs":6240.675741588381,"peers":[{"node_id":"node-s6hf4","assigned_chunks":98804,"fetched":98804,"bytes":413340567567,"errors":[],"elapsed_ms":62937}]}

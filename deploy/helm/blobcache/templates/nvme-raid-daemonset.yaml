@@ -1,0 +1,75 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "blobcache.fullname" . }}-nvme-raid-init
+  namespace: {{ include "blobcache.namespace" . }}
+  labels:
+    {{- include "blobcache.labels" . | nindent 4 }}
+    app.kubernetes.io/component: nvme-raid-init
+spec:
+  selector:
+    matchLabels:
+      {{- include "blobcache.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: nvme-raid-init
+  template:
+    metadata:
+      labels:
+        {{- include "blobcache.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: nvme-raid-init
+    spec:
+      hostPID: true
+      hostNetwork: true
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.nodeSelector.agentPoolValue }}
+      nodeSelector:
+        {{ .Values.nodeSelector.agentPoolKey }}: {{ .Values.nodeSelector.agentPoolValue | quote }}
+      {{- end }}
+      containers:
+        - name: init
+          image: "{{ .Values.image.nvmeRaid.repository }}:{{ .Values.image.nvmeRaid.tag }}"
+          imagePullPolicy: {{ .Values.image.nvmeRaid.pullPolicy }}
+          securityContext:
+            privileged: true
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eux
+              tdnf install -y mdadm e2fsprogs util-linux nvme-cli || true
+              nsenter -t 1 -m -u -i -n -p -- bash -c '
+                set -eux
+                mkdir -p {{ .Values.hostPaths.nvme }}
+                if mountpoint -q {{ .Values.hostPaths.nvme }}; then
+                  echo "already mounted"; exit 0
+                fi
+                if [ -b /dev/md/blobcache ] || [ -b /dev/md0 ]; then
+                  MD=$(ls /dev/md/blobcache /dev/md0 2>/dev/null | head -n1)
+                  mount "$MD" {{ .Values.hostPaths.nvme }} || true
+                  exit 0
+                fi
+                DEVS=$(lsblk -dn -o NAME,TYPE,MOUNTPOINT | awk "\$2==\"disk\" && \$3==\"\" {print \$1}" | grep -E "^nvme" || true)
+                COUNT=$(echo "$DEVS" | wc -w)
+                if [ "$COUNT" -lt 1 ]; then echo "no spare NVMe devices"; exit 0; fi
+                FULL=""
+                for d in $DEVS; do FULL="$FULL /dev/$d"; done
+                if [ "$COUNT" -ge 2 ]; then
+                  yes | mdadm --create /dev/md/blobcache --level=0 --raid-devices=$COUNT --name=blobcache $FULL
+                  MD=/dev/md/blobcache
+                else
+                  MD=$(echo $FULL | awk "{print \$1}")
+                fi
+                mkfs.ext4 -F -E nodiscard -L blobcache "$MD"
+                mount -o noatime,nodiratime "$MD" {{ .Values.hostPaths.nvme }}
+                chmod 1777 {{ .Values.hostPaths.nvme }}
+              '
+              sleep infinity
+          volumeMounts:
+            - name: host-root
+              mountPath: /host
+              mountPropagation: Bidirectional
+      volumes:
+        - name: host-root
+          hostPath:
+            path: /

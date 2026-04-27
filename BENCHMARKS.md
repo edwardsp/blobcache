@@ -15,7 +15,7 @@ TCP peer transport. Run via `benchmarks/bench.sh`; raw TSV in
 | `chunk_concurrency` | 32 |
 | `peer_concurrency` | 8 |
 | Peer transport | HTTP/1.1 over TCP (host-network, intra-AZ) |
-| Storage account | `myaccount`, container `test`, blobs `azcp-bench/dl-src-big/file_*.bin` (2 GiB each) |
+| Storage account | Premium block-blob (`myaccount`), container `test`, blobs `azcp-bench/dl-src-big/file_*.bin` (2 GiB each) |
 | Read pattern | `dd bs=1M count=N iflag=fullblock` after `drop_caches` |
 
 All Oracle CRITICAL + HIGH issues from the v1 review are fixed in this
@@ -971,7 +971,7 @@ Real model, real container:
 | | |
 |---|---|
 | Model | `nvidia/DeepSeek-R1-0528-NVFP4-v2` |
-| Storage account | `myaccount`, container `models`, prefix `models/test-prefix/` |
+| Storage account | Premium block-blob (`myaccount`), container `models`, prefix `models/test-prefix/` |
 | Files | 163 safetensors shards, 385 GiB total |
 | Per-pod read | first 8 model shards, sequential, `dd bs=4M`, ≈21.3 GiB |
 | Cluster | 8× `Standard_GB300` (Grace + Blackwell), `agentpool=gb300` |
@@ -1662,7 +1662,7 @@ sleeps, all the way to 102 Gbps aggregate Azure pull at N=16.
 | | |
 |---|---|
 | Model | `nvidia/DeepSeek-R1-0528-NVFP4-v2` (350 blobs, 163 of which are `.safetensors`, 385.0 GiB) |
-| Storage | `myaccount` (Azure Blob, Premium block-blob, single account) |
+| Storage | Azure Blob Premium block-blob, single account (~200 Gbps egress cap) |
 | Cluster | gb300 nodepool, ND-class GraceBlackwell, 4× ConnectX-7 NDR HCAs per node |
 | Daemon | blobcached v2.7.1, `--features ucx` (RDMA peer transport via UCX) |
 | Cache | NVMe RAID-0 per node, 14 TiB capacity, 450 GiB blobcache budget |
@@ -1838,7 +1838,7 @@ to `/opt/blobcache/azcp` on every gb300 pod.
 
 Identical orchestration to `bench/matrix.sh`: same pod set, same seed-IP
 hold-list, same N sweep, same destination NVMe (`/mnt/nvme/azcp-test/`),
-same MSI auth (`AZURE_CLIENT_ID=38eed020-...`). Runner: `bench/azcp-matrix.sh`,
+same MSI auth (`AZURE_CLIENT_ID=<your-msi-client-id>`). Runner: `bench/azcp-matrix.sh`,
 analysis: `bench/analyze-azcp.py`, raw data: `bench/results-azcp/N{1,2,4,8,16}/`.
 
 ### Per-shard invocation

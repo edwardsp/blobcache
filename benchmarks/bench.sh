@@ -15,7 +15,7 @@ set -euo pipefail
 #
 # Output: machine-readable TSV on stdout. Wrap with bench_to_md.sh for markdown.
 #
-# Requires: kubectl context = mycluster, namespace blobcache, 3 blobcached pods,
+# Requires: kubectl context pointed at the test cluster, namespace blobcache, 3 blobcached pods,
 # storage-access ON, mount name "test", blob path azcp-bench/dl-src-big/*.
 
 NS=${NS:-blobcache}

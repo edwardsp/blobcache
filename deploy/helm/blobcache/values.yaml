@@ -1,0 +1,75 @@
+# Default values for blobcache.
+# This is a YAML-formatted file.
+#
+# All site-specific values are EMPTY by default. You MUST supply at least
+# `nodeSelector.agentPoolValue` (e.g. via `-f myvalues.yaml` or `--set`).
+# See `values.example.yaml` for a worked example.
+
+# -- Namespace control. If `create` is true the chart will render a Namespace
+# manifest named `name`. If false, the resources are installed into the release
+# namespace and you are responsible for creating it.
+namespace:
+  create: true
+  name: blobcache
+
+# -- Container images for each component.
+image:
+  blobcached:
+    repository: ubuntu
+    tag: "24.04"
+    pullPolicy: IfNotPresent
+  nvmeRaid:
+    repository: mcr.microsoft.com/cbl-mariner/base/core
+    tag: "2.0"
+    pullPolicy: IfNotPresent
+
+# -- Node targeting. Both DaemonSets are pinned to nodes carrying
+# `agentPoolKey=agentPoolValue`. The blobcached DS additionally requires
+# `testLabelKey=testLabelValue` so you can opt nodes in/out of the test pool.
+#
+# REQUIRED: set `agentPoolValue` to your cluster's RDMA-capable nodepool name.
+nodeSelector:
+  agentPoolKey: kubernetes.azure.com/agentpool
+  agentPoolValue: ""
+  testLabelKey: blobcache.test/enabled
+  testLabelValue: "true"
+
+# -- Pod tolerations. Defaults to "tolerate everything" so the DaemonSets land
+# on tainted system nodepools too.
+tolerations:
+  - operator: Exists
+
+# -- Azure auth. `clientId` is the user-assigned managed identity client-id
+# that holds Storage Blob Data Reader (or higher) on the target storage
+# account(s). Leave empty to fall back to system-assigned MSI / IMDS default
+# (the AZURE_CLIENT_ID env var is omitted entirely when empty).
+azure:
+  clientId: ""
+
+# -- UCX / RDMA tuning. These map directly to UCX_* env vars on the
+# blobcached container.
+ucx:
+  netDevices: "mlx5_0:1"
+  tls: "rc,ud,sm,self"
+  ibAddrType: "auto"
+  rndvThresh: "64K"
+  zcopyThresh: "64K"
+  rndvScheme: "put_zcopy"
+  maxRndvRails: "1"
+  logLevel: "info"
+
+# -- RUST_LOG value for the blobcached container.
+rustLog: "info,blobcache=debug"
+
+# -- RDMA device request. Only meaningful if the cluster has the SR-IOV IB
+# device plugin installed and exposing `rdma/ib` (or equivalent) as an
+# extended resource.
+rdma:
+  enabled: true
+  resourceName: rdma/ib
+  count: 1
+
+# -- Host paths used by the blobcached DS. `nvme` is where the NVMe RAID
+# init DS mounts the assembled array on the host.
+hostPaths:
+  nvme: /mnt/nvme

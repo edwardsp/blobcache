@@ -2,10 +2,16 @@
 # Toggle public network access on the storage account so vnet rules apply.
 # Default action is already Deny + vnet rule allows the AKS subnet, so flipping
 # publicAccess between Enabled and Disabled is the entire dance.
+#
+# Reads STORAGE_ACCOUNT and RESOURCE_GROUP from .env (or environment).
 set -euo pipefail
 
-ACCOUNT="${ACCOUNT:-myaccount}"
-RG="${RG:-myresourcegroup}"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$HERE/.." && pwd)"
+[[ -f "$REPO_ROOT/.env" ]] && set -a && . "$REPO_ROOT/.env" && set +a
+
+ACCOUNT="${STORAGE_ACCOUNT:?set STORAGE_ACCOUNT (in .env or env) to your storage account name}"
+RG="${RESOURCE_GROUP:?set RESOURCE_GROUP (in .env or env) to the storage account's resource group}"
 
 case "${1:-}" in
   on)

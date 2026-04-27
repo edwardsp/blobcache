@@ -4,10 +4,22 @@
 # does not toggle it.
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-NS="blobcache"
+REPO_ROOT="$(cd "$HERE/.." && pwd)"
+[[ -f "$REPO_ROOT/.env" ]] && set -a && . "$REPO_ROOT/.env" && set +a
+
+: "${STORAGE_ACCOUNT:?set STORAGE_ACCOUNT in .env}"
+: "${CONTAINER:?set CONTAINER in .env}"
+: "${MODEL_PREFIX:?set MODEL_PREFIX in .env}"
+: "${GOSSIP_SEEDS:?set GOSSIP_SEEDS (comma-separated http://IP:7771 list) in .env}"
+
+NS="${NAMESPACE:-blobcache}"
 SWEEP="$HERE/sweep-workers"
 BIN=/tmp/blobcached.aarch64
 mkdir -p "$SWEEP"
+
+# GOSSIP_SEEDS is "url1,url2,url3"; render as a TOML string array.
+seeds_toml() { python3 -c 'import os,sys;print(",".join("\""+s.strip()+"\"" for s in os.environ["GOSSIP_SEEDS"].split(",") if s.strip()))'; }
+SEEDS_TOML="$(seeds_toml)"
 
 current_pods() {
   kubectl -n "$NS" get pods -l app=blobcached --field-selector=status.phase=Running \
@@ -30,7 +42,7 @@ workers = $workers
 
 [cluster]
 bind = "0.0.0.0:7771"
-seeds = ["http://10.0.0.5:7771","http://10.0.0.6:7771","http://10.0.0.7:7771"]
+seeds = [$SEEDS_TOML]
 advertise = "http://$ip:7771"
 
 [transport]
@@ -47,9 +59,9 @@ bind = "0.0.0.0:7773"
 [[mounts]]
 name = "deepseek"
 mountpoint = "/mnt/blobcache/deepseek"
-account = "myaccount"
-container = "models"
-prefix = "models/test-prefix/"
+account = "$STORAGE_ACCOUNT"
+container = "$CONTAINER"
+prefix = "$MODEL_PREFIX"
 EOF
 }
 

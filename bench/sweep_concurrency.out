@@ -1,5 +1,0 @@
-[19:05:31] === START 16M-conc8 (chunk=16777216 conc=8) ===
-[19:05:31] ================ N=16 START ================
-[19:05:31] scaling to N=16 nodes
-[19:05:42] pod count = 16 / 16
-[19:05:42] pushing blobcached binary + config to current pods

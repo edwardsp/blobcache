@@ -5,19 +5,42 @@
 # directly reflects per-process tokio/reqwest scaling.
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-NS="blobcache"
+REPO_ROOT="$(cd "$HERE/.." && pwd)"
+[[ -f "$REPO_ROOT/.env" ]] && set -a && . "$REPO_ROOT/.env" && set +a
+
+: "${STORAGE_ACCOUNT:?set STORAGE_ACCOUNT in .env}"
+: "${CONTAINER:?set CONTAINER in .env}"
+: "${MODEL_PREFIX:?set MODEL_PREFIX in .env}"
+: "${AGENT_POOL:?set AGENT_POOL in .env}"
+
+NS="${NAMESPACE:-blobcache}"
+TEST_LABEL_KEY="${TEST_NODE_LABEL_KEY:-blobcache.test/enabled}"
+TEST_LABEL_VALUE="${TEST_NODE_LABEL_VALUE:-true}"
 SWEEP="$HERE/sweep-workers-n1"
 BIN=/tmp/blobcached.aarch64
-SEEDS_LABEL_KEEP=(vmss00001h vmss000010 vmss00001g)
+
+# Pick the single node to keep labeled for the N=1 sweep. SEED_NODES (comma-
+# separated node names) overrides; otherwise the first node returned by
+# kubectl in the agent pool wins.
+mapfile -t _ALL_POOL_NODES < <(kubectl get nodes \
+  -l "kubernetes.azure.com/agentpool=$AGENT_POOL" \
+  -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | sort)
+if [[ -n "${SEED_NODES:-}" ]]; then
+  IFS=',' read -ra _SEEDS <<< "$SEED_NODES"
+  KEEP_NODE="${_SEEDS[0]}"
+else
+  KEEP_NODE="${_ALL_POOL_NODES[0]:-}"
+fi
+: "${KEEP_NODE:?no nodes found in agent pool $AGENT_POOL}"
+
 mkdir -p "$SWEEP"
 
 scale_to_one() {
-  local keep="${SEEDS_LABEL_KEEP[0]}"
-  for n in $(kubectl get nodes -l agentpool=gb300 -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}'); do
-    if [[ "$n" == *"$keep" ]]; then
-      kubectl label --overwrite node "$n" blobcache.test/enabled=true >/dev/null
+  for n in "${_ALL_POOL_NODES[@]}"; do
+    if [[ "$n" == "$KEEP_NODE" ]]; then
+      kubectl label --overwrite node "$n" "$TEST_LABEL_KEY=$TEST_LABEL_VALUE" >/dev/null
     else
-      kubectl label node "$n" blobcache.test/enabled- >/dev/null 2>&1 || true
+      kubectl label node "$n" "$TEST_LABEL_KEY-" >/dev/null 2>&1 || true
     fi
   done
   for _ in {1..60}; do
@@ -67,9 +90,9 @@ bind = "0.0.0.0:7773"
 [[mounts]]
 name = "deepseek"
 mountpoint = "/mnt/blobcache/deepseek"
-account = "myaccount"
-container = "models"
-prefix = "models/test-prefix/"
+account = "$STORAGE_ACCOUNT"
+container = "$CONTAINER"
+prefix = "$MODEL_PREFIX"
 EOF
 }
 

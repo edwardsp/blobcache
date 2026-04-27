@@ -1,0 +1,41 @@
+# Example overrides for `helm install -f`.
+# Copy to `myvalues.yaml`, fill in the placeholders, then:
+#
+#   helm install blobcache ./deploy/helm/blobcache -f myvalues.yaml
+#
+# All values shown here override defaults from values.yaml.
+
+namespace:
+  create: true
+  name: blobcache
+
+# REQUIRED: pin to your RDMA-capable nodepool.
+nodeSelector:
+  agentPoolKey: kubernetes.azure.com/agentpool
+  agentPoolValue: "myagentpool"          # <— your AKS nodepool name
+  testLabelKey: blobcache.test/enabled
+  testLabelValue: "true"
+
+# Disambiguate which user-assigned MSI to use (when the VMSS has more than
+# one). The MSI must have Storage Blob Data Reader on the target account.
+azure:
+  clientId: "<msi-client-id>"            # <— guid of your user-assigned MSI
+
+# Override only if your cluster uses a different IB device name or RDMA plugin.
+ucx:
+  netDevices: "mlx5_0:1"
+  tls: "rc,ud,sm,self"
+  ibAddrType: "auto"
+  rndvThresh: "64K"
+  zcopyThresh: "64K"
+  rndvScheme: "put_zcopy"
+  maxRndvRails: "1"
+  logLevel: "info"
+
+rdma:
+  enabled: true
+  resourceName: rdma/ib
+  count: 1
+
+# Example: tighter logging on a stable cluster.
+# rustLog: "info"

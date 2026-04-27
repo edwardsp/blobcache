@@ -1,0 +1,107 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "blobcache.fullname" . }}-blobcached
+  namespace: {{ include "blobcache.namespace" . }}
+  labels:
+    {{- include "blobcache.labels" . | nindent 4 }}
+    app.kubernetes.io/component: blobcached
+spec:
+  selector:
+    matchLabels:
+      {{- include "blobcache.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: blobcached
+  template:
+    metadata:
+      labels:
+        {{- include "blobcache.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: blobcached
+    spec:
+      hostNetwork: true
+      hostPID: false
+      dnsPolicy: ClusterFirstWithHostNet
+      {{- if or .Values.nodeSelector.agentPoolValue (and .Values.nodeSelector.testLabelKey .Values.nodeSelector.testLabelValue) }}
+      nodeSelector:
+        {{- if .Values.nodeSelector.agentPoolValue }}
+        {{ .Values.nodeSelector.agentPoolKey }}: {{ .Values.nodeSelector.agentPoolValue | quote }}
+        {{- end }}
+        {{- if and .Values.nodeSelector.testLabelKey .Values.nodeSelector.testLabelValue }}
+        {{ .Values.nodeSelector.testLabelKey }}: {{ .Values.nodeSelector.testLabelValue | quote }}
+        {{- end }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: blobcached
+          image: "{{ .Values.image.blobcached.repository }}:{{ .Values.image.blobcached.tag }}"
+          imagePullPolicy: {{ .Values.image.blobcached.pullPolicy }}
+          securityContext:
+            privileged: true
+            capabilities:
+              add: ["SYS_ADMIN", "IPC_LOCK"]
+          {{- if .Values.rdma.enabled }}
+          resources:
+            limits:
+              {{ .Values.rdma.resourceName }}: {{ .Values.rdma.count }}
+            requests:
+              {{ .Values.rdma.resourceName }}: {{ .Values.rdma.count }}
+          {{- end }}
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -eux
+              apt-get update -qq
+              apt-get install -y -qq fuse3 ca-certificates curl jq iproute2 \
+                libucx0 libibverbs1 librdmacm1t64 ucx-utils ibverbs-utils
+              modprobe fuse || true
+              mkdir -p {{ .Values.hostPaths.nvme }}/blobcache-cache {{ .Values.hostPaths.nvme }}/blobcache-mnt
+              echo "container ready; waiting for binary at /opt/blobcache/blobcached"
+              while ! [ -x /opt/blobcache/blobcached ]; do sleep 5; done
+              echo "binary present, launching"
+              exec /opt/blobcache/blobcached --config /opt/blobcache/blobcached.toml
+          env:
+            - name: RUST_LOG
+              value: {{ .Values.rustLog | quote }}
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            {{- if .Values.azure.clientId }}
+            - name: AZURE_CLIENT_ID
+              value: {{ .Values.azure.clientId | quote }}
+            {{- end }}
+            - name: UCX_NET_DEVICES
+              value: {{ .Values.ucx.netDevices | quote }}
+            - name: UCX_TLS
+              value: {{ .Values.ucx.tls | quote }}
+            - name: UCX_IB_ADDR_TYPE
+              value: {{ .Values.ucx.ibAddrType | quote }}
+            - name: UCX_RNDV_THRESH
+              value: {{ .Values.ucx.rndvThresh | quote }}
+            - name: UCX_ZCOPY_THRESH
+              value: {{ .Values.ucx.zcopyThresh | quote }}
+            - name: UCX_RNDV_SCHEME
+              value: {{ .Values.ucx.rndvScheme | quote }}
+            - name: UCX_MAX_RNDV_RAILS
+              value: {{ .Values.ucx.maxRndvRails | quote }}
+            - name: UCX_LOG_LEVEL
+              value: {{ .Values.ucx.logLevel | quote }}
+          volumeMounts:
+            - name: nvme
+              mountPath: {{ .Values.hostPaths.nvme }}
+              mountPropagation: HostToContainer
+            - name: fuse
+              mountPath: /dev/fuse
+            - name: opt
+              mountPath: /opt/blobcache
+      volumes:
+        - name: nvme
+          hostPath:
+            path: {{ .Values.hostPaths.nvme }}
+        - name: fuse
+          hostPath:
+            path: /dev/fuse
+        - name: opt
+          emptyDir: {}

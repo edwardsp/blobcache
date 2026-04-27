@@ -14,8 +14,8 @@ pub struct Stats {
     pub blob_fetches: IntCounter,
     pub blob_fetch_bytes: IntCounter,
     // Throttling visibility: when Azure egress saturates the storage account
-    // (typically ~200 Gbps for myaccount), it returns 429/503 with a
-    // Retry-After hint. The blob client retries silently with exponential
+    // (Premium block-blob accounts cap around ~200 Gbps), it returns 429/503
+    // with a Retry-After hint. The blob client retries silently with exponential
     // backoff. These counters surface that retry traffic so an operator can
     // see throttling pressure without having to tcpdump.
     //
