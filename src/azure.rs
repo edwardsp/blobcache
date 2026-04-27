@@ -114,16 +114,49 @@ impl BlobClient {
         let url = self.url(account, container, blob)?;
         let range_val = format!("bytes={}-{}", offset, offset + length - 1);
         let extra = vec![("x-ms-range", HeaderValue::from_str(&range_val).unwrap())];
-        let resp = self.send(Method::GET, url, &extra, None, None).await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await?;
-            return Err(BcError::Storage {
-                status: status.as_u16(),
-                message: body.chars().take(200).collect(),
-            });
+        let max_attempts = self.max_retries.saturating_add(1).max(1);
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            let resp = self
+                .send(Method::GET, url.clone(), &extra, None, None)
+                .await?;
+            let status = resp.status();
+            if !status.is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                return Err(BcError::Storage {
+                    status: status.as_u16(),
+                    message: body.chars().take(200).collect(),
+                });
+            }
+            match resp.bytes().await {
+                Ok(b) => return Ok(b),
+                Err(e)
+                    if attempt < max_attempts
+                        && (e.is_body() || e.is_timeout() || e.is_decode()) =>
+                {
+                    let delay = backoff_ms(attempt);
+                    if let Some(m) = &self.metrics {
+                        m.blob_request_retries_total
+                            .with_label_values(&["body"])
+                            .inc();
+                        m.blob_retry_sleep_seconds_total
+                            .inc_by(delay as f64 / 1000.0);
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                    continue;
+                }
+                Err(e) => {
+                    if let Some(m) = &self.metrics {
+                        m.blob_request_status_total
+                            .with_label_values(&["body_err"])
+                            .inc();
+                        m.blob_request_giveups_total.inc();
+                    }
+                    return Err(e.into());
+                }
+            }
         }
-        Ok(resp.bytes().await?)
     }
 
     pub async fn list_blobs(

@@ -105,7 +105,7 @@ blobcache_cluster_config_mismatches_total 0
 blobcache_cluster_failures_total 0
 # HELP blobcache_cluster_gossip_rounds_total gossip rounds
 # TYPE blobcache_cluster_gossip_rounds_total counter
-blobcache_cluster_gossip_rounds_total 7
+blobcache_cluster_gossip_rounds_total 5
 # HELP blobcache_cluster_joins_total peer joins observed
 # TYPE blobcache_cluster_joins_total counter
 blobcache_cluster_joins_total 0

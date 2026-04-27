@@ -121,6 +121,10 @@ pub async fn run_shard(
             }
         }
     }
+    // Wait for all backgrounded cache.insert tasks to finish writing to NVMe
+    // (tmp+fsync+rename) so elapsed_ms reflects on-disk completion, matching
+    // azcp's wall-clock semantics (azcp writes synchronously before returning).
+    fetcher.await_inserts_drained().await;
     HydrateShardResponse {
         fetched,
         bytes,

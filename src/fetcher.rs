@@ -677,6 +677,19 @@ impl Fetcher {
         });
     }
 
+    /// Poll until every chunk previously handed to spawn_insert has been
+    /// durably persisted to NVMe (tmp+fsync+rename completed) and removed
+    /// from inflight_writes. Used by hydrate to make wall-time measurements
+    /// reflect on-disk completion, not just GET completion.
+    pub async fn await_inserts_drained(&self) {
+        loop {
+            if self.inflight_writes.is_empty() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
     pub async fn fetch_range(
         &self,
         mount: &MountConfig,

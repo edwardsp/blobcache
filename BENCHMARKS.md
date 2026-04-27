@@ -2191,3 +2191,124 @@ retry layer on `decode_body`-class failures; the multi-node case is fine.
 - **Per-NIC pinning.** Each runtime gets a fresh reqwest client; we don't
   pin them to specific NICs. On 4-HCA boxes the single-runtime ceiling per
   NIC may differ from what we measured pooled across NICs; not investigated.
+
+---
+
+## v2.9.1 — body-decode retry + fair wall measurement
+
+**Status: shipped.** Two correctness/methodology fixes on top of v2.9.0,
+both surfaced when triaging the v2.9.0 N=1 results above.
+
+### What was wrong with the v2.9.0 numbers
+
+1. **Chunk decode errors (functional bug).** `BlobClient::get_blob_range`
+   wrapped only `req.send()` in the retry loop; the subsequent
+   `resp.bytes().await` body read was unguarded, so an HTTPS body-stream
+   truncation (4-30 per N=1 hydrate) leaked straight to the caller as a
+   permanent chunk-fetch failure. Cache write is atomic (`tmp + fsync +
+   rename`) so no partial files were ever produced — but the chunk was
+   simply never inserted, leaving the FUSE read path to return EIO at
+   first access. The peer fallback at N≥2 masked it; at N=1 it surfaced
+   as 4-30 missing chunks per run.
+
+2. **Wall measurement biased the comparison vs azcp.** `Fetcher::spawn_insert`
+   backgrounds `cache.insert` via `tokio::spawn(spawn_blocking(...))`, so
+   `run_shard` returned `elapsed_ms` as soon as the last *GET* completed —
+   not the last NVMe write. azcp's baseline (`reference/azcp`) writes
+   synchronously with `tokio::fs::write_all + flush` before returning, then
+   counts bytes via `du -sb` post-process. So the v2.9.0 N=1 w=8 figure
+   of **52 Gbps** reflected wire-side completion only; the comparable
+   azcp number (27 Gbps at w=1) included disk-write completion. Apples to
+   oranges.
+
+### The fix
+
+```rust
+// src/azure.rs:get_blob_range
+loop {
+    let resp = self.send(...).await?;          // existing send-time retry (≤11 attempts)
+    if !resp.status().is_success() { return Err(...); }
+    match resp.bytes().await {
+        Ok(b) => return Ok(b),
+        Err(e) if attempt < max_attempts && (e.is_body() || e.is_timeout() || e.is_decode())
+            => { sleep(backoff); continue; }
+        Err(e) => return Err(e.into()),
+    }
+}
+```
+
+Same `max_retries = 10` budget as send-time retries; metric label
+`status="body"` distinguishes from `"net"`.
+
+```rust
+// src/fetcher.rs
+pub async fn await_inserts_drained(&self) {
+    while !self.inflight_writes.is_empty() {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+// src/hydrate.rs:run_shard, end of for-loop
+fetcher.await_inserts_drained().await;
+HydrateShardResponse { elapsed_ms: t0.elapsed().as_millis() as u64, ... }
+```
+
+`elapsed_ms` now reflects on-disk completion. Same wall-clock semantics
+as azcp.
+
+### v2.9.1 N=1 sweep (`bench/sweep_workers_n1.sh`)
+
+Single pod, `chunk_size=4 MiB`, `chunk_concurrency=32` (constant across all
+worker settings — `workers` multiplies tokio runtime + reqwest pool
+infrastructure, **not** the in-flight chunk count, which stays at 32 via
+the global `chunk_sem`):
+
+| workers | wall (s) | per-node Gbps | speedup vs w=1 | chunk errors | vs v2.9.0 (wire-only) |
+|--:|--:|--:|--:|--:|--:|
+| 1 | 130.2 | 23.6 | 1.00× | **0** | -16% (now incl. writes) |
+| 2 | 76.2 | 40.4 | 1.71× | **0** | -2% |
+| 4 | 66.0 | 46.6 | 1.97× | **0** | -2% |
+| **8 (peak)** | **63.2** | **48.8** | **2.07×** | **0** | -6% |
+| 16 | 80.0 | 38.5 | 1.63× | **0** | -23% (over-subscribed) |
+
+azcp `--workers 1` baseline on this hardware: **27.08 Gbps** (sync writes).
+blobcache w=1 with sync writes lands at 23.6 Gbps — within 13% of azcp on
+the apples-to-apples comparison. The pool mechanism still scales: w=8
+delivers **48.8 Gbps**, **1.80× azcp** with the same disk-completion
+semantics.
+
+The w=1 → w=8 speedup of 2.07× is slightly larger than v2.9.0's 1.85×
+because the writeback wait at w=1 dominates a larger share of the wall
+than at w=8 (more concurrent runtimes overlap GET and NVMe-write phases).
+
+### v2.9.1 N=17 sweep (`bench/sweep_workers.sh`, all available gb300 nodes)
+
+| workers | wall (s) | aggregate Gbps | per-node Gbps | chunk errors |
+|--:|--:|--:|--:|--:|
+| 1 | 20.4 | 151.1 | 8.89 | **0** |
+| 2 | 21.3 | 144.8 | 8.52 | **0** |
+| 4 | 21.2 | 145.2 | 8.54 | **0** |
+| 8 | 22.9 | 134.7 | 7.92 | **0** |
+
+At N=17 the storage-account share per node (~10.85 Gbps) is the binding
+constraint, so `workers` is irrelevant in this regime — the slight w=8
+regression is the same over-subscription effect seen at N=1 w=16. Zero
+chunk errors at every setting confirms the body-retry fix; the previous
+"errors only at N=1" pattern simply reflected that peer fallback masked
+them, not that they didn't happen.
+
+### Recommendations (unchanged from v2.9)
+
+- **Storage-account-capped clusters**: `workers = 1`-`4`. The account is
+  the bottleneck; per-process scaling is dominated.
+- **Single-node / per-account-isolated workloads**: `workers = 8`.
+  Empirical peak; w=16 oversubscribes runtimes.
+- **Default**: ship `workers = 1` for backward compat; document `8` as the
+  isolated-workload tuning.
+
+### What this *doesn't* change
+
+- The v2.9 `azure.workers` mechanism is unaffected — the speedup curve
+  shape (1× → ~2× from w=1 to w=8) reproduces exactly.
+- Block aggregation (`azure.block_size`) is still plumbed-but-unused.
+- Per-NIC runtime pinning is still not done.

@@ -138,7 +138,8 @@ run_one() {
   push_cfg "$workers"
   echo "[$(date +%H:%M:%S)] pushed; wiping + restarting"
   wipe_restart
-  wait_ready 16 || { echo "  no convergence; skipping"; return 1; }
+  local n; n=$(current_pods | wc -l)
+  wait_ready "$n" || { echo "  no convergence; skipping"; return 1; }
   snap "$out" pre
   hydrate "$out"
   snap "$out" post

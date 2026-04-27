@@ -1,25 +1,23 @@
-[20:48:14] === w1 : workers=1 ===
-[20:49:40] pushed; wiping + restarting
-[20:50:23] cluster ready (16 alive)
-[20:50:25] HYDRATE coord=blobcached-75mcn
-[20:50:50] hydrate wall = 24.539 s
-[20:50:52] === w1 DONE ===
-[20:50:52] === w2 : workers=2 ===
-[20:52:19] pushed; wiping + restarting
-[20:53:14] cluster ready (16 alive)
-[20:53:16] HYDRATE coord=blobcached-75mcn
-[20:53:38] hydrate wall = 22.216 s
-[20:53:41] === w2 DONE ===
-[20:53:41] === w4 : workers=4 ===
-[20:55:06] pushed; wiping + restarting
-[20:56:10] cluster ready (16 alive)
-[20:56:12] HYDRATE coord=blobcached-75mcn
-[20:56:34] hydrate wall = 21.406 s
-[20:56:36] === w4 DONE ===
-[20:56:36] === w8 : workers=8 ===
-[20:58:12] pushed; wiping + restarting
-[20:59:44] cluster ready (16 alive)
-[20:59:46] HYDRATE coord=blobcached-75mcn
-[21:00:09] hydrate wall = 22.587 s
-[21:00:11] === w8 DONE ===
-[21:00:11] ALL DONE
+[08:17:51] === w1 : workers=1 ===
+[08:19:19] pushed; wiping + restarting
+[08:20:44] cluster ready (17 alive)
+[08:20:46] HYDRATE coord=blobcached-2d4g5
+[08:21:08] hydrate wall = 21.354 s
+[08:21:10] === w1 DONE ===
+[08:21:10] === w2 : workers=2 ===
+[08:22:39] pushed; wiping + restarting
+[08:24:52] cluster ready (17 alive)
+[08:24:54] HYDRATE coord=blobcached-2d4g5
+[08:25:16] hydrate wall = 22.210 s
+[08:25:19] === w2 DONE ===
+[08:25:19] === w4 : workers=4 ===
+[08:26:47] pushed; wiping + restarting
+[08:30:15] cluster ready (17 alive)
+[08:30:17] HYDRATE coord=blobcached-2d4g5
+[08:30:39] hydrate wall = 22.138 s
+[08:30:42] === w4 DONE ===
+[08:30:42] === w8 : workers=8 ===
+[08:33:06] pushed; wiping + restarting
+[08:37:06] WARN: not converged
+  no convergence; skipping
+[08:37:06] ALL DONE
