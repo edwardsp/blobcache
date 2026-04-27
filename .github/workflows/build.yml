@@ -1,0 +1,131 @@
+name: build
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }} (${{ matrix.features }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # blobcache is Linux-only: FUSE doesn't exist on macOS/Windows in
+          # the form we use. We build x86_64 (dev/CI) and aarch64 (gb300
+          # cluster target). Each in two variants: tcp-only (no extra deps,
+          # smallest binary) and ucx (RDMA peer transport, the production
+          # build for the cluster).
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            features: tcp
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            features: ucx
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            features: tcp
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            features: ucx
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build deps (FUSE always; UCX when feature enabled)
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq pkg-config libfuse3-dev
+          if [ "${{ matrix.features }}" = "ucx" ]; then
+            # UCX 1.16+ is in noble (24.04). The ucx1-sys crate also needs
+            # libclang for bindgen.
+            sudo apt-get install -y -qq libucx-dev libclang-dev
+          fi
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}-${{ matrix.features }}
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.features }}" = "ucx" ]; then
+            cargo build --release --locked --target ${{ matrix.target }} --features ucx
+          else
+            cargo build --release --locked --target ${{ matrix.target }}
+          fi
+
+      - name: Unit tests
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.features }}" = "ucx" ]; then
+            cargo test --release --locked --target ${{ matrix.target }} --features ucx
+          else
+            cargo test --release --locked --target ${{ matrix.target }}
+          fi
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="blobcached-${{ matrix.target }}-${{ matrix.features }}"
+          mkdir -p "dist/$name"
+          cp "target/${{ matrix.target }}/release/blobcached" "dist/$name/"
+          cp README.md "dist/$name/" 2>/dev/null || true
+          cp LICENSE* "dist/$name/" 2>/dev/null || true
+          cp examples/blobcached.toml "dist/$name/blobcached.toml.example" 2>/dev/null || true
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          ( cd dist && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256" )
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: blobcached-${{ matrix.target }}-${{ matrix.features }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+
+  helm-lint:
+    name: helm lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - run: helm lint deploy/helm/blobcache
+      - run: |
+          helm template blobcache deploy/helm/blobcache \
+            -f deploy/helm/blobcache/values.example.yaml \
+            --set azure.clientId=00000000-0000-0000-0000-000000000000 \
+            --set nodeSelector.agentPoolValue=test-pool > /dev/null
+
+  release:
+    needs: [build, helm-lint]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256
+          generate_release_notes: true
