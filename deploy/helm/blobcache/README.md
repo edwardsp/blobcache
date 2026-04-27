@@ -9,9 +9,11 @@ The chart deploys two DaemonSets:
 1. **`<release>-nvme-raid-init`** — privileged, assembles spare NVMe disks on
    each target node into a RAID-0 (`/dev/md/blobcache`), formats ext4, and
    mounts it on the host at `/mnt/nvme`. Idempotent.
-2. **`<release>-blobcached`** — runs the `blobcached` daemon. Pinned to nodes
-   that have both the agent-pool label and an opt-in test label set. Pod waits
-   for the binary at `/opt/blobcache/blobcached` and launches it.
+2. **`<release>-blobcached`** — runs the `blobcached` daemon directly from
+   the `ghcr.io/edwardsp/blobcache` container image (binary baked in,
+   UCX/FUSE runtime libs included). Pinned to nodes that have both the
+   agent-pool label and an opt-in test label set. Reads its config from a
+   `ConfigMap` mounted at `/etc/blobcached.toml`.
 
 ## Prerequisites
 
@@ -55,7 +57,7 @@ azure:
 Everything else falls back to the defaults in `values.yaml`. See
 [`values.example.yaml`](values.example.yaml) for a more complete example.
 
-## Post-install: opt nodes in and push the binary
+## Post-install: opt nodes in
 
 The blobcached DaemonSet pins to nodes carrying
 `blobcache.test/enabled=true` (configurable via
@@ -66,22 +68,19 @@ nodes you want to run on:
 kubectl label node <node1> <node2> <node3> blobcache.test/enabled=true
 ```
 
-The blobcached pods start an Ubuntu base image, apt-install the runtime
-dependencies, then poll for the binary at `/opt/blobcache/blobcached`. Push
-the cross-built binary and the config in:
+Pods start immediately using the image's baked-in binary and the
+ConfigMap-mounted `/etc/blobcached.toml` — no `kubectl cp` step.
 
-```sh
-kubectl -n blobcache cp blobcached.aarch64 <pod>:/opt/blobcache/blobcached
-kubectl -n blobcache cp blobcached.toml    <pod>:/opt/blobcache/blobcached.toml
-```
+To roll out a config change, edit your values file (e.g. add a `[[mounts]]`
+entry under `config.mounts`) and re-run `helm upgrade`; pods restart
+automatically because the DaemonSet template carries a `checksum/config`
+annotation derived from the rendered ConfigMap.
 
-Once the binary is present and executable, the pod's main loop execs it.
-Repeat for each pod (or scriptify with `kubectl get pods -o name`).
+### Pinning to a specific image
 
-This binary-push workflow is intentionally not modelled as a ConfigMap or
-init-container image build — it lets you iterate on the daemon without
-rebuilding container images. A future revision of this chart may add a
-ConfigMap-backed option for pinned releases.
+The default tag is `:main` (rolling, multi-arch). For reproducible
+deployments override `image.blobcached.tag` with a digest-pinned SHA tag
+emitted by the container CI workflow (e.g. `sha-da10404`).
 
 ## Uninstall
 
@@ -107,6 +106,9 @@ parameters and inline documentation. Key knobs:
 | `rdma.enabled` / `rdma.resourceName` / `rdma.count` | RDMA device request on the blobcached pod. |
 | `ucx.*` | UCX_* env vars for the blobcached container. |
 | `image.blobcached.*` / `image.nvmeRaid.*` | Container images and pull policies. |
+| `imagePullSecrets` | Pull secrets for private GHCR packages. |
+| `config.mounts` | **REQUIRED.** List of `[[mounts]]` entries (one per blob container). |
+| `config.*` | Other contents of `/etc/blobcached.toml` (cache, azure, cluster, transport, stats). |
 | `hostPaths.nvme` | Where the NVMe RAID array is mounted on the host. |
 
 ## Local validation

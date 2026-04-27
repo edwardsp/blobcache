@@ -2,7 +2,8 @@
 # This is a YAML-formatted file.
 #
 # All site-specific values are EMPTY by default. You MUST supply at least
-# `nodeSelector.agentPoolValue` (e.g. via `-f myvalues.yaml` or `--set`).
+# `nodeSelector.agentPoolValue` (e.g. via `-f myvalues.yaml` or `--set`)
+# and at least one entry in `config.mounts`.
 # See `values.example.yaml` for a worked example.
 
 # -- Namespace control. If `create` is true the chart will render a Namespace
@@ -15,13 +16,19 @@ namespace:
 # -- Container images for each component.
 image:
   blobcached:
-    repository: ubuntu
-    tag: "24.04"
+    repository: ghcr.io/edwardsp/blobcache
+    tag: main
     pullPolicy: IfNotPresent
   nvmeRaid:
     repository: mcr.microsoft.com/cbl-mariner/base/core
     tag: "2.0"
     pullPolicy: IfNotPresent
+
+# -- Optional image pull secrets (e.g. for a private GHCR package).
+# Set to a list of LocalObjectReference, e.g.:
+#   imagePullSecrets:
+#     - name: ghcr-pull-secret
+imagePullSecrets: []
 
 # -- Node targeting. Both DaemonSets are pinned to nodes carrying
 # `agentPoolKey=agentPoolValue`. The blobcached DS additionally requires
@@ -73,3 +80,48 @@ rdma:
 # init DS mounts the assembled array on the host.
 hostPaths:
   nvme: /mnt/nvme
+
+# -- blobcached.toml contents, rendered into a ConfigMap and mounted at
+# /etc/blobcached.toml. `node_id` is intentionally omitted: the daemon
+# falls back to hostname() which, with hostNetwork=true, equals the
+# Kubernetes node name (so each pod gets a unique id automatically).
+config:
+  cache:
+    dir: /mnt/nvme/blobcache-cache
+    maxBytes: 107374182400      # 100 GiB
+    chunkSize: 4194304          # 4 MiB; MUST match across cluster
+  azure:
+    poolMaxIdlePerHost: 512
+    workers: 1                  # see BENCHMARKS § v2.9 for tuning
+    blockSize: 0                # 0 = use cache.chunkSize
+  cluster:
+    bind: "0.0.0.0:7771"
+    seeds: []                   # e.g. ["http://10.0.0.5:7771"]
+    advertise: ""               # blank = derived from local NIC
+  transport:
+    kind: rdma                  # "tcp" or "rdma" (image is built --features ucx)
+    bind: "0.0.0.0:7772"
+    advertise: []               # e.g. ["http://10.0.0.6:7772"]
+    chunkConcurrency: 32
+    peerConcurrency: 8
+    prefetchDepth: 16
+    prefetchThreshold: 3
+    prefetchConcurrency: 32
+    bloomBits: 8388608          # 1 MiB / peer
+    bloomRebuildSecs: 30
+    bloomPullSecs: 5
+    peerMaxCandidates: 4
+    peerMaxYesAttempts: 2
+    peerMaxMaybeAttempts: 2
+    stampedeWaitMs: 5000
+  stats:
+    bind: "0.0.0.0:7773"
+  # REQUIRED: at least one mount entry. Each entry becomes a [[mounts]]
+  # block in blobcached.toml.
+  mounts: []
+    # - name: models
+    #   mountpoint: /mnt/nvme/blobcache-mnt/models
+    #   account: myaccount
+    #   container: models
+    #   prefix: ""
+    #   sasToken: ""             # optional; omit for managed identity

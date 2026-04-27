@@ -37,5 +37,21 @@ rdma:
   resourceName: rdma/ib
   count: 1
 
+# REQUIRED: at least one mount entry.
+config:
+  mounts:
+    - name: models
+      mountpoint: /mnt/nvme/blobcache-mnt/models
+      account: "<storage-account>"       # <— your account name
+      container: models
+      prefix: ""
+      # sasToken: ""                     # optional; omit for managed identity
+
 # Example: tighter logging on a stable cluster.
 # rustLog: "info"
+
+# Example: pin to a specific image digest instead of the rolling :main tag.
+# image:
+#   blobcached:
+#     repository: ghcr.io/edwardsp/blobcache
+#     tag: "sha-da10404"

@@ -1,0 +1,84 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "blobcache.fullname" . }}-blobcached
+  namespace: {{ include "blobcache.namespace" . }}
+  labels:
+    {{- include "blobcache.labels" . | nindent 4 }}
+    app.kubernetes.io/component: blobcached
+data:
+  blobcached.toml: |
+    # Rendered by Helm. node_id is omitted; the daemon falls back to hostname()
+    # which, with hostNetwork=true, equals the Kubernetes node name.
+
+    [cache]
+    dir = {{ .Values.config.cache.dir | quote }}
+    max_bytes = {{ printf "%d" (int64 .Values.config.cache.maxBytes) }}
+    chunk_size = {{ printf "%d" (int64 .Values.config.cache.chunkSize) }}
+
+    [azure]
+    pool_max_idle_per_host = {{ printf "%d" (int64 .Values.config.azure.poolMaxIdlePerHost) }}
+    workers = {{ printf "%d" (int64 .Values.config.azure.workers) }}
+    block_size = {{ printf "%d" (int64 .Values.config.azure.blockSize) }}
+
+    [cluster]
+    bind = {{ .Values.config.cluster.bind | quote }}
+    seeds = [{{ range $i, $s := .Values.config.cluster.seeds }}{{ if $i }}, {{ end }}{{ $s | quote }}{{ end }}]
+    {{- with .Values.config.cluster.advertise }}
+    advertise = {{ . | quote }}
+    {{- end }}
+
+    [transport]
+    kind = {{ .Values.config.transport.kind | quote }}
+    bind = {{ .Values.config.transport.bind | quote }}
+    {{- with .Values.config.transport.advertise }}
+    advertise = [{{ range $i, $s := . }}{{ if $i }}, {{ end }}{{ $s | quote }}{{ end }}]
+    {{- end }}
+    chunk_concurrency = {{ printf "%d" (int64 .Values.config.transport.chunkConcurrency) }}
+    peer_concurrency = {{ printf "%d" (int64 .Values.config.transport.peerConcurrency) }}
+    {{- with .Values.config.transport.prefetchDepth }}
+    prefetch_depth = {{ printf "%d" (int64 .) }}
+    {{- end }}
+    {{- with .Values.config.transport.prefetchThreshold }}
+    prefetch_threshold = {{ printf "%d" (int64 .) }}
+    {{- end }}
+    {{- with .Values.config.transport.prefetchConcurrency }}
+    prefetch_concurrency = {{ printf "%d" (int64 .) }}
+    {{- end }}
+    {{- with .Values.config.transport.bloomBits }}
+    bloom_bits = {{ printf "%d" (int64 .) }}
+    {{- end }}
+    {{- with .Values.config.transport.bloomRebuildSecs }}
+    bloom_rebuild_secs = {{ printf "%d" (int64 .) }}
+    {{- end }}
+    {{- with .Values.config.transport.bloomPullSecs }}
+    bloom_pull_secs = {{ printf "%d" (int64 .) }}
+    {{- end }}
+    {{- with .Values.config.transport.peerMaxCandidates }}
+    peer_max_candidates = {{ printf "%d" (int64 .) }}
+    {{- end }}
+    {{- with .Values.config.transport.peerMaxYesAttempts }}
+    peer_max_yes_attempts = {{ printf "%d" (int64 .) }}
+    {{- end }}
+    {{- with .Values.config.transport.peerMaxMaybeAttempts }}
+    peer_max_maybe_attempts = {{ printf "%d" (int64 .) }}
+    {{- end }}
+    {{- with .Values.config.transport.stampedeWaitMs }}
+    stampede_wait_ms = {{ printf "%d" (int64 .) }}
+    {{- end }}
+
+    [stats]
+    bind = {{ .Values.config.stats.bind | quote }}
+
+    {{- range .Values.config.mounts }}
+
+    [[mounts]]
+    name = {{ .name | quote }}
+    mountpoint = {{ .mountpoint | quote }}
+    account = {{ .account | quote }}
+    container = {{ .container | quote }}
+    prefix = {{ default "" .prefix | quote }}
+    {{- with .sasToken }}
+    sas_token = {{ . | quote }}
+    {{- end }}
+    {{- end }}

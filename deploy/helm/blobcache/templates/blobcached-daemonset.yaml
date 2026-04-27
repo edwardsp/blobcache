@@ -16,10 +16,17 @@ spec:
       labels:
         {{- include "blobcache.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: blobcached
+      annotations:
+        # Roll pods when the rendered blobcached.toml changes.
+        checksum/config: {{ include (print $.Template.BasePath "/blobcached-configmap.yaml") . | sha256sum }}
     spec:
       hostNetwork: true
       hostPID: false
       dnsPolicy: ClusterFirstWithHostNet
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       {{- if or .Values.nodeSelector.agentPoolValue (and .Values.nodeSelector.testLabelKey .Values.nodeSelector.testLabelValue) }}
       nodeSelector:
         {{- if .Values.nodeSelector.agentPoolValue }}
@@ -37,6 +44,9 @@ spec:
         - name: blobcached
           image: "{{ .Values.image.blobcached.repository }}:{{ .Values.image.blobcached.tag }}"
           imagePullPolicy: {{ .Values.image.blobcached.pullPolicy }}
+          # Image entrypoint is /usr/local/bin/blobcached; CMD defaults to
+          # `--config /etc/blobcached.toml`. Config is mounted from the
+          # ConfigMap below; runtime UCX/FUSE libs are baked into the image.
           securityContext:
             privileged: true
             capabilities:
@@ -48,19 +58,6 @@ spec:
             requests:
               {{ .Values.rdma.resourceName }}: {{ .Values.rdma.count }}
           {{- end }}
-          command: ["/bin/bash", "-c"]
-          args:
-            - |
-              set -eux
-              apt-get update -qq
-              apt-get install -y -qq fuse3 ca-certificates curl jq iproute2 \
-                libucx0 libibverbs1 librdmacm1t64 ucx-utils ibverbs-utils
-              modprobe fuse || true
-              mkdir -p {{ .Values.hostPaths.nvme }}/blobcache-cache {{ .Values.hostPaths.nvme }}/blobcache-mnt
-              echo "container ready; waiting for binary at /opt/blobcache/blobcached"
-              while ! [ -x /opt/blobcache/blobcached ]; do sleep 5; done
-              echo "binary present, launching"
-              exec /opt/blobcache/blobcached --config /opt/blobcache/blobcached.toml
           env:
             - name: RUST_LOG
               value: {{ .Values.rustLog | quote }}
@@ -94,8 +91,10 @@ spec:
               mountPropagation: HostToContainer
             - name: fuse
               mountPath: /dev/fuse
-            - name: opt
-              mountPath: /opt/blobcache
+            - name: config
+              mountPath: /etc/blobcached.toml
+              subPath: blobcached.toml
+              readOnly: true
       volumes:
         - name: nvme
           hostPath:
@@ -103,5 +102,6 @@ spec:
         - name: fuse
           hostPath:
             path: /dev/fuse
-        - name: opt
-          emptyDir: {}
+        - name: config
+          configMap:
+            name: {{ include "blobcache.fullname" . }}-blobcached
