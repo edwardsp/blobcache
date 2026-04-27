@@ -98,7 +98,7 @@ impl RecvSlab {
             | (ucp_mem_map_params_field::UCP_MEM_MAP_PARAM_FIELD_LENGTH.0 as u64)
             | (ucp_mem_map_params_field::UCP_MEM_MAP_PARAM_FIELD_FLAGS.0 as u64);
         params.address = backing.as_ptr() as *mut c_void;
-        params.length = total as u64;
+        params.length = total as _;
         params.flags = UCP_MEM_MAP_NONBLOCK as u32;
 
         let mut memh: ucp_mem_h = ptr::null_mut();
@@ -111,7 +111,7 @@ impl RecvSlab {
                 | (ucp_mem_advise_params_field::UCP_MEM_ADVISE_PARAM_FIELD_LENGTH.0 as u64)
                 | (ucp_mem_advise_params_field::UCP_MEM_ADVISE_PARAM_FIELD_ADVICE.0 as u64);
         advise.address = backing.as_ptr() as *mut c_void;
-        advise.length = total as u64;
+        advise.length = total as _;
         advise.advice = ucp_mem_advice::UCP_MADV_WILLNEED;
         let advise_status = unsafe { ucp_mem_advise(context, memh, &mut advise) };
         if let Err(e) = check_status("ucp_mem_advise(WILLNEED)", advise_status) {
@@ -407,7 +407,7 @@ async fn run_runtime(
     };
 
     let mut worker_addr: *mut ucp_address_t = ptr::null_mut();
-    let mut worker_addr_len: u64 = 0;
+    let mut worker_addr_len: usize = 0;
     let worker_addr_status =
         unsafe { ucp_worker_get_address(ucx.worker, &mut worker_addr, &mut worker_addr_len) };
     if let Err(e) = check_status("ucp_worker_get_address", worker_addr_status) {
@@ -417,7 +417,7 @@ async fn run_runtime(
     }
 
     let worker_addr_blob = unsafe {
-        std::slice::from_raw_parts(worker_addr.cast::<u8>(), worker_addr_len as usize).to_vec()
+        std::slice::from_raw_parts(worker_addr.cast::<u8>(), worker_addr_len).to_vec()
     };
     let state = Rc::new(RefCell::new(RuntimeState::new(
         ucx.worker,
@@ -1245,7 +1245,7 @@ impl UcxRuntime {
             | (ucp_params_field::UCP_PARAM_FIELD_REQUEST_CLEANUP.0 as u64);
         params.features =
             (ucp_feature::UCP_FEATURE_TAG.0 as u64) | (ucp_feature::UCP_FEATURE_WAKEUP.0 as u64);
-        params.request_size = mem::size_of::<RequestState>() as u64;
+        params.request_size = mem::size_of::<RequestState>() as _;
         params.request_init = Some(request_init_cb);
         params.request_cleanup = Some(request_cleanup_cb);
 
@@ -1623,7 +1623,7 @@ extern "C" fn recv_tag_cb(
     complete_request(request, status, length);
 }
 
-fn complete_request(request: *mut c_void, status: ucs_status_t, length: u64) {
+fn complete_request(request: *mut c_void, status: ucs_status_t, length: usize) {
     unsafe {
         let state = request_state_mut(request);
         state.done = true;
