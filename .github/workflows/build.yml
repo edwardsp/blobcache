@@ -19,36 +19,30 @@ jobs:
       matrix:
         include:
           # blobcache is Linux-only: FUSE doesn't exist on macOS/Windows in
-          # the form we use. We build x86_64 (dev/CI) and aarch64 (gb300
-          # cluster target). Each in two variants: tcp-only (no extra deps,
-          # smallest binary) and ucx (RDMA peer transport, the production
-          # build for the cluster).
+          # the form we use. CI builds the tcp-only variant for both the
+          # dev arch (x86_64) and the gb300 cluster target (aarch64). The
+          # ucx variant is intentionally not built here: ucx1-sys vendors
+          # and rebuilds UCX 1.18.1 from source, which fails on modern
+          # GCC's stricter -Werror flags, and even when it builds the
+          # resulting binary has no RDMA support without MOFED on the
+          # build host. UCX builds are produced by the container image
+          # workflow (see deploy/Dockerfile) on a base with the proper
+          # OFED/UCX stack matching the cluster.
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
             features: tcp
-          - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
-            features: ucx
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
             features: tcp
-          - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-24.04-arm
-            features: ucx
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install build deps (FUSE always; UCX when feature enabled)
+      - name: Install build deps
         run: |
           set -euo pipefail
           sudo apt-get update -qq
           sudo apt-get install -y -qq pkg-config libfuse3-dev
-          if [ "${{ matrix.features }}" = "ucx" ]; then
-            # UCX 1.16+ is in noble (24.04). The ucx1-sys crate also needs
-            # libclang for bindgen.
-            sudo apt-get install -y -qq libucx-dev libclang-dev
-          fi
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -61,22 +55,10 @@ jobs:
           key: ${{ matrix.target }}-${{ matrix.features }}
 
       - name: Build
-        run: |
-          set -euo pipefail
-          if [ "${{ matrix.features }}" = "ucx" ]; then
-            cargo build --release --locked --target ${{ matrix.target }} --features ucx
-          else
-            cargo build --release --locked --target ${{ matrix.target }}
-          fi
+        run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Unit tests
-        run: |
-          set -euo pipefail
-          if [ "${{ matrix.features }}" = "ucx" ]; then
-            cargo test --release --locked --target ${{ matrix.target }} --features ucx
-          else
-            cargo test --release --locked --target ${{ matrix.target }}
-          fi
+        run: cargo test --release --locked --target ${{ matrix.target }}
 
       - name: Package
         shell: bash
