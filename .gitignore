@@ -21,3 +21,4 @@ bench/sweep-*
 bench/sweep_*.out
 bench/sweep_workers*.out
 bench/deploy-configs
+docs/INTEGRATION_PLAN.md
