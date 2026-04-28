@@ -48,12 +48,14 @@ pub struct Fetcher {
     prefetch_sem: Arc<Semaphore>,
     prefetch_depth: u32,
     prefetch_threshold: u32,
+    prefetch_origin_only: bool,
 }
 
 #[derive(Clone, Copy)]
 struct SeqState {
     last_end: u64,
     consecutive: u32,
+    blob_streak: u32,
 }
 
 // RAII guard for the leader slot in `inflight`. On drop (panic, cancel, or
@@ -98,6 +100,7 @@ impl Fetcher {
         prefetch_depth: u32,
         prefetch_threshold: u32,
         prefetch_concurrency: usize,
+        prefetch_origin_only: bool,
         peer_index: Arc<PeerIndex>,
         peer_max_candidates: usize,
         peer_max_yes_attempts: usize,
@@ -133,6 +136,7 @@ impl Fetcher {
             prefetch_sem: Arc::new(Semaphore::new(pf_permits)),
             prefetch_depth,
             prefetch_threshold: prefetch_threshold.max(1),
+            prefetch_origin_only,
         }
     }
 
@@ -282,6 +286,19 @@ impl Fetcher {
             )));
         }
         Ok(full.slice(sub_offset as usize..end))
+    }
+
+    fn note_fetch_origin(&self, mount_name: &str, blob_path: &str, from_blob: bool) {
+        let key = format!("{}\0{}", mount_name, blob_path);
+        let mut e = self
+            .seq_state
+            .entry(key)
+            .or_insert(SeqState { last_end: 0, consecutive: 0, blob_streak: 0 });
+        if from_blob {
+            e.blob_streak = e.blob_streak.saturating_add(1);
+        } else {
+            e.blob_streak = 0;
+        }
     }
 
     async fn fetch_chunk_inner(
@@ -497,6 +514,7 @@ impl Fetcher {
         self.stats.blob_fetches.inc();
         self.stats.blob_fetch_bytes.inc_by(data.len() as u64);
         self.spawn_insert(key.clone(), data.clone());
+        self.note_fetch_origin(&key.mount, &key.blob, true);
         Ok(data)
     }
 
@@ -565,6 +583,7 @@ impl Fetcher {
                 self.stats.peer_fetches_ok.inc();
                 self.stats.peer_fetch_bytes.inc_by(data.len() as u64);
                 self.spawn_insert(key.clone(), data.clone());
+                self.note_fetch_origin(&key.mount, &key.blob, false);
                 Ok(Some(data))
             }
             Err(BcError::NotFound(_)) => {
@@ -690,6 +709,7 @@ impl Fetcher {
         self.stats.blob_fetches.inc();
         self.stats.blob_fetch_bytes.inc_by(data.len() as u64);
         self.spawn_insert(key.clone(), data.clone());
+        self.note_fetch_origin(&key.mount, &key.blob, true);
         Ok(data)
     }
 
@@ -832,6 +852,7 @@ impl Fetcher {
             prefetch_sem: self.prefetch_sem.clone(),
             prefetch_depth: self.prefetch_depth,
             prefetch_threshold: self.prefetch_threshold,
+            prefetch_origin_only: self.prefetch_origin_only,
         }
     }
 
@@ -852,11 +873,11 @@ impl Fetcher {
         }
         let cs = self.chunk_size;
         let key = format!("{}\0{}", mount.name, blob_path);
-        let consecutive = {
+        let (consecutive, blob_streak) = {
             let mut e = self
                 .seq_state
                 .entry(key)
-                .or_insert(SeqState { last_end: 0, consecutive: 0 });
+                .or_insert(SeqState { last_end: 0, consecutive: 0, blob_streak: 0 });
             // Sequential = read starts exactly where the previous one ended,
             // or within one chunk ahead (covers FUSE sub-read reordering and
             // small skipped slack from prefetch-warmed reads).
@@ -867,9 +888,13 @@ impl Fetcher {
                 e.consecutive = 1;
             }
             e.last_end = req_end;
-            e.consecutive
+            (e.consecutive, e.blob_streak)
         };
         if consecutive < self.prefetch_threshold {
+            return;
+        }
+        if self.prefetch_origin_only && blob_streak == 0 {
+            self.stats.prefetch_skipped_not_origin.inc();
             return;
         }
 
@@ -901,12 +926,18 @@ impl Fetcher {
             let mc = mount.clone();
             let bp = blob_path.to_string();
             let sem = self.prefetch_sem.clone();
+            let origin_only = self.prefetch_origin_only;
             self.stats.prefetch_spawned.inc();
             tokio::spawn(async move {
                 let Ok(_permit) = sem.acquire_owned().await else {
                     return;
                 };
-                match me.fetch_chunk(&mc, &bp, off, chunk_len).await {
+                let res = if origin_only {
+                    me.fetch_chunk_origin_only(&mc, &bp, off, chunk_len).await
+                } else {
+                    me.fetch_chunk(&mc, &bp, off, chunk_len).await
+                };
+                match res {
                     Ok(_) => me.stats.prefetch_completed_ok.inc(),
                     Err(_) => me.stats.prefetch_completed_err.inc(),
                 }

@@ -44,6 +44,7 @@ pub struct Stats {
     pub prefetch_spawned: IntCounter,
     pub prefetch_skipped_cached: IntCounter,
     pub prefetch_skipped_inflight: IntCounter,
+    pub prefetch_skipped_not_origin: IntCounter,
     pub prefetch_completed_ok: IntCounter,
     pub prefetch_completed_err: IntCounter,
     pub peer_bloom_yes: IntCounter,
@@ -150,6 +151,11 @@ impl Stats {
         let prefetch_skipped_inflight = IntCounter::new(
             "blobcache_prefetch_skipped_inflight_total",
             "prefetch candidates skipped because fetch already in flight",
+        )
+        .unwrap();
+        let prefetch_skipped_not_origin = IntCounter::new(
+            "blobcache_prefetch_skipped_not_origin_total",
+            "prefetch trigger gated off because prefetch_origin_only=true and the stream's recent fetches were not from blob",
         )
         .unwrap();
         let prefetch_completed_ok = IntCounter::new(
@@ -298,6 +304,7 @@ impl Stats {
             &prefetch_spawned,
             &prefetch_skipped_cached,
             &prefetch_skipped_inflight,
+            &prefetch_skipped_not_origin,
             &prefetch_completed_ok,
             &prefetch_completed_err,
             &peer_bloom_yes,
@@ -365,6 +372,7 @@ impl Stats {
             prefetch_spawned,
             prefetch_skipped_cached,
             prefetch_skipped_inflight,
+            prefetch_skipped_not_origin,
             prefetch_completed_ok,
             prefetch_completed_err,
             peer_bloom_yes,

@@ -147,6 +147,7 @@ config:
     prefetchDepth: 0
     prefetchThreshold: 3
     prefetchConcurrency: 4
+    prefetchOriginOnly: false
     bloomBits: 8388608          # 1 MiB / peer
     bloomRebuildSecs: 30
     bloomPullSecs: 5

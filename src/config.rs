@@ -95,6 +95,12 @@ pub struct TransportConfig {
     pub prefetch_threshold: u32,
     #[serde(default = "default_prefetch_concurrency")]
     pub prefetch_concurrency: usize,
+    /// When true: (1) prefetch only triggers on streams whose recent fetches
+    /// came from Azure Blob (a peer-fetch success resets the streak to 0); and
+    /// (2) prefetched chunks themselves use the origin-only fetch path,
+    /// bypassing peer fan-out and stampede-leader hops. Default false.
+    #[serde(default)]
+    pub prefetch_origin_only: bool,
     #[serde(default = "default_transport_kind")]
     pub kind: String,
     #[serde(default = "default_bloom_bits")]

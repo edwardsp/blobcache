@@ -47,6 +47,9 @@ data:
     {{- with .Values.config.transport.prefetchConcurrency }}
     prefetch_concurrency = {{ printf "%d" (int64 .) }}
     {{- end }}
+    {{- if .Values.config.transport.prefetchOriginOnly }}
+    prefetch_origin_only = true
+    {{- end }}
     {{- with .Values.config.transport.bloomBits }}
     bloom_bits = {{ printf "%d" (int64 .) }}
     {{- end }}
