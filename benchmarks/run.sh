@@ -154,6 +154,12 @@ run_pass() {
 START=\$(date +%s.%N)
 TOTAL=0
 COUNT=0
+# Background heartbeat keeps the kubectl exec websocket alive; without it
+# the apiserver SPDY/websocket idle-timeout (3 min) tears down long reads
+# even though the cat is still progressing on the pod.
+( while :; do sleep 30; echo HB \$(date +%s); done ) &
+HB_PID=\$!
+trap 'kill \$HB_PID 2>/dev/null' EXIT
 for f in /mnt/nvme/blobcache-mnt/${MOUNT}/${PATH_PREFIX}${READ_GLOB}; do
   [ -e \"\$f\" ] || continue
   S=\$(stat -c %s \"\$f\")
@@ -163,8 +169,9 @@ for f in /mnt/nvme/blobcache-mnt/${MOUNT}/${PATH_PREFIX}${READ_GLOB}; do
 done
 END=\$(date +%s.%N)
 WALL=\$(awk -v a=\"\$END\" -v b=\"\$START\" 'BEGIN{printf \"%.3f\", a-b}')
-echo \"files=\$COUNT bytes=\$TOTAL wall_s=\$WALL\"
-" 2>&1)
+kill \$HB_PID 2>/dev/null
+echo \"RESULT files=\$COUNT bytes=\$TOTAL wall_s=\$WALL\"
+" 2>&1 | grep -E '^RESULT')
       printf '%s\t%s\t%s\n' "$pod" "$node" "$OUT" >>"$tsv"
     ) &
   done <"$OUT_DIR/${TAG}-podnodes.txt"
