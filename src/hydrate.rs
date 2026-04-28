@@ -15,7 +15,14 @@ use crate::fetcher::Fetcher;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChunkSpec {
@@ -36,6 +43,8 @@ pub struct HydrateShardResponse {
     pub bytes: u64,
     pub errors: Vec<String>,
     pub elapsed_ms: u64,
+    pub start_unix_ms: u64,
+    pub end_unix_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,6 +64,8 @@ pub struct PerPeerStats {
     pub bytes: u64,
     pub errors: Vec<String>,
     pub elapsed_ms: u64,
+    pub start_unix_ms: u64,
+    pub end_unix_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,6 +90,7 @@ pub async fn run_shard(
     mounts: Arc<HashMap<String, MountConfig>>,
 ) -> HydrateShardResponse {
     let t0 = Instant::now();
+    let start_unix_ms = now_unix_ms();
     let mount = match mounts.get(&req.mount) {
         Some(m) => m.clone(),
         None => {
@@ -87,6 +99,8 @@ pub async fn run_shard(
                 bytes: 0,
                 errors: vec![format!("unknown mount {}", req.mount)],
                 elapsed_ms: 0,
+                start_unix_ms,
+                end_unix_ms: now_unix_ms(),
             };
         }
     };
@@ -95,7 +109,12 @@ pub async fn run_shard(
         let f = fetcher.clone();
         let m = mount.clone();
         handles.push(tokio::spawn(async move {
+            let permit = match f.acquire_chunk_permit().await {
+                Ok(p) => p,
+                Err(e) => return (c, Err(e)),
+            };
             let res = f.fetch_chunk(&m, &c.blob, c.offset, c.len).await;
+            drop(permit);
             (c, res)
         }));
     }
@@ -130,6 +149,8 @@ pub async fn run_shard(
         bytes,
         errors,
         elapsed_ms: t0.elapsed().as_millis() as u64,
+        start_unix_ms,
+        end_unix_ms: now_unix_ms(),
     }
 }
 
@@ -263,6 +284,8 @@ pub async fn run_coordinator(
                     bytes: r.bytes,
                     errors: r.errors,
                     elapsed_ms: r.elapsed_ms,
+                    start_unix_ms: r.start_unix_ms,
+                    end_unix_ms: r.end_unix_ms,
                 }
             }));
         } else {
@@ -285,6 +308,7 @@ pub async fn run_coordinator(
                     chunks,
                 };
                 let t0 = Instant::now();
+                let post_start_unix_ms = now_unix_ms();
                 let resp = http
                     .post(&endpoint)
                     .json(&body)
@@ -300,6 +324,8 @@ pub async fn run_coordinator(
                             bytes: s.bytes,
                             errors: s.errors,
                             elapsed_ms: s.elapsed_ms,
+                            start_unix_ms: s.start_unix_ms,
+                            end_unix_ms: s.end_unix_ms,
                         },
                         Err(e) => PerPeerStats {
                             node_id,
@@ -308,6 +334,8 @@ pub async fn run_coordinator(
                             bytes: 0,
                             errors: vec![format!("decode: {e}")],
                             elapsed_ms: t0.elapsed().as_millis() as u64,
+                            start_unix_ms: post_start_unix_ms,
+                            end_unix_ms: now_unix_ms(),
                         },
                     },
                     Err(e) => PerPeerStats {
@@ -317,6 +345,8 @@ pub async fn run_coordinator(
                         bytes: 0,
                         errors: vec![format!("post: {e}")],
                         elapsed_ms: t0.elapsed().as_millis() as u64,
+                        start_unix_ms: post_start_unix_ms,
+                        end_unix_ms: now_unix_ms(),
                     },
                 }
             }));
@@ -347,6 +377,8 @@ pub async fn run_coordinator(
                     bytes: 0,
                     errors: vec![format!("join: {e}")],
                     elapsed_ms: 0,
+                    start_unix_ms: 0,
+                    end_unix_ms: 0,
                 }),
             }
         }
@@ -367,6 +399,8 @@ pub async fn run_coordinator(
                     "coordinator timeout after {global_timeout_secs}s; aborted outstanding shards"
                 )],
                 elapsed_ms: global_timeout.as_millis() as u64,
+                start_unix_ms: 0,
+                end_unix_ms: now_unix_ms(),
             });
         }
     }

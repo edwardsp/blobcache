@@ -153,6 +153,21 @@ impl Fetcher {
         res
     }
 
+    /// Acquire a `chunk_concurrency` permit. Used by hydrate to gate the
+    /// per-shard fan-out (which spawns one task per assigned chunk and would
+    /// otherwise issue an unbounded burst of in-flight blob GETs through a
+    /// single reqwest pool — see `hydrate::run_shard`). The FUSE read fan-out
+    /// (`fetch_chunk_range`) and the prefetch worker acquire the same
+    /// semaphore directly, so all three paths share the per-pod `chunk_sem`
+    /// budget.
+    pub async fn acquire_chunk_permit(&self) -> Result<tokio::sync::OwnedSemaphorePermit> {
+        self.chunk_sem
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|e| BcError::Other(format!("chunk_sem closed: {e}")))
+    }
+
     /// Like `fetch_chunk` but returns only `[sub_offset, sub_offset+sub_len)`
     /// of the chunk. On a cache hit it issues a single pread() of just the
     /// requested slice, avoiding the 32x read amplification when FUSE splits
