@@ -596,6 +596,38 @@ pub async fn serve(
                                             .unwrap(),
                                     }
                                 }
+                                (&Method::POST, "/clear-cache") => {
+                                    match crate::clear::run_coordinator(
+                                        fetcher.clone(),
+                                        membership.clone(),
+                                        me_id.clone(),
+                                        hydrate_http.clone(),
+                                    )
+                                    .await
+                                    {
+                                        Ok(r) => {
+                                            let body = serde_json::to_vec(&r).unwrap();
+                                            Response::builder()
+                                                .status(200)
+                                                .header("content-type", "application/json")
+                                                .body(Full::new(Bytes::from(body)))
+                                                .unwrap()
+                                        }
+                                        Err(e) => Response::builder()
+                                            .status(500)
+                                            .body(Full::new(Bytes::from(format!("{e}"))))
+                                            .unwrap(),
+                                    }
+                                }
+                                (&Method::POST, "/clear-cache-shard") => {
+                                    let r = crate::clear::run_shard(fetcher.clone()).await;
+                                    let body = serde_json::to_vec(&r).unwrap();
+                                    Response::builder()
+                                        .status(200)
+                                        .header("content-type", "application/json")
+                                        .body(Full::new(Bytes::from(body)))
+                                        .unwrap()
+                                }
                                 (&Method::POST, "/hydrate-shard") => {
                                     let body = match req.into_body().collect().await {
                                         Ok(c) => c.to_bytes(),

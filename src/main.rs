@@ -9,6 +9,7 @@ mod auth;
 mod azure;
 mod blob_fetcher_pool;
 mod cache;
+mod clear;
 mod cluster;
 mod config;
 mod error;

@@ -346,6 +346,46 @@ impl DiskCache {
         Ok(())
     }
 
+    /// Drop every cached chunk: remove tracked files, clear the LRU/entries
+    /// maps, reset bytes_in_use to zero, and sweep any stray files left in
+    /// the cache root (mirrors scan_existing's behaviour). Used by the
+    /// /clear-cache admin endpoint to reproducibly return a node to the
+    /// post-startup empty state without restarting the daemon. Concurrent
+    /// inserts may briefly race past the lock release; the next /clear-cache
+    /// or scan_existing call will sweep any survivors.
+    pub fn clear_all(self: &Arc<Self>) -> Result<(u64, u64)> {
+        let mut g = self.inner.lock();
+        let mut removed_files = 0u64;
+        let mut removed_bytes = 0u64;
+        let keys: Vec<ChunkKey> = g.entries.keys().cloned().collect();
+        for k in keys {
+            if let Some(e) = g.entries.remove(&k) {
+                let p = self.path_for(&k);
+                if std::fs::remove_file(&p).is_ok() {
+                    removed_files += 1;
+                    removed_bytes = removed_bytes.saturating_add(e.size);
+                }
+                g.lru.remove(&e.last_access_seq);
+            }
+        }
+        g.bytes = 0;
+        g.lru.clear();
+        self.stats.bytes_in_use.store(0, Ordering::Relaxed);
+        drop(g);
+        // Sweep any stray files (untracked tmp files, files left by a
+        // concurrent inserter, or pre-existing junk). Mirrors scan_existing.
+        if let Ok(rd) = std::fs::read_dir(&self.root) {
+            for e in rd.flatten() {
+                if let Ok(m) = e.metadata() {
+                    if m.is_file() {
+                        let _ = std::fs::remove_file(e.path());
+                    }
+                }
+            }
+        }
+        Ok((removed_files, removed_bytes))
+    }
+
     pub fn local_path(&self, key: &ChunkKey) -> Option<PathBuf> {
         let p = self.path_for(key);
         if p.exists() {

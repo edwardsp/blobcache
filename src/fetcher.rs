@@ -759,6 +759,21 @@ impl Fetcher {
         }
     }
 
+    /// Drain any in-flight insert tasks, drop the on-disk cache, and reset
+    /// the in-memory fetcher state (singleflight inflight map, prefetch
+    /// sequential-read tracker) so subsequent reads start cold. Bumps the
+    /// local bloom (rebuilt from the now-empty cache) so peers stop directing
+    /// requests here for cleared keys. Used by /clear-cache.
+    pub async fn clear_local_state(&self) -> Result<(u64, u64)> {
+        self.await_inserts_drained().await;
+        let (files, bytes) = self.cache.clear_all()?;
+        self.inflight.lock().clear();
+        self.inflight_writes.clear();
+        self.seq_state.clear();
+        self.peer_index.rebuild_local_from_cache(&self.cache);
+        Ok((files, bytes))
+    }
+
     pub async fn fetch_range(
         &self,
         mount: &MountConfig,
