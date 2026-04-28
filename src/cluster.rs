@@ -170,8 +170,14 @@ impl Membership {
             match g.members.get(&n.id) {
                 Some(existing) => {
                     let inc_better = n.incarnation > existing.incarnation;
+                    // SWIM freshness guard: at equal incarnation, a more-severe state
+                    // only wins if its observation is at least as fresh. Without this,
+                    // a stale Dead payload propagated through gossip clobbers a fresh
+                    // Alive set by direct touch_peer from the recovered node, causing
+                    // perpetual flapping and a partitioned membership after any restart.
                     let same_inc_more_severe = n.incarnation == existing.incarnation
-                        && n.state.rank() > existing.state.rank();
+                        && n.state.rank() > existing.state.rank()
+                        && n.last_seen_unix >= existing.last_seen_unix;
                     let same_state_fresher = n.incarnation == existing.incarnation
                         && n.state == existing.state
                         && n.last_seen_unix > existing.last_seen_unix;
