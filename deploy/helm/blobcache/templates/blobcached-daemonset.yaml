@@ -85,6 +85,16 @@ spec:
               value: {{ .Values.ucx.maxRndvRails | quote }}
             - name: UCX_LOG_LEVEL
               value: {{ .Values.ucx.logLevel | quote }}
+          ports:
+            - name: gossip
+              containerPort: 7771
+              protocol: TCP
+            - name: peer
+              containerPort: 7772
+              protocol: TCP
+            - name: stats
+              containerPort: 7773
+              protocol: TCP
           volumeMounts:
             - name: nvme
               mountPath: {{ .Values.hostPaths.nvme }}

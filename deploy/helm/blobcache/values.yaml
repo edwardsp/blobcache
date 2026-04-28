@@ -81,6 +81,30 @@ rdma:
 hostPaths:
   nvme: /mnt/nvme
 
+# -- Observability. When `enabled`, renders a `PodMonitor` (scraping each
+# blobcached pod's :7773/metrics endpoint) and a Grafana dashboard
+# `ConfigMap` (auto-imported by the standard kube-prometheus Grafana
+# sidecar via the `grafana_dashboard: "1"` label).
+#
+# `podMonitor.releaseLabel` MUST match your Prometheus instance's
+# `podMonitorSelector` — for kube-prometheus-stack the convention is
+# `release: <helm-release-name>` (default: `kube-prometheus`).
+#
+# `grafanaDashboard.namespace` controls where the dashboard CM is created.
+# kube-prometheus's Grafana sidecar runs with `NAMESPACE=ALL` by default
+# so any namespace works; leave empty to use the chart's namespace.
+monitoring:
+  enabled: true
+  podMonitor:
+    interval: 15s
+    scrapeTimeout: 10s
+    releaseLabel: kube-prometheus
+  grafanaDashboard:
+    enabled: true
+    namespace: ""               # blank = chart namespace
+    folder: blobcache
+    datasourceName: Prometheus  # must match your Grafana datasource name
+
 # -- blobcached.toml contents, rendered into a ConfigMap and mounted at
 # /etc/blobcached.toml. `node_id` is intentionally omitted: the daemon
 # falls back to hostname() which, with hostNetwork=true, equals the
@@ -88,7 +112,13 @@ hostPaths:
 config:
   cache:
     dir: /mnt/nvme/blobcache-cache
-    maxBytes: 107374182400      # 100 GiB
+    # 10 TiB. The nvme-raid-init DS assembles ~14 TiB of striped NVMe at
+    # /mnt/nvme on each gb300 node; this leaves filesystem headroom while
+    # letting working sets up to ~10 TiB stay locally cached after the
+    # first read (eliminates RDMA peer-fetches for re-reads of the same
+    # dataset). Lower this if you're sharing the RAID with other
+    # workloads.
+    maxBytes: 10995116277760    # 10 TiB
     chunkSize: 4194304          # 4 MiB; MUST match across cluster
   azure:
     poolMaxIdlePerHost: 512

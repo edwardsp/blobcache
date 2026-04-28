@@ -1,0 +1,30 @@
+{{- if .Values.monitoring.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: {{ include "blobcache.fullname" . }}-blobcached
+  namespace: {{ include "blobcache.namespace" . }}
+  labels:
+    {{- include "blobcache.labels" . | nindent 4 }}
+    app.kubernetes.io/component: blobcached
+    release: {{ .Values.monitoring.podMonitor.releaseLabel }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "blobcache.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: blobcached
+  namespaceSelector:
+    matchNames:
+      - {{ include "blobcache.namespace" . }}
+  podMetricsEndpoints:
+    - port: stats
+      path: /metrics
+      interval: {{ .Values.monitoring.podMonitor.interval }}
+      scrapeTimeout: {{ .Values.monitoring.podMonitor.scrapeTimeout }}
+      honorLabels: true
+      relabelings:
+        - sourceLabels: [__meta_kubernetes_pod_node_name]
+          targetLabel: node
+        - sourceLabels: [__meta_kubernetes_pod_name]
+          targetLabel: pod
+{{- end }}

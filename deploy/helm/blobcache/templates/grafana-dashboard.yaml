@@ -1,0 +1,187 @@
+{{- if and .Values.monitoring.enabled .Values.monitoring.grafanaDashboard.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "blobcache.fullname" . }}-grafana-dashboard
+  namespace: {{ default (include "blobcache.namespace" .) .Values.monitoring.grafanaDashboard.namespace }}
+  labels:
+    {{- include "blobcache.labels" . | nindent 4 }}
+    app.kubernetes.io/component: grafana-dashboard
+    grafana_dashboard: "1"
+  annotations:
+    grafana_folder: {{ .Values.monitoring.grafanaDashboard.folder | quote }}
+data:
+  blobcache.json: |
+    {
+      "title": "blobcache",
+      "uid": "blobcache-overview",
+      "schemaVersion": 39,
+      "timezone": "",
+      "refresh": "10s",
+      "time": { "from": "now-15m", "to": "now" },
+      "templating": {
+        "list": [
+          {
+            "name": "datasource",
+            "type": "datasource",
+            "query": "prometheus",
+            "current": { "text": {{ .Values.monitoring.grafanaDashboard.datasourceName | quote }}, "value": {{ .Values.monitoring.grafanaDashboard.datasourceName | quote }} },
+            "hide": 0
+          },
+          {
+            "name": "node",
+            "type": "query",
+            "datasource": { "type": "prometheus", "uid": "${datasource}" },
+            "query": "label_values(blobcache_cache_bytes, node)",
+            "refresh": 2,
+            "includeAll": true,
+            "multi": true,
+            "current": { "text": "All", "value": "$__all" }
+          }
+        ]
+      },
+      "panels": [
+        {
+          "title": "Cluster aggregate FUSE read throughput",
+          "type": "timeseries",
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+          "fieldConfig": { "defaults": { "unit": "binBps" } },
+          "targets": [
+            { "expr": "sum(rate(blobcache_fuse_read_bytes_total[1m]))", "legendFormat": "fuse_read_bytes/s (cluster)" },
+            { "expr": "sum(rate(blobcache_peer_chunk_bytes_served_total[1m]))", "legendFormat": "peer_served/s (cluster)" },
+            { "expr": "sum(rate(blobcache_blob_fetch_bytes_total[1m]))", "legendFormat": "azure_blob/s (cluster)" }
+          ]
+        },
+        {
+          "title": "Per-node FUSE read BW",
+          "type": "timeseries",
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+          "fieldConfig": { "defaults": { "unit": "binBps" } },
+          "targets": [
+            { "expr": "sum by (node) (rate(blobcache_fuse_read_bytes_total{node=~\"$node\"}[1m]))", "legendFormat": "{{`{{`}}node{{`}}`}}" }
+          ]
+        },
+        {
+          "title": "Cache hit ratio",
+          "type": "timeseries",
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "gridPos": { "h": 8, "w": 8, "x": 0, "y": 8 },
+          "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1 } },
+          "targets": [
+            { "expr": "sum by (node) (rate(blobcache_cache_hits_total{node=~\"$node\"}[1m])) / clamp_min(sum by (node) (rate(blobcache_cache_hits_total{node=~\"$node\"}[1m]) + rate(blobcache_cache_misses_total{node=~\"$node\"}[1m])), 1)", "legendFormat": "{{`{{`}}node{{`}}`}}" }
+          ]
+        },
+        {
+          "title": "Cache bytes used / evictions",
+          "type": "timeseries",
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "gridPos": { "h": 8, "w": 8, "x": 8, "y": 8 },
+          "fieldConfig": { "defaults": { "unit": "bytes" } },
+          "targets": [
+            { "expr": "blobcache_cache_bytes{node=~\"$node\"}", "legendFormat": "{{`{{`}}node{{`}}`}} bytes" },
+            { "expr": "rate(blobcache_cache_evictions_total{node=~\"$node\"}[1m])", "legendFormat": "{{`{{`}}node{{`}}`}} evict/s" }
+          ]
+        },
+        {
+          "title": "Cluster members alive",
+          "type": "stat",
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "gridPos": { "h": 8, "w": 8, "x": 16, "y": 8 },
+          "fieldConfig": { "defaults": { "unit": "short" } },
+          "targets": [
+            { "expr": "min(blobcache_cluster_members_alive)" }
+          ]
+        },
+        {
+          "title": "Peer fetch outcomes (cluster, ops/s)",
+          "type": "timeseries",
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+          "fieldConfig": { "defaults": { "unit": "ops" } },
+          "targets": [
+            { "expr": "sum(rate(blobcache_peer_fetches_ok_total[1m]))",   "legendFormat": "ok" },
+            { "expr": "sum(rate(blobcache_peer_fetches_miss_total[1m]))", "legendFormat": "miss" },
+            { "expr": "sum(rate(blobcache_peer_fetches_err_total[1m]))",  "legendFormat": "err" }
+          ]
+        },
+        {
+          "title": "FUSE read latency (cluster p50 / p99)",
+          "type": "timeseries",
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+          "fieldConfig": { "defaults": { "unit": "s" } },
+          "targets": [
+            { "expr": "histogram_quantile(0.50, sum by (le) (rate(blobcache_fuse_read_seconds_bucket[1m])))", "legendFormat": "p50" },
+            { "expr": "histogram_quantile(0.99, sum by (le) (rate(blobcache_fuse_read_seconds_bucket[1m])))", "legendFormat": "p99" }
+          ]
+        },
+        {
+          "title": "Peer chunk fetch latency (cluster p50 / p99)",
+          "type": "timeseries",
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
+          "fieldConfig": { "defaults": { "unit": "s" } },
+          "targets": [
+            { "expr": "histogram_quantile(0.50, sum by (le) (rate(blobcache_chunk_peer_fetch_seconds_bucket[1m])))", "legendFormat": "p50" },
+            { "expr": "histogram_quantile(0.99, sum by (le) (rate(blobcache_chunk_peer_fetch_seconds_bucket[1m])))", "legendFormat": "p99" }
+          ]
+        },
+        {
+          "title": "Azure blob retries / give-ups",
+          "type": "timeseries",
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
+          "fieldConfig": { "defaults": { "unit": "ops" } },
+          "targets": [
+            { "expr": "sum by (status) (rate(blobcache_blob_request_status_total[1m]))", "legendFormat": "status={{`{{`}}status{{`}}`}}" },
+            { "expr": "sum(rate(blobcache_blob_request_giveups_total[1m]))",             "legendFormat": "giveups/s" },
+            { "expr": "sum(rate(blobcache_blob_retry_sleep_seconds_total[1m]))",         "legendFormat": "retry_sleep_s/s" }
+          ]
+        },
+        {
+          "title": "Azure blob download BW per node",
+          "type": "timeseries",
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 32 },
+          "fieldConfig": { "defaults": { "unit": "binBps" } },
+          "targets": [
+            { "expr": "sum by (node) (rate(blobcache_blob_fetch_bytes_total{node=~\"$node\"}[1m]))", "legendFormat": "{{`{{`}}node{{`}}`}}" }
+          ]
+        },
+        {
+          "title": "Azure blob downloads (aggregate BW + cumulative bytes)",
+          "type": "timeseries",
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 32 },
+          "fieldConfig": { "defaults": { "unit": "binBps" } },
+          "targets": [
+            { "expr": "sum(rate(blobcache_blob_fetch_bytes_total[1m]))", "legendFormat": "cluster BW (B/s)" },
+            { "expr": "sum(rate(blobcache_blob_fetches_total[1m]))",     "legendFormat": "cluster fetch ops/s" }
+          ]
+        },
+        {
+          "title": "Total bytes downloaded from Azure (cumulative)",
+          "type": "stat",
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "gridPos": { "h": 4, "w": 8, "x": 0, "y": 40 },
+          "fieldConfig": { "defaults": { "unit": "bytes" } },
+          "targets": [
+            { "expr": "sum(blobcache_blob_fetch_bytes_total)", "legendFormat": "cluster total" }
+          ]
+        },
+        {
+          "title": "Bytes downloaded from Azure per node (cumulative)",
+          "type": "bargauge",
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "gridPos": { "h": 8, "w": 16, "x": 8, "y": 40 },
+          "fieldConfig": { "defaults": { "unit": "bytes" } },
+          "options": { "orientation": "horizontal", "displayMode": "gradient" },
+          "targets": [
+            { "expr": "sum by (node) (blobcache_blob_fetch_bytes_total{node=~\"$node\"})", "legendFormat": "{{`{{`}}node{{`}}`}}" }
+          ]
+        }
+      ]
+    }
+{{- end }}
