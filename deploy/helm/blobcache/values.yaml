@@ -129,11 +129,11 @@ config:
     # dataset). Lower this if you're sharing the RAID with other
     # workloads.
     maxBytes: 10995116277760    # 10 TiB
-    chunkSize: 4194304          # 4 MiB; MUST match across cluster
+    chunkSize: 67108864         # 64 MiB; MUST match across cluster
   azure:
     poolMaxIdlePerHost: 512
-    workers: 1                  # see BENCHMARKS § v2.9 for tuning
-    blockSize: 0                # 0 = use cache.chunkSize
+    workers: 8                  # see BENCHMARKS § v2.9 for tuning
+    blockSize: 67108864         # 64 MiB; 0 = use cache.chunkSize
   cluster:
     bind: "0.0.0.0:7771"
     seeds: []                   # e.g. ["http://10.0.0.5:7771"]
@@ -143,10 +143,10 @@ config:
     bind: "0.0.0.0:7772"
     advertise: []               # e.g. ["http://10.0.0.6:7772"]
     chunkConcurrency: 32
-    peerConcurrency: 8
+    peerConcurrency: 32
     prefetchDepth: 16
     prefetchThreshold: 3
-    prefetchConcurrency: 32
+    prefetchConcurrency: 4
     bloomBits: 8388608          # 1 MiB / peer
     bloomRebuildSecs: 30
     bloomPullSecs: 5
