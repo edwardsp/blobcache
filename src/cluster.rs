@@ -169,19 +169,21 @@ impl Membership {
             }
             match g.members.get(&n.id) {
                 Some(existing) => {
-                    let inc_better = n.incarnation > existing.incarnation;
-                    // SWIM freshness guard: at equal incarnation, a more-severe state
-                    // only wins if its observation is at least as fresh. Without this,
-                    // a stale Dead payload propagated through gossip clobbers a fresh
-                    // Alive set by direct touch_peer from the recovered node, causing
-                    // perpetual flapping and a partitioned membership after any restart.
-                    let same_inc_more_severe = n.incarnation == existing.incarnation
-                        && n.state.rank() > existing.state.rank()
-                        && n.last_seen_unix >= existing.last_seen_unix;
-                    let same_state_fresher = n.incarnation == existing.incarnation
-                        && n.state == existing.state
-                        && n.last_seen_unix > existing.last_seen_unix;
-                    if inc_better || same_inc_more_severe || same_state_fresher {
+                    // SWIM merge precedence:
+                    //   1. higher incarnation always wins (definitive refresh)
+                    //   2. same incarnation: freshest last_seen wins (recency beats stale rank)
+                    //   3. same incarnation AND same timestamp: more-severe state wins (rank tiebreak)
+                    // Without rule 2, stale Dead@old records persist after a peer recovers
+                    // (fresh Alive can't satisfy any branch) AND fresh Alive observations
+                    // get clobbered by stale Dead replies (rank-only check), partitioning
+                    // membership permanently after any rolling restart.
+                    let should_update = n.incarnation > existing.incarnation
+                        || (n.incarnation == existing.incarnation
+                            && n.last_seen_unix > existing.last_seen_unix)
+                        || (n.incarnation == existing.incarnation
+                            && n.last_seen_unix == existing.last_seen_unix
+                            && n.state.rank() > existing.state.rank());
+                    if should_update {
                         #[cfg(feature = "ucx")]
                         let should_ensure = existing.ucx_worker_addr_b64 != n.ucx_worker_addr_b64;
                         g.members.insert(n.id.clone(), n.clone());
