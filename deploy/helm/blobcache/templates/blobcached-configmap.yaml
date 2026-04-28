@@ -38,6 +38,8 @@ data:
     peer_concurrency = {{ printf "%d" (int64 .Values.config.transport.peerConcurrency) }}
     {{- with .Values.config.transport.prefetchDepth }}
     prefetch_depth = {{ printf "%d" (int64 .) }}
+    {{- else }}
+    prefetch_depth = 0
     {{- end }}
     {{- with .Values.config.transport.prefetchThreshold }}
     prefetch_threshold = {{ printf "%d" (int64 .) }}

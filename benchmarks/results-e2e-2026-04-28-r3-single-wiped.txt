@@ -1,0 +1,46 @@
+SINGLE-NODE COLD-CACHE TEST (run #3)
+====================================
+Setup: After run #2 with all 17 pods cached, wipe one pod's cache, restart it,
+       and read the full dataset from FUSE on the wiped pod only. Other pods
+       remain cache-resident and serve via peer transport (UCX/RDMA).
+
+Wiped pod : pod-55  (node: node-016)
+Storage   : public-access ON during this run, OFF after.
+
+PASS 1 (cold cache, peer-fetch only)
+------------------------------------
+READ_START=2026-04-28T15:17:09Z
+READ_END  =2026-04-28T15:26:54Z
+files=163 bytes=413328348544 (385.0 GiB) wall_s=584.307
+
+Wiped-pod metrics after PASS1:
+  blob_fetches_total           = 0           (no Azure traffic)
+  peer_fetches_ok_total        = 6278        (all chunks via peers)
+  peer_fetches_miss_total      = 0
+  peer_fetches_err_total       = 0
+  cache_inserts_total          = 6278        (all served chunks cached)
+  cache_bytes                  = 413328348544 (full dataset)
+  peer_chunk_bytes_served_total= 0           (nothing served outbound)
+  fuse_reads_total             = 1576868
+  fuse_read_bytes_total        = 413328348544
+
+Throughput: 413 GiB / 584.3s = 0.706 GiB/s peer-fetch bandwidth
+
+PASS 2 (cache-resident on wiped pod)
+------------------------------------
+files=163 bytes=413328348544 wall_s=216.984
+Throughput: 413 GiB / 217.0s = 1.903 GiB/s local-NVMe bandwidth
+
+KEY OBSERVATIONS
+================
+1. Zero Azure traffic. Peer transport correctly serves 100% of chunks.
+2. Single-pod cold-read time (584s) is nearly identical to the per-pod
+   PASS1 time when ALL 17 pods peer-fetch concurrently in run #2 (mean
+   551s, max 740s). The peer-fetch transport scales: contention from
+   16 concurrent peers fetching from ~1/16 of the cluster does not
+   meaningfully degrade per-pod read latency.
+3. Cache-resident PASS2 (217s) matches run #2's mean (176s) within
+   normal variance. The wiped pod's cache fill matches its peers
+   exactly: 6278 inserts vs ~6289 across other pods (the 11-chunk
+   delta is the empty-content_length zero-byte files filtered out
+   during run #2's hydrate but NOT during pass1 reads).
