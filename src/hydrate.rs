@@ -113,7 +113,9 @@ pub async fn run_shard(
                 Ok(p) => p,
                 Err(e) => return (c, Err(e)),
             };
-            let res = f.fetch_chunk(&m, &c.blob, c.offset, c.len).await;
+            let res = f
+                .fetch_chunk_origin_only(&m, &c.blob, c.offset, c.len)
+                .await;
             drop(permit);
             (c, res)
         }));

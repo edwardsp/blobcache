@@ -145,7 +145,35 @@ impl Fetcher {
     ) -> Result<Bytes> {
         let t_total = std::time::Instant::now();
         let res = self
-            .fetch_chunk_inner(mount, blob_path, offset, expected_len)
+            .fetch_chunk_inner(mount, blob_path, offset, expected_len, false)
+            .await;
+        self.stats
+            .chunk_total_seconds
+            .observe(t_total.elapsed().as_secs_f64());
+        res
+    }
+
+    /// Origin-only fetch: cache lookup → singleflight → direct Azure GET,
+    /// bypassing the peer-pull and stampede-leader coordination paths in
+    /// `do_fetch`. Used by hydrate, where every node already has a disjoint
+    /// shard assignment from the coordinator: routing to peers would cause
+    /// (a) ~2x cache duplication (peer serves a chunk it was about to fetch
+    /// itself, then the requester also writes through to its own cache), and
+    /// (b) up to `stampede_wait_ms` of dead time per chunk while the HRW-top
+    /// peer's `serve_peer_chunk` blocks waiting for a cold cache that never
+    /// fills (because the HRW peer is also fetching its own shard, not this
+    /// one). The cache.insert + bloom update still happen, so subsequent
+    /// FUSE reads on other nodes find the chunk via the normal peer path.
+    pub async fn fetch_chunk_origin_only(
+        &self,
+        mount: &MountConfig,
+        blob_path: &str,
+        offset: u64,
+        expected_len: u64,
+    ) -> Result<Bytes> {
+        let t_total = std::time::Instant::now();
+        let res = self
+            .fetch_chunk_inner(mount, blob_path, offset, expected_len, true)
             .await;
         self.stats
             .chunk_total_seconds
@@ -243,7 +271,7 @@ impl Fetcher {
         // Slice miss: full-chunk fetch (will populate cache for subsequent
         // sub-reads), then slice.
         let full = self
-            .fetch_chunk_inner(mount, blob_path, chunk_offset, expected_chunk_len)
+            .fetch_chunk_inner(mount, blob_path, chunk_offset, expected_chunk_len, false)
             .await?;
         let end = (sub_offset + sub_len) as usize;
         if end > full.len() {
@@ -262,6 +290,7 @@ impl Fetcher {
         blob_path: &str,
         offset: u64,
         expected_len: u64,
+        bypass_peers: bool,
     ) -> Result<Bytes> {
         let key = ChunkKey {
             mount: mount.name.clone(),
@@ -356,7 +385,9 @@ impl Fetcher {
             key: key.clone(),
             armed: true,
         };
-        let result = self.do_fetch(mount, blob_path, &key, expected_len).await;
+        let result = self
+            .do_fetch(mount, blob_path, &key, expected_len, bypass_peers)
+            .await;
         if let Some(tx) = guard.disarm() {
             let msg = match &result {
                 Ok(b) => Ok(b.clone()),
@@ -373,65 +404,68 @@ impl Fetcher {
         blob_path: &str,
         key: &ChunkKey,
         expected_len: u64,
+        bypass_peers: bool,
     ) -> Result<Bytes> {
-        let alive = self.membership.members_alive();
-        let candidates = self.peer_index.rank_candidates(
-            key,
-            &alive,
-            self.peer_max_yes_attempts,
-            self.peer_max_maybe_attempts,
-        );
-        let yes_count = candidates.yes.len();
-        if yes_count > 0 {
-            self.stats.peer_bloom_yes.inc();
-        } else if !alive.is_empty() {
-            self.stats.peer_bloom_no_holder.inc();
-        }
-        // Try yes-set first (peers whose advertised bloom contains this
-        // chunk), then maybe-set (peers with no bloom yet, e.g. just joined).
-        // Each set has its own budget so a flood of false-positives in yes
-        // can't starve the maybe-set.
-        let mut ordered: Vec<(usize, &crate::cluster::NodeInfo)> = Vec::new();
-        for (i, p) in candidates.yes.iter().enumerate() {
-            ordered.push((i, p));
-        }
-        let yes_len = candidates.yes.len();
-        for (i, p) in candidates.maybe.iter().enumerate() {
-            ordered.push((yes_len + i, p));
-        }
-        for (idx, peer) in ordered.iter() {
-            let was_yes = *idx < yes_len;
-            if let Some(data) = self
-                .try_peer_fetch(peer, key, expected_len, was_yes, 0)
-                .await?
-            {
-                return Ok(data);
+        if !bypass_peers {
+            let alive = self.membership.members_alive();
+            let candidates = self.peer_index.rank_candidates(
+                key,
+                &alive,
+                self.peer_max_yes_attempts,
+                self.peer_max_maybe_attempts,
+            );
+            let yes_count = candidates.yes.len();
+            if yes_count > 0 {
+                self.stats.peer_bloom_yes.inc();
+            } else if !alive.is_empty() {
+                self.stats.peer_bloom_no_holder.inc();
             }
-        }
-
-        // v2.6.0 stampede-leader cold-start coordination: if no peer claims
-        // (or might claim) the chunk, route to the cluster-wide HRW-top
-        // owner with wait_ms so that the first to reach blob becomes the
-        // leader and everyone else piggybacks on its singleflight. This
-        // avoids the cold-start herd: 8 nodes reading the same model file
-        // would otherwise each issue an independent blob GET because their
-        // blooms are still empty.
-        if yes_count == 0 && self.stampede_wait_ms > 0 && !alive.is_empty() {
-            let hrw_top_id = self.peer_index.hrw_top_id(key, &alive);
-            if hrw_top_id != self.peer_index.me_id {
-                if let Some(peer) = alive.iter().find(|n| n.id == hrw_top_id) {
-                    self.stats.peer_stampede_follower.inc();
-                    if let Some(data) = self
-                        .try_peer_fetch(peer, key, expected_len, false, self.stampede_wait_ms)
-                        .await?
-                    {
-                        self.stats.peer_stampede_follower_ok.inc();
-                        return Ok(data);
-                    }
-                    self.stats.peer_stampede_follower_timeout.inc();
+            // Try yes-set first (peers whose advertised bloom contains this
+            // chunk), then maybe-set (peers with no bloom yet, e.g. just joined).
+            // Each set has its own budget so a flood of false-positives in yes
+            // can't starve the maybe-set.
+            let mut ordered: Vec<(usize, &crate::cluster::NodeInfo)> = Vec::new();
+            for (i, p) in candidates.yes.iter().enumerate() {
+                ordered.push((i, p));
+            }
+            let yes_len = candidates.yes.len();
+            for (i, p) in candidates.maybe.iter().enumerate() {
+                ordered.push((yes_len + i, p));
+            }
+            for (idx, peer) in ordered.iter() {
+                let was_yes = *idx < yes_len;
+                if let Some(data) = self
+                    .try_peer_fetch(peer, key, expected_len, was_yes, 0)
+                    .await?
+                {
+                    return Ok(data);
                 }
-            } else {
-                self.stats.peer_stampede_leader.inc();
+            }
+
+            // v2.6.0 stampede-leader cold-start coordination: if no peer claims
+            // (or might claim) the chunk, route to the cluster-wide HRW-top
+            // owner with wait_ms so that the first to reach blob becomes the
+            // leader and everyone else piggybacks on its singleflight. This
+            // avoids the cold-start herd: 8 nodes reading the same model file
+            // would otherwise each issue an independent blob GET because their
+            // blooms are still empty.
+            if yes_count == 0 && self.stampede_wait_ms > 0 && !alive.is_empty() {
+                let hrw_top_id = self.peer_index.hrw_top_id(key, &alive);
+                if hrw_top_id != self.peer_index.me_id {
+                    if let Some(peer) = alive.iter().find(|n| n.id == hrw_top_id) {
+                        self.stats.peer_stampede_follower.inc();
+                        if let Some(data) = self
+                            .try_peer_fetch(peer, key, expected_len, false, self.stampede_wait_ms)
+                            .await?
+                        {
+                            self.stats.peer_stampede_follower_ok.inc();
+                            return Ok(data);
+                        }
+                        self.stats.peer_stampede_follower_timeout.inc();
+                    }
+                } else {
+                    self.stats.peer_stampede_leader.inc();
+                }
             }
         }
 
