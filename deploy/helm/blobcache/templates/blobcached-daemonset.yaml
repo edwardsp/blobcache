@@ -85,6 +85,12 @@ spec:
               value: {{ .Values.ucx.maxRndvRails | quote }}
             - name: UCX_LOG_LEVEL
               value: {{ .Values.ucx.logLevel | quote }}
+            - name: UCX_RC_TIMEOUT
+              value: {{ .Values.ucx.rcTimeout | quote }}
+            - name: UCX_RC_RNR_TIMEOUT
+              value: {{ .Values.ucx.rcRnrTimeout | quote }}
+            - name: UCX_RC_RETRY_COUNT
+              value: {{ .Values.ucx.rcRetryCount | quote }}
           ports:
             - name: gossip
               containerPort: 7771

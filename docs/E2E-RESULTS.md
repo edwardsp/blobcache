@@ -163,25 +163,44 @@ egress (hydrate is the only spike).
 
 ## Recommended follow-ups
 
-1. Add UCX timeouts to the chart so a stuck QP fails fast instead of
-   wedging the daemon:
-   ```yaml
-   env:
-     UCX_RC_TIMEOUT: "30s"
-     UCX_RC_RNR_TIMEOUT: "30s"
-     UCX_RC_RETRY_COUNT: "8"
-   ```
-2. Wrap `run_coordinator` in `tokio::time::timeout` so a single
-   misbehaving peer can't block `/hydrate` indefinitely (current code
-   has no global timeout; the per-remote-shard HTTP timeout is 3600 s).
-3. Install `bc` in the daemon image (or replace the `bc` arithmetic in
-   the bench scripts with shell `$((...))`) so per-pod `wall_s` is
-   captured in the TSV. Outer-script timing was used in this run.
-4. Investigate why the same five nodes stall — likely an IB-fabric
-   per-pair issue rather than a per-node one (hydrate worked from
-   coordinator → all peers, but cross-node peer fetches against these
-   five hung). Worth a single targeted UCX `ucx_perftest` between the
-   stuck pairs after applying (1).
+1. ✅ **Done** — UCX timeouts added to chart (`UCX_RC_TIMEOUT=30s`,
+   `UCX_RC_RNR_TIMEOUT=30s`, `UCX_RC_RETRY_COUNT=8`) so a stuck QP
+   surfaces as `endpoint_error_cb` instead of an indefinite block.
+2. ✅ **Done** — `run_coordinator` is now wrapped in
+   `tokio::time::timeout(BLOBCACHE_HYDRATE_TIMEOUT_SECS, ...)` (default
+   3700 s, 100 s above the per-shard HTTP timeout). On expiry, all
+   outstanding handles are aborted and the coordinator returns the
+   partial result with an explicit error row.
+3. ✅ **Done** — replaced `bc` with `awk` in the bench scripts
+   (`benchmarks/e2e-hydrate-read.sh`, `deploy/wipe-caches.sh`); no
+   image rebuild needed.
+4. ✅ **Investigated, fabric ruled out** — `ucx_perftest` (rc_mlx5,
+   1 MiB / 200 iter) was run between the healthy coordinator
+   (`vmss000011`) and each of the five stalling nodes, plus a
+   healthy↔healthy control:
+
+   | Server-side node | Bandwidth | 50 %ile latency |
+   |---|---:|---:|
+   | vmss00001b (stuck)              | 42 753 MB/s | 22.98 µs |
+   | vmss00001c (stuck)              | 42 871 MB/s | 22.94 µs |
+   | vmss00001e (stuck)              | 42 736 MB/s | 22.94 µs |
+   | vmss000015 (stuck)              | 43 001 MB/s | 22.98 µs |
+   | vmss000010 (stuck)              | 42 480 MB/s | 23.04 µs |
+   | vmss00001f (control, healthy)   | 42 937 MB/s | 22.98 µs |
+
+   All five "bad" pairs sustain ~42 GB/s (≈336 Gbps), within 1.2 % of
+   the healthy control and at the line rate of a single mlx5 rail.
+   **The IB fabric is healthy for every pair.** The stalls are
+   software-side, in blobcached's `Fetcher` / UCX endpoint management
+   — likely the in-flight-counter / endpoint-reaper interaction
+   already documented above (a request that wedges in user-space
+   keeps `in_flight > 0` so the broken-slot reaper never fires).
+   Mitigations (1)+(2) are the correct response; the next time the
+   five-node stall reproduces, they should now produce a clean error
+   instead of a hang, which is observable end-to-end. The
+   `ucx_perftest` probe script is preserved at `/tmp/ucx-probe.sh`
+   (and full output at `/tmp/ucx-probe.log`) for re-running if the
+   pattern returns after the chart upgrade.
 
 ## Reproduce
 

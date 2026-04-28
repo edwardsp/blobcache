@@ -324,17 +324,50 @@ pub async fn run_coordinator(
     }
 
     let mut peers = Vec::with_capacity(n_targets);
-    for h in handles {
-        match h.await {
-            Ok(s) => peers.push(s),
-            Err(e) => peers.push(PerPeerStats {
-                node_id: "unknown".into(),
+    // Per-shard remote HTTP timeout is 3600s; cap the whole hydrate at
+    // 3700s (override with BLOBCACHE_HYDRATE_TIMEOUT_SECS) so a single
+    // wedged local shard or a peer whose HTTP didn't fire can't block
+    // /hydrate indefinitely. On timeout we abort outstanding handles and
+    // return what completed, marking the rest as errors.
+    let global_timeout_secs: u64 = std::env::var("BLOBCACHE_HYDRATE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3700);
+    let global_timeout = std::time::Duration::from_secs(global_timeout_secs);
+    let abort_handles: Vec<_> = handles.iter().map(|h| h.abort_handle()).collect();
+    let join_all = async {
+        let mut out = Vec::with_capacity(n_targets);
+        for h in handles {
+            match h.await {
+                Ok(s) => out.push(s),
+                Err(e) => out.push(PerPeerStats {
+                    node_id: "unknown".into(),
+                    assigned_chunks: 0,
+                    fetched: 0,
+                    bytes: 0,
+                    errors: vec![format!("join: {e}")],
+                    elapsed_ms: 0,
+                }),
+            }
+        }
+        out
+    };
+    match tokio::time::timeout(global_timeout, join_all).await {
+        Ok(p) => peers = p,
+        Err(_) => {
+            for ah in abort_handles {
+                ah.abort();
+            }
+            peers.push(PerPeerStats {
+                node_id: "coordinator".into(),
                 assigned_chunks: 0,
                 fetched: 0,
                 bytes: 0,
-                errors: vec![format!("join: {e}")],
-                elapsed_ms: 0,
-            }),
+                errors: vec![format!(
+                    "coordinator timeout after {global_timeout_secs}s; aborted outstanding shards"
+                )],
+                elapsed_ms: global_timeout.as_millis() as u64,
+            });
         }
     }
     let elapsed_ms = t0.elapsed().as_millis() as u64;

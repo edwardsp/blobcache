@@ -64,6 +64,16 @@ ucx:
   rndvScheme: "put_zcopy"
   maxRndvRails: "1"
   logLevel: "info"
+  # RC QP timeouts. Without these UCX inherits driver defaults that
+  # effectively never time out a stuck QP, so a single misbehaving
+  # peer wedges the daemon's Fetcher (FUSE read() blocks forever and
+  # endpoint_error_cb's reaper never recreates the slot because
+  # in_flight stays > 0). The 17-node DeepSeek-R1 e2e showed five
+  # peers in this exact stall state. 30s + 8 retries gives the fabric
+  # plenty of head-room while still letting endpoint_error_cb fire.
+  rcTimeout: "30s"
+  rcRnrTimeout: "30s"
+  rcRetryCount: "8"
 
 # -- RUST_LOG value for the blobcached container.
 rustLog: "info,blobcache=debug"
