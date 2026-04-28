@@ -9,7 +9,7 @@ set -uo pipefail
 # daemons re-scan an empty cache directory.
 
 NS=${NS:-blobcache}
-DS_LABEL=${DS_LABEL:-app.kubernetes.io/component=nvme-raid}
+DS_LABEL=${DS_LABEL:-app.kubernetes.io/component=nvme-raid-init}
 HOST_CACHE=${HOST_CACHE:-/host/mnt/nvme/blobcache-cache}
 LOG=${LOG:-/tmp/wipe.log}
 
