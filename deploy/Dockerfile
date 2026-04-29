@@ -25,7 +25,6 @@ ENV CARGO_TERM_COLOR=always
 
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
-COPY crates ./crates
 COPY src ./src
 COPY examples ./examples
 
