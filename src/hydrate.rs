@@ -817,6 +817,7 @@ pub async fn run_broadcast_shard(
     let mut fetched = 0u64;
     let mut bytes = 0u64;
     let mut errors = Vec::new();
+    let pulls_t0 = Instant::now();
     for h in handles {
         match h.await {
             Ok((_, _, Ok(b))) => {
@@ -835,7 +836,18 @@ pub async fn run_broadcast_shard(
             }
         }
     }
+    let pulls_elapsed_ms = pulls_t0.elapsed().as_millis() as u64;
+    let drain_t0 = Instant::now();
     fetcher.await_inserts_drained().await;
+    let drain_elapsed_ms = drain_t0.elapsed().as_millis() as u64;
+    tracing::info!(
+        n_chunks = fetched,
+        bytes,
+        pulls_ms = pulls_elapsed_ms,
+        drain_ms = drain_elapsed_ms,
+        n_errors = errors.len(),
+        "broadcast shard complete"
+    );
     HydrateBroadcastShardResponse {
         fetched,
         bytes,
