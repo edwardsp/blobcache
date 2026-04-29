@@ -135,6 +135,10 @@ config:
                                 # effective cluster cache capacity by avoiding
                                 # replication and removes the cache-write from the
                                 # peer-read hot path
+    peerLruBytes: 1073741824    # 1 GiB in-memory LRU of peer-fetched chunks; only
+                                # consulted when cacheOnPeerFetch=false, prevents
+                                # FUSE's ~32 sub-reads per chunk from triggering 32
+                                # peer fetches. 0 = disable.
   azure:
     poolMaxIdlePerHost: 512
     workers: 8                  # production default; bumping above 8 has not shown a Phase A win

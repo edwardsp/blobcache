@@ -1,6 +1,7 @@
 use base64::prelude::{Engine as _, BASE64_STANDARD};
 use bytes::Bytes;
 use dashmap::DashMap;
+use lru::LruCache;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -23,6 +24,52 @@ const MAX_READ_BYTES: u64 = 64 * 1024 * 1024;
 // followers waiting on that key. Without this, N concurrent FUSE reads landing
 // on the same uncached chunk would each issue an independent peer/blob fetch.
 type InflightTx = broadcast::Sender<std::result::Result<Bytes, String>>;
+
+// Byte-bounded LRU of peer-fetched chunks. Used when cache_on_peer_fetch=false
+// to keep within-chunk locality (FUSE issues ~32 sub-reads per 4 MiB chunk)
+// without writing to disk. lru::LruCache is entry-bounded; we wrap it with
+// running byte accounting and evict from the back until under the cap.
+struct PeerLru {
+    inner: LruCache<ChunkKey, Bytes>,
+    bytes: u64,
+    cap_bytes: u64,
+}
+
+impl PeerLru {
+    fn new(cap_bytes: u64) -> Self {
+        Self {
+            inner: LruCache::unbounded(),
+            bytes: 0,
+            cap_bytes,
+        }
+    }
+
+    fn get(&mut self, key: &ChunkKey) -> Option<Bytes> {
+        self.inner.get(key).cloned()
+    }
+
+    fn put(&mut self, key: ChunkKey, val: Bytes) {
+        let new_len = val.len() as u64;
+        if new_len > self.cap_bytes {
+            return;
+        }
+        if let Some(prev) = self.inner.put(key, val) {
+            self.bytes = self.bytes.saturating_sub(prev.len() as u64);
+        }
+        self.bytes = self.bytes.saturating_add(new_len);
+        while self.bytes > self.cap_bytes {
+            match self.inner.pop_lru() {
+                Some((_, v)) => self.bytes = self.bytes.saturating_sub(v.len() as u64),
+                None => break,
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        self.inner.clear();
+        self.bytes = 0;
+    }
+}
 
 pub struct Fetcher {
     pub cache: Arc<DiskCache>,
@@ -51,6 +98,7 @@ pub struct Fetcher {
     prefetch_threshold: u32,
     prefetch_origin_only: bool,
     cache_on_peer_fetch: bool,
+    peer_lru: Option<Arc<Mutex<PeerLru>>>,
 }
 
 #[derive(Clone, Copy)]
@@ -104,6 +152,7 @@ impl Fetcher {
         prefetch_concurrency: usize,
         prefetch_origin_only: bool,
         cache_on_peer_fetch: bool,
+        peer_lru_bytes: u64,
         peer_index: Arc<PeerIndex>,
         peer_max_candidates: usize,
         peer_max_yes_attempts: usize,
@@ -142,6 +191,11 @@ impl Fetcher {
             prefetch_threshold: prefetch_threshold.max(1),
             prefetch_origin_only,
             cache_on_peer_fetch,
+            peer_lru: if peer_lru_bytes > 0 {
+                Some(Arc::new(Mutex::new(PeerLru::new(peer_lru_bytes))))
+            } else {
+                None
+            },
         }
     }
 
@@ -266,6 +320,19 @@ impl Fetcher {
             }
         }
 
+        if let Some(lru) = &self.peer_lru {
+            let hit = lru.lock().get(&key);
+            if let Some(bytes) = hit {
+                if bytes.len() as u64 == expected_chunk_len {
+                    let end = (sub_offset + sub_len) as usize;
+                    if end <= bytes.len() {
+                        self.stats.peer_lru_hits.inc();
+                        return Ok(bytes.slice(sub_offset as usize..end));
+                    }
+                }
+            }
+        }
+
         let cache_for_get = self.cache.clone();
         let key_for_get = key.clone();
         let t_get = std::time::Instant::now();
@@ -328,6 +395,16 @@ impl Fetcher {
             let bytes = b.value().clone();
             if bytes.len() as u64 == expected_len {
                 return Ok(bytes);
+            }
+        }
+
+        if let Some(lru) = &self.peer_lru {
+            let hit = lru.lock().get(&key);
+            if let Some(bytes) = hit {
+                if bytes.len() as u64 == expected_len {
+                    self.stats.peer_lru_hits.inc();
+                    return Ok(bytes);
+                }
             }
         }
 
@@ -593,6 +670,8 @@ impl Fetcher {
                 self.stats.peer_fetch_bytes.inc_by(data.len() as u64);
                 if self.cache_on_peer_fetch {
                     self.spawn_insert(key.clone(), data.clone());
+                } else if let Some(lru) = &self.peer_lru {
+                    lru.lock().put(key.clone(), data.clone());
                 }
                 self.note_fetch_origin(&key.mount, &key.blob, false);
                 Ok(Some(data))
@@ -834,9 +913,7 @@ impl Fetcher {
         }
         self.stats.peer_fetches_ok.inc();
         self.stats.peer_fetch_bytes.inc_by(data.len() as u64);
-        if self.cache_on_peer_fetch {
-            self.spawn_insert(key, data.clone());
-        }
+        self.spawn_insert(key, data.clone());
         Ok(data)
     }
 
@@ -868,6 +945,9 @@ impl Fetcher {
         self.inflight.lock().clear();
         self.inflight_writes.clear();
         self.seq_state.clear();
+        if let Some(lru) = &self.peer_lru {
+            lru.lock().clear();
+        }
         self.peer_index.rebuild_local_from_cache(&self.cache);
         Ok((files, bytes))
     }
@@ -968,6 +1048,7 @@ impl Fetcher {
             prefetch_threshold: self.prefetch_threshold,
             prefetch_origin_only: self.prefetch_origin_only,
             cache_on_peer_fetch: self.cache_on_peer_fetch,
+            peer_lru: self.peer_lru.clone(),
         }
     }
 

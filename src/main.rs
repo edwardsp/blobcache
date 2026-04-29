@@ -244,6 +244,7 @@ fn main() -> anyhow::Result<()> {
         cfg.transport.prefetch_concurrency,
         cfg.transport.prefetch_origin_only,
         cfg.cache.cache_on_peer_fetch,
+        cfg.cache.peer_lru_bytes,
         peer_index.clone(),
         cfg.transport.peer_max_candidates,
         cfg.transport.peer_max_yes_attempts,

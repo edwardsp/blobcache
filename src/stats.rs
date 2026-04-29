@@ -45,6 +45,7 @@ pub struct Stats {
     pub peer_fetches_miss: IntCounter,
     pub peer_fetches_err: IntCounter,
     pub peer_fetch_bytes: IntCounter,
+    pub peer_lru_hits: IntCounter,
     pub fuse_reads: IntCounter,
     pub fuse_read_bytes: IntCounter,
     pub singleflight_waits: IntCounter,
@@ -152,6 +153,11 @@ impl Stats {
             IntCounter::new("blobcache_peer_fetches_err_total", "peer fetch errors").unwrap();
         let peer_fetch_bytes =
             IntCounter::new("blobcache_peer_fetch_bytes_total", "peer fetched bytes").unwrap();
+        let peer_lru_hits = IntCounter::new(
+            "blobcache_peer_lru_hits_total",
+            "in-memory peer-LRU hits (cache_on_peer_fetch=false path)",
+        )
+        .unwrap();
         let fuse_reads = IntCounter::new("blobcache_fuse_reads_total", "fuse read calls").unwrap();
         let fuse_read_bytes =
             IntCounter::new("blobcache_fuse_read_bytes_total", "fuse read bytes").unwrap();
@@ -320,6 +326,7 @@ impl Stats {
             &peer_fetches_miss,
             &peer_fetches_err,
             &peer_fetch_bytes,
+            &peer_lru_hits,
             &fuse_reads,
             &fuse_read_bytes,
             &singleflight_waits,
@@ -393,6 +400,7 @@ impl Stats {
             peer_fetches_miss,
             peer_fetches_err,
             peer_fetch_bytes,
+            peer_lru_hits,
             fuse_reads,
             fuse_read_bytes,
             singleflight_waits,

@@ -33,12 +33,23 @@ pub struct CacheConfig {
     /// path on the critical path. Blob fetches always cache regardless.
     #[serde(default = "default_cache_on_peer_fetch")]
     pub cache_on_peer_fetch: bool,
+    /// Bounded in-memory LRU of peer-fetched chunks (bytes). Mirrors the
+    /// chunks the disk cache would have held when `cache_on_peer_fetch`
+    /// is false, so that within-chunk locality (FUSE issues ~32 sub-reads
+    /// per 4 MiB chunk) doesn't trigger a full peer re-fetch per sub-read.
+    /// 0 disables. Default 1 GiB. Memory accounting is approximate
+    /// (sum of chunk byte lengths); per-entry overhead is negligible.
+    #[serde(default = "default_peer_lru_bytes")]
+    pub peer_lru_bytes: u64,
 }
 fn default_chunk_size() -> u64 {
     4 * 1024 * 1024
 }
 fn default_cache_on_peer_fetch() -> bool {
     true
+}
+fn default_peer_lru_bytes() -> u64 {
+    1024 * 1024 * 1024
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

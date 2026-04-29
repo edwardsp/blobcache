@@ -16,6 +16,7 @@ data:
     max_bytes = {{ printf "%d" (int64 .Values.config.cache.maxBytes) }}
     chunk_size = {{ printf "%d" (int64 .Values.config.cache.chunkSize) }}
     cache_on_peer_fetch = {{ .Values.config.cache.cacheOnPeerFetch }}
+    peer_lru_bytes = {{ printf "%d" (int64 .Values.config.cache.peerLruBytes) }}
 
     [azure]
     pool_max_idle_per_host = {{ printf "%d" (int64 .Values.config.azure.poolMaxIdlePerHost) }}
