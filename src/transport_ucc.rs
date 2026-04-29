@@ -19,10 +19,12 @@ pub mod sys {
 use sys::*;
 
 const COLLECTIVE_TIMEOUT: Duration = Duration::from_secs(300);
-const UCC_CONTEXT_PARAM_FIELD_OOB_MASK: u64 = 1 << 4;
-const UCC_TEAM_PARAM_FIELD_OOB_MASK: u64 = 1 << 6;
+const CREATE_TIMEOUT: Duration = Duration::from_secs(120);
+const UCC_CONTEXT_PARAM_FIELD_OOB_MASK: u64 = 1 << 2;
+const UCC_TEAM_PARAM_FIELD_OOB_MASK: u64 = 1 << 11;
 const UCC_COLL_ARGS_FIELD_FLAGS_MASK: u64 = 1 << 2;
 const UCC_COLL_ARGS_FLAG_CONTIG_DST_BUFFER_MASK: u64 = 1 << 2;
+const UCC_DT_UINT8_VALUE: ucc_datatype_t = (5u64 << 3) as ucc_datatype_t;
 
 struct SendPtr<T>(*mut T);
 
@@ -80,7 +82,7 @@ impl UccCollectives {
 
         let mut lib_params: ucc_lib_params_t = unsafe { mem::zeroed() };
         let mut lib: ucc_lib_h = ptr::null_mut();
-        let init_status = unsafe { ucc_lib_init(&mut lib_params, lib_config, &mut lib) };
+        let init_status = unsafe { ucc_init_ffi(&mut lib_params, lib_config, &mut lib) };
         unsafe { ucc_lib_config_release(lib_config) };
         check_status("ucc_init", init_status)?;
 
@@ -221,12 +223,12 @@ impl UccCollectives {
         unsafe {
             coll.src.info.buffer = send.as_ptr() as *mut c_void;
             coll.src.info.count = send.len() as u64;
-            coll.src.info.datatype = ucc_datatype_UCC_DT_UINT8;
+            coll.src.info.datatype = UCC_DT_UINT8_VALUE;
             coll.src.info.mem_type = ucc_memory_type_UCC_MEMORY_TYPE_HOST;
             coll.dst.info_v.buffer = recv.as_mut_ptr() as *mut c_void;
             coll.dst.info_v.counts = counts64.as_ptr() as *mut u64;
             coll.dst.info_v.displacements = displs64.as_ptr() as *mut u64;
-            coll.dst.info_v.datatype = ucc_datatype_UCC_DT_UINT8;
+            coll.dst.info_v.datatype = UCC_DT_UINT8_VALUE;
             coll.dst.info_v.mem_type = ucc_memory_type_UCC_MEMORY_TYPE_HOST;
         }
 
@@ -441,4 +443,21 @@ unsafe fn ucc_collective_test_ffi(request: ucc_coll_req_h) -> ucc_status_t {
         fn ucc_collective_test(request: ucc_coll_req_h) -> ucc_status_t;
     }
     unsafe { ucc_collective_test(request) }
+}
+
+unsafe fn ucc_init_ffi(
+    params: *const ucc_lib_params_t,
+    config: ucc_lib_config_h,
+    lib: *mut ucc_lib_h,
+) -> ucc_status_t {
+    unsafe extern "C" {
+        fn ucc_init_version(
+            api_major_version: ::std::os::raw::c_uint,
+            api_minor_version: ::std::os::raw::c_uint,
+            params: *const ucc_lib_params_t,
+            config: ucc_lib_config_h,
+            lib_p: *mut ucc_lib_h,
+        ) -> ucc_status_t;
+    }
+    unsafe { ucc_init_version(UCC_API_MAJOR, UCC_API_MINOR, params, config, lib) }
 }

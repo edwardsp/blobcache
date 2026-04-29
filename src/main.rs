@@ -314,12 +314,13 @@ fn main() -> anyhow::Result<()> {
         }
         _ => unreachable!(),
     }
+    #[cfg(feature = "ucc")]
+    let oob_coord = crate::ucc_oob::OobCoordinator::new();
+
     rt.spawn({
         let m = membership.clone();
         #[allow(unused_mut)]
         let mut s = cluster::GossipServer::new(m).with_peer_index(peer_index.clone());
-        #[cfg(feature = "ucc")]
-        let oob_coord = crate::ucc_oob::OobCoordinator::new();
         #[cfg(feature = "ucc")]
         {
             s = s.with_oob_coordinator(oob_coord.clone());
