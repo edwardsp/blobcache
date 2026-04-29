@@ -455,6 +455,7 @@ pub async fn serve(
     chunk_size: u64,
     me_id: String,
     me_transport_url: String,
+    ucc: Option<crate::hydrate::UccHydrateHandle>,
 ) -> crate::error::Result<()> {
     use bytes::Bytes;
     use http_body_util::{BodyExt, Full};
@@ -484,6 +485,7 @@ pub async fn serve(
         let mounts = mounts.clone();
         let me_id = me_id.clone();
         let me_url = me_transport_url.clone();
+        let ucc = ucc.clone();
         let hydrate_http = hydrate_http.clone();
         tokio::spawn(async move {
             let io = TokioIo::new(stream);
@@ -499,6 +501,7 @@ pub async fn serve(
                         let mounts = mounts.clone();
                         let me_id = me_id.clone();
                         let me_url = me_url.clone();
+                        let ucc = ucc.clone();
                         let hydrate_http = hydrate_http.clone();
                         async move {
                             let resp = match (req.method(), req.uri().path()) {
@@ -606,6 +609,7 @@ pub async fn serve(
                                         me_id.clone(),
                                         me_url.clone(),
                                         hydrate_http.clone(),
+                                        ucc.clone(),
                                     )
                                     .await
                                     {

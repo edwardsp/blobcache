@@ -8,11 +8,13 @@
 // in parallel from Azure.
 
 use crate::azure::BlobClient;
+use crate::cache::ChunkKey;
 use crate::cluster::{Membership, NodeState};
 use crate::config::MountConfig;
 use crate::error::{BcError, Result};
 use crate::fetcher::Fetcher;
 use base64::prelude::{Engine as _, BASE64_STANDARD};
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -53,6 +55,7 @@ pub struct HydrateShardResponse {
 pub enum HydrateMode {
     Default,
     Broadcast,
+    Ucc,
 }
 
 impl Default for HydrateMode {
@@ -127,6 +130,26 @@ pub struct HydrateResponse {
     pub phase_b_elapsed_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub broadcast_peers: Vec<PerPeerStats>,
+}
+
+#[cfg(feature = "ucc")]
+#[derive(Clone)]
+pub struct UccHydrateHandle(pub Arc<crate::transport_ucc::UccCollectives>);
+
+#[cfg(not(feature = "ucc"))]
+#[derive(Clone)]
+pub struct UccHydrateHandle;
+
+impl UccHydrateHandle {
+    #[cfg(feature = "ucc")]
+    fn allgatherv(&self, send: &[u8], recv: &mut [u8], counts: &[usize], displs: &[usize]) -> Result<()> {
+        self.0.allgatherv(send, recv, counts, displs)
+    }
+
+    #[cfg(not(feature = "ucc"))]
+    fn allgatherv(&self, _send: &[u8], _recv: &mut [u8], _counts: &[usize], _displs: &[usize]) -> Result<()> {
+        Err(BcError::Other("hydrate mode ucc requires --features ucc".into()))
+    }
 }
 
 /// Worker side: fetch the assigned chunks through the local Fetcher,
@@ -218,9 +241,10 @@ pub async fn run_coordinator(
     me_id: String,
     me_transport_url: String,
     http: reqwest::Client,
+    ucc: Option<UccHydrateHandle>,
 ) -> Result<HydrateResponse> {
     let t0 = Instant::now();
-    let mode = req.mode.unwrap_or_default();
+    let mode = hydrate_mode(req.mode);
     tracing::info!(
         mount = %req.mount,
         path = %req.path,
@@ -537,6 +561,33 @@ pub async fn run_coordinator(
         tracing::warn!(
             "skipping hydrate Phase B (broadcast) because Phase A reported errors"
         );
+    } else if mode == HydrateMode::Ucc && peers.iter().all(|p| p.errors.is_empty()) {
+        let Some(ucc) = ucc else {
+            return Err(BcError::Other("HYDRATE_MODE=ucc requested but UCC is not initialised".into()));
+        };
+        let phase_b_t0 = Instant::now();
+        broadcast_peers = run_ucc_phase(&req.mount, &plan, &me_id, fetcher.clone(), ucc, global_timeout).await;
+        phase_b_elapsed_ms = Some(phase_b_t0.elapsed().as_millis() as u64);
+        let phase_b_bytes: u64 = broadcast_peers.iter().map(|p| p.bytes).sum();
+        let phase_b_mibs = if let Some(ms) = phase_b_elapsed_ms {
+            if ms > 0 {
+                (phase_b_bytes as f64 / 1024.0 / 1024.0) / (ms as f64 / 1000.0)
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+        tracing::info!(
+            elapsed_ms = phase_b_elapsed_ms.unwrap_or(0),
+            bytes = phase_b_bytes,
+            aggregate_mibs = phase_b_mibs,
+            n_targets = broadcast_peers.len(),
+            n_errors = broadcast_peers.iter().map(|p| p.errors.len()).sum::<usize>(),
+            "hydrate phase B (ucc) complete"
+        );
+    } else if mode == HydrateMode::Ucc {
+        tracing::warn!("skipping hydrate Phase B (ucc) because Phase A reported errors");
     }
 
     let elapsed_ms = t0.elapsed().as_millis() as u64;
@@ -560,6 +611,175 @@ pub async fn run_coordinator(
         phase_b_elapsed_ms,
         broadcast_peers,
     })
+}
+
+fn hydrate_mode(request_mode: Option<HydrateMode>) -> HydrateMode {
+    if let Ok(s) = std::env::var("HYDRATE_MODE") {
+        match s.to_ascii_lowercase().as_str() {
+            "broadcast" => return HydrateMode::Broadcast,
+            "ucc" => return HydrateMode::Ucc,
+            _ => {}
+        }
+    }
+    request_mode.unwrap_or_default()
+}
+
+async fn run_ucc_phase(
+    mount: &str,
+    plan: &[BroadcastSource],
+    me_id: &str,
+    fetcher: Arc<Fetcher>,
+    ucc: UccHydrateHandle,
+    global_timeout: std::time::Duration,
+) -> Vec<PerPeerStats> {
+    let receiver = plan.iter().find(|p| p.node_id == me_id);
+    let Some(receiver) = receiver else {
+        return vec![PerPeerStats {
+            node_id: me_id.to_string(),
+            assigned_chunks: 0,
+            fetched: 0,
+            bytes: 0,
+            errors: vec!["local node missing from UCC hydrate plan".into()],
+            elapsed_ms: 0,
+            start_unix_ms: 0,
+            end_unix_ms: now_unix_ms(),
+        }];
+    };
+    match tokio::time::timeout(global_timeout, run_ucc_shard(mount, plan, receiver, fetcher, ucc)).await {
+        Ok(stats) => vec![stats],
+        Err(_) => vec![PerPeerStats {
+            node_id: me_id.to_string(),
+            assigned_chunks: plan.iter().map(|p| p.chunks.len() as u64).sum(),
+            fetched: 0,
+            bytes: 0,
+            errors: vec![format!("phase-b ucc timeout after {}s", global_timeout.as_secs())],
+            elapsed_ms: global_timeout.as_millis() as u64,
+            start_unix_ms: 0,
+            end_unix_ms: now_unix_ms(),
+        }],
+    }
+}
+
+async fn run_ucc_shard(
+    mount: &str,
+    plan: &[BroadcastSource],
+    receiver: &BroadcastSource,
+    fetcher: Arc<Fetcher>,
+    ucc: UccHydrateHandle,
+) -> PerPeerStats {
+    let t0 = Instant::now();
+    let start_unix_ms = now_unix_ms();
+    let mut send = Vec::new();
+    if let Some(local) = plan.iter().find(|p| p.node_id == receiver.node_id) {
+        for c in &local.chunks {
+            let key = ChunkKey {
+                mount: mount.to_string(),
+                blob: c.blob.clone(),
+                offset: c.offset,
+            };
+            match fetcher.cache.try_get(&key) {
+                Some(bytes) if bytes.len() as u64 == c.len => send.extend_from_slice(&bytes),
+                Some(bytes) => {
+                    return PerPeerStats {
+                        node_id: receiver.node_id.clone(),
+                        assigned_chunks: 0,
+                        fetched: 0,
+                        bytes: 0,
+                        errors: vec![format!("local chunk wrong length: got {} want {}", bytes.len(), c.len)],
+                        elapsed_ms: t0.elapsed().as_millis() as u64,
+                        start_unix_ms,
+                        end_unix_ms: now_unix_ms(),
+                    };
+                }
+                None => {
+                    return PerPeerStats {
+                        node_id: receiver.node_id.clone(),
+                        assigned_chunks: 0,
+                        fetched: 0,
+                        bytes: 0,
+                        errors: vec![format!("local Phase A chunk missing: {}@{}", c.blob, c.offset)],
+                        elapsed_ms: t0.elapsed().as_millis() as u64,
+                        start_unix_ms,
+                        end_unix_ms: now_unix_ms(),
+                    };
+                }
+            }
+        }
+    }
+    let counts: Vec<usize> = plan
+        .iter()
+        .map(|p| p.chunks.iter().map(|c| c.len as usize).sum())
+        .collect();
+    let mut displs = Vec::with_capacity(counts.len());
+    let mut total = 0usize;
+    for count in &counts {
+        displs.push(total);
+        total = total.saturating_add(*count);
+    }
+    let mut recv = vec![0u8; total];
+    let pulls_t0 = Instant::now();
+    let allgather = ucc.allgatherv(&send, &mut recv, &counts, &displs);
+    let pulls_elapsed_ms = pulls_t0.elapsed().as_millis() as u64;
+    if let Err(e) = allgather {
+        return PerPeerStats {
+            node_id: receiver.node_id.clone(),
+            assigned_chunks: plan.iter().map(|p| p.chunks.len() as u64).sum(),
+            fetched: 0,
+            bytes: 0,
+            errors: vec![format!("ucc allgatherv: {e}")],
+            elapsed_ms: t0.elapsed().as_millis() as u64,
+            start_unix_ms,
+            end_unix_ms: now_unix_ms(),
+        };
+    }
+    let drain_t0 = Instant::now();
+    let mut fetched = 0u64;
+    let mut bytes = 0u64;
+    let mut errors = Vec::new();
+    for (source_idx, source) in plan.iter().enumerate() {
+        if source.node_id == receiver.node_id {
+            continue;
+        }
+        let mut pos = displs[source_idx];
+        for c in &source.chunks {
+            let end = pos.saturating_add(c.len as usize);
+            if end > recv.len() {
+                if errors.len() < 32 {
+                    errors.push(format!("recv bounds: {}@{}", c.blob, c.offset));
+                }
+                break;
+            }
+            let key = ChunkKey {
+                mount: mount.to_string(),
+                blob: c.blob.clone(),
+                offset: c.offset,
+            };
+            fetcher.insert_received_chunk(key, Bytes::copy_from_slice(&recv[pos..end]));
+            fetched += 1;
+            bytes += c.len;
+            pos = end;
+        }
+    }
+    fetcher.await_inserts_drained().await;
+    let drain_elapsed_ms = drain_t0.elapsed().as_millis() as u64;
+    tracing::info!(
+        n_chunks = fetched,
+        bytes,
+        pulls_ms = pulls_elapsed_ms,
+        drain_ms = drain_elapsed_ms,
+        n_errors = errors.len(),
+        "broadcast shard complete"
+    );
+    PerPeerStats {
+        node_id: receiver.node_id.clone(),
+        assigned_chunks: plan.iter().filter(|p| p.node_id != receiver.node_id).map(|p| p.chunks.len() as u64).sum(),
+        fetched,
+        bytes,
+        errors,
+        elapsed_ms: t0.elapsed().as_millis() as u64,
+        start_unix_ms,
+        end_unix_ms: now_unix_ms(),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
