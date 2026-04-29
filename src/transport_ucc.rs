@@ -220,17 +220,15 @@ impl UccCollectives {
         coll.mask = UCC_COLL_ARGS_FIELD_FLAGS_MASK;
         coll.flags = UCC_COLL_ARGS_FLAG_CONTIG_DST_BUFFER_MASK;
         coll.coll_type = ucc_coll_type_t_UCC_COLL_TYPE_ALLGATHERV;
-        unsafe {
-            coll.src.info.buffer = send.as_ptr() as *mut c_void;
-            coll.src.info.count = send.len() as u64;
-            coll.src.info.datatype = UCC_DT_UINT8_VALUE;
-            coll.src.info.mem_type = ucc_memory_type_UCC_MEMORY_TYPE_HOST;
-            coll.dst.info_v.buffer = recv.as_mut_ptr() as *mut c_void;
-            coll.dst.info_v.counts = counts64.as_ptr() as *mut u64;
-            coll.dst.info_v.displacements = displs64.as_ptr() as *mut u64;
-            coll.dst.info_v.datatype = UCC_DT_UINT8_VALUE;
-            coll.dst.info_v.mem_type = ucc_memory_type_UCC_MEMORY_TYPE_HOST;
-        }
+        coll.src.info.buffer = send.as_ptr() as *mut c_void;
+        coll.src.info.count = send.len() as u64;
+        coll.src.info.datatype = UCC_DT_UINT8_VALUE;
+        coll.src.info.mem_type = ucc_memory_type_UCC_MEMORY_TYPE_HOST;
+        coll.dst.info_v.buffer = recv.as_mut_ptr() as *mut c_void;
+        coll.dst.info_v.counts = counts64.as_ptr() as *mut u64;
+        coll.dst.info_v.displacements = displs64.as_ptr() as *mut u64;
+        coll.dst.info_v.datatype = UCC_DT_UINT8_VALUE;
+        coll.dst.info_v.mem_type = ucc_memory_type_UCC_MEMORY_TYPE_HOST;
 
         let mut req: ucc_coll_req_h = ptr::null_mut();
         check_status(
@@ -246,7 +244,7 @@ impl UccCollectives {
 
         let start = Instant::now();
         loop {
-            match unsafe { ucc_collective_test_ffi(req) } {
+            match unsafe { ucc_collective_status(req) } {
                 s if status_is_ok(s) => {
                     unsafe { ucc_collective_finalize(req) };
                     return Ok(());
@@ -438,11 +436,8 @@ fn status_no_message() -> ucc_status_t {
     ucc_status_t_UCC_ERR_NO_MESSAGE
 }
 
-unsafe fn ucc_collective_test_ffi(request: ucc_coll_req_h) -> ucc_status_t {
-    unsafe extern "C" {
-        fn ucc_collective_test(request: ucc_coll_req_h) -> ucc_status_t;
-    }
-    unsafe { ucc_collective_test(request) }
+unsafe fn ucc_collective_status(request: ucc_coll_req_h) -> ucc_status_t {
+    unsafe { ptr::addr_of!((*request).status).read_volatile() }
 }
 
 unsafe fn ucc_init_ffi(
