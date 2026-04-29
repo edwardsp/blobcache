@@ -43,6 +43,7 @@ pub struct Fetcher {
     pub mounts: Arc<HashMap<String, MountConfig>>,
     inflight: Arc<Mutex<HashMap<ChunkKey, InflightTx>>>,
     chunk_sem: Arc<Semaphore>,
+    chunk_concurrency: usize,
     inflight_writes: Arc<DashMap<ChunkKey, Bytes>>,
     seq_state: Arc<DashMap<String, SeqState>>,
     prefetch_sem: Arc<Semaphore>,
@@ -131,6 +132,7 @@ impl Fetcher {
             mounts,
             inflight: Arc::new(Mutex::new(HashMap::new())),
             chunk_sem: Arc::new(Semaphore::new(permits)),
+            chunk_concurrency: permits,
             inflight_writes: Arc::new(DashMap::new()),
             seq_state: Arc::new(DashMap::new()),
             prefetch_sem: Arc::new(Semaphore::new(pf_permits)),
@@ -198,6 +200,10 @@ impl Fetcher {
             .acquire_owned()
             .await
             .map_err(|e| BcError::Other(format!("chunk_sem closed: {e}")))
+    }
+
+    pub fn chunk_concurrency_limit(&self) -> usize {
+        self.chunk_concurrency
     }
 
     /// Like `fetch_chunk` but returns only `[sub_offset, sub_offset+sub_len)`
@@ -918,6 +924,7 @@ impl Fetcher {
             mounts: self.mounts.clone(),
             inflight: self.inflight.clone(),
             chunk_sem: self.chunk_sem.clone(),
+            chunk_concurrency: self.chunk_concurrency,
             inflight_writes: self.inflight_writes.clone(),
             seq_state: self.seq_state.clone(),
             prefetch_sem: self.prefetch_sem.clone(),

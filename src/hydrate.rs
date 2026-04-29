@@ -682,47 +682,95 @@ pub async fn run_broadcast_shard(
             };
         }
     };
+    // Round-robin chunks across sources so concurrent permits land on
+    // different peers (run #9 found that a source-major ordering pinned every
+    // receiver to the same source[0] first, serialising 16 sources through one
+    // peer endpoint and stalling Phase B at ~2 fetches/min). Each source also
+    // gets its own per-source semaphore (≤ chunk_concurrency / sources) to keep
+    // any single UCX endpoint from monopolising the puller's runtime.
+    struct SourceCtx {
+        node_id: String,
+        transport_url: String,
+        worker_addr: Option<Vec<u8>>,
+        per_src_sem: Arc<tokio::sync::Semaphore>,
+        chunks: std::vec::IntoIter<ChunkSpec>,
+    }
+    let n_src = req.sources.len().max(1);
+    let chunk_conc = fetcher.chunk_concurrency_limit().max(1);
+    let per_src_permits = (chunk_conc / n_src).max(1);
+    let mut sources: Vec<SourceCtx> = req
+        .sources
+        .into_iter()
+        .map(|src| {
+            let worker_addr: Option<Vec<u8>> = match src.ucx_worker_addr_b64.as_ref() {
+                Some(s) => match BASE64_STANDARD.decode(s) {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        tracing::warn!(
+                            peer = %src.node_id,
+                            error = %e,
+                            "broadcast source has invalid ucx worker addr; will skip its chunks"
+                        );
+                        None
+                    }
+                },
+                None => None,
+            };
+            SourceCtx {
+                node_id: src.node_id,
+                transport_url: src.transport_url,
+                worker_addr,
+                per_src_sem: Arc::new(tokio::sync::Semaphore::new(per_src_permits)),
+                chunks: src.chunks.into_iter(),
+            }
+        })
+        .collect();
     let mut handles = Vec::new();
-    for src in req.sources {
-        let worker_addr: Option<Vec<u8>> = match src.ucx_worker_addr_b64.as_ref() {
-            Some(s) => match BASE64_STANDARD.decode(s) {
-                Ok(v) => Some(v),
-                Err(e) => {
-                    tracing::warn!(
-                        peer = %src.node_id,
-                        error = %e,
-                        "broadcast source has invalid ucx worker addr; will skip its chunks"
-                    );
-                    None
-                }
-            },
-            None => None,
-        };
-        for c in src.chunks {
-            let f = fetcher.clone();
-            let m = mount.clone();
-            let peer_id = src.node_id.clone();
-            let transport_url = src.transport_url.clone();
-            let wa = worker_addr.clone();
-            handles.push(tokio::spawn(async move {
-                let permit = match f.acquire_chunk_permit().await {
-                    Ok(p) => p,
-                    Err(e) => return (peer_id, c, Err(e)),
-                };
-                let res = f
-                    .pull_chunk_from_peer(
-                        &m,
-                        &c.blob,
-                        c.offset,
-                        c.len,
-                        &peer_id,
-                        &transport_url,
-                        wa.as_deref(),
-                    )
-                    .await;
-                drop(permit);
-                (peer_id, c, res)
-            }));
+    let mut any_left = true;
+    while any_left {
+        any_left = false;
+        for s in sources.iter_mut() {
+            if let Some(c) = s.chunks.next() {
+                any_left = true;
+                let f = fetcher.clone();
+                let m = mount.clone();
+                let peer_id = s.node_id.clone();
+                let transport_url = s.transport_url.clone();
+                let wa = s.worker_addr.clone();
+                let per_src = s.per_src_sem.clone();
+                handles.push(tokio::spawn(async move {
+                    let _src_permit = match per_src.acquire_owned().await {
+                        Ok(p) => p,
+                        Err(_) => {
+                            return (
+                                peer_id,
+                                c,
+                            Err(crate::error::BcError::Other(
+                                "broadcast per-src semaphore closed".into(),
+                            )),
+                            );
+                        }
+                    };
+                    let permit = match f.acquire_chunk_permit().await {
+                        Ok(p) => p,
+                        Err(e) => return (peer_id, c, Err(e)),
+                    };
+                    let res = f
+                        .pull_chunk_from_peer(
+                            &m,
+                            &c.blob,
+                            c.offset,
+                            c.len,
+                            &peer_id,
+                            &transport_url,
+                            wa.as_deref(),
+                        )
+                        .await;
+                    drop(permit);
+                    drop(_src_permit);
+                    (peer_id, c, res)
+                }));
+            }
         }
     }
     let mut fetched = 0u64;

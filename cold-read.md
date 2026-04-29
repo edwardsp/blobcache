@@ -164,13 +164,33 @@ work across pods, prefetch hides per-chunk latency within a pod.
 
 Listed roughly in expected leverage. Pick the ones you want to run.
 
-1. **Hydrate-broadcast (already queued)**. Two-phase: each node
-   shard-pulls from Azure (disjoint), then UCX all-to-all distributes
-   to all 17 nodes. Optional via `mode=broadcast` parameter, default
-   off. Hypothesis: cluster-wide cold ingest drops from 17× to 1×
-   dataset, and the RDMA distribution phase is fast (~minutes at 11
-   GiB/s aggregate); disk write becomes the bottleneck and is the
-   honest lower bound for "everyone has everything cached".
+1. **Hydrate-broadcast (built and tested; first run uncovered a stall —
+   fix landed but not yet re-run)**. Two-phase: each node shard-pulls
+   from Azure (disjoint), then UCX all-to-all distributes to all 17
+   nodes. Optional via `mode=broadcast` parameter, default off.
+   Hypothesis: cluster-wide cold ingest drops from 17× to 1× dataset,
+   and the RDMA distribution phase is fast (~minutes at 11 GiB/s
+   aggregate); disk write becomes the bottleneck and is the honest
+   lower bound for "everyone has everything cached".
+
+   **Run #9 (broadcast, first attempt)** at 2026-04-29T08:33:57Z stalled
+   in Phase B. Phase A finished cleanly in ~4 min (each pod downloaded
+   its ~358-chunk shard ≈ 24.6 GB from Azure). Phase B then ran for
+   >20 min and only completed ~32 outbound peer fetches per pod (out of
+   ~5722 expected). Histograms showed `chunk_peer_fetch_seconds_count=32`
+   with `_sum ≈ 13948 s` — i.e. ≈ 11 fetches finished promptly (≤100 ms),
+   then 21 fetches each took several hundred seconds. Inbound serves
+   were skewed: coordinator served 1019 chunks (54 GB), one peer served
+   64, two sampled peers served 0. **Cause**: `run_broadcast_shard`
+   spawned chunks in source-major order. With `chunk_concurrency = 32`
+   and 16 sources, the first 32 spawns to acquire permits were all the
+   coordinator's chunks → every receiver hammered the same source,
+   serialising 16 outbound RDMA endpoints through the single UCX
+   runtime task. 15 sources sat idle. Fix in commit
+   `<round-robin commit>`: round-robin chunks across sources at spawn
+   time, plus a per-source semaphore sized at `chunk_concurrency /
+   n_sources` so no single endpoint can monopolise the puller. Not
+   re-run; left for the next session to validate.
 
 2. **Bump `azure.workers` from 1 → 8**. Single-runtime ceiling is
    ~28 Gbps documented. We're nowhere near it per-pod, but this is a
