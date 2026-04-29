@@ -6,13 +6,25 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \
     curl \
     ca-certificates \
+    git \
+    automake \
+    autoconf \
+    libtool \
     libfuse3-dev \
     libucx-dev \
-    libucc-dev \
     libibverbs-dev \
     librdmacm-dev \
     libclang-dev \
     && rm -rf /var/lib/apt/lists/*
+
+ARG UCC_VERSION=v1.4.0
+RUN git clone --depth 1 --branch ${UCC_VERSION} https://github.com/openucx/ucc.git /tmp/ucc && \
+    cd /tmp/ucc && \
+    ./autogen.sh && \
+    ./configure --prefix=/usr/local --with-ucx=/usr && \
+    make -j"$(nproc)" install && \
+    ldconfig && \
+    rm -rf /tmp/ucc
 
 ARG RUST_VERSION=stable
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
@@ -22,6 +34,7 @@ ENV CARGO_TERM_COLOR=always
 
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
 COPY src ./src
 COPY examples ./examples
 
@@ -34,7 +47,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libfuse3-3 \
     fuse3 \
     libucx0 \
-    libucc1 \
     libibverbs1 \
     librdmacm1t64 \
     ucx-utils \
@@ -42,6 +54,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
+COPY --from=builder /usr/local/lib/libucc* /usr/local/lib/
+COPY --from=builder /usr/local/lib/ucc /usr/local/lib/ucc
+RUN ldconfig
 COPY --from=builder /src/target/release/blobcached /usr/local/bin/blobcached
 
 ENTRYPOINT ["/usr/local/bin/blobcached"]
