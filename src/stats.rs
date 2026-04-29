@@ -737,7 +737,7 @@ pub async fn serve(
                                         .body(Full::new(Bytes::from(body)))
                                         .unwrap()
                                 }
-                                (&Method::POST, "/hydrate-ring-shard") => {
+                                (&Method::POST, "/hydrate-ring-step") => {
                                     let body = match req.into_body().collect().await {
                                         Ok(c) => c.to_bytes(),
                                         Err(e) => {
@@ -751,7 +751,7 @@ pub async fn serve(
                                             );
                                         }
                                     };
-                                    let rreq: crate::hydrate::HydrateRingShardRequest =
+                                    let rreq: crate::hydrate::HydrateRingStepRequest =
                                         match serde_json::from_slice(&body) {
                                             Ok(r) => r,
                                             Err(e) => {
@@ -765,7 +765,7 @@ pub async fn serve(
                                                 );
                                             }
                                         };
-                                    let r = crate::hydrate::run_ring_shard(
+                                    let r = crate::hydrate::run_ring_step(
                                         rreq,
                                         fetcher.clone(),
                                         mounts.clone(),
