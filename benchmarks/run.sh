@@ -25,6 +25,7 @@ set -uo pipefail
 #   --out-dir DIR        output directory               (default: benchmarks/out)
 #   --passes N           number of read passes          (default: 1)
 #   --hydrate            run /hydrate before passes     (default: off)
+#   --hydrate-mode MODE  default | broadcast            (default: default)
 #   --clear-cache        POST /clear-cache before run   (default: off)
 #   --pf-port N          local port-forward port        (default: 17773)
 #   --hydrate-timeout N  curl --max-time for hydrate    (default: 3700)
@@ -38,6 +39,7 @@ TAG=${TAG:-$(date -u +%Y%m%d-%H%M)}
 OUT_DIR=${OUT_DIR:-benchmarks/out}
 PASSES=${PASSES:-1}
 DO_HYDRATE=${DO_HYDRATE:-0}
+HYDRATE_MODE=${HYDRATE_MODE:-default}
 DO_CLEAR=${DO_CLEAR:-0}
 PF_LOCAL_PORT=${PF_LOCAL_PORT:-17773}
 HYDRATE_TIMEOUT_S=${HYDRATE_TIMEOUT_S:-3700}
@@ -54,6 +56,7 @@ while [ $# -gt 0 ]; do
     --out-dir) OUT_DIR=$2; shift 2;;
     --passes) PASSES=$2; shift 2;;
     --hydrate) DO_HYDRATE=1; shift;;
+    --hydrate-mode) HYDRATE_MODE=$2; DO_HYDRATE=1; shift 2;;
     --clear-cache) DO_CLEAR=1; shift;;
     --pf-port) PF_LOCAL_PORT=$2; shift 2;;
     --hydrate-timeout) HYDRATE_TIMEOUT_S=$2; shift 2;;
@@ -93,7 +96,7 @@ stop_pf() {
 }
 
 echo "=========================================="
-echo "RUN_START=$(date -u +%FT%TZ) tag=$TAG ns=$NS mount=$MOUNT prefix=$PATH_PREFIX glob=$READ_GLOB passes=$PASSES hydrate=$DO_HYDRATE clear=$DO_CLEAR"
+echo "RUN_START=$(date -u +%FT%TZ) tag=$TAG ns=$NS mount=$MOUNT prefix=$PATH_PREFIX glob=$READ_GLOB passes=$PASSES hydrate=$DO_HYDRATE hydrate_mode=$HYDRATE_MODE clear=$DO_CLEAR"
 echo "=========================================="
 
 if [ "$DO_CLEAR" = "1" ]; then
@@ -120,7 +123,7 @@ if [ "$DO_HYDRATE" = "1" ]; then
   H0=$(date +%s.%N)
   curl -sS --max-time "$HYDRATE_TIMEOUT_S" -X POST "http://127.0.0.1:${PF_LOCAL_PORT}/hydrate" \
     -H 'content-type: application/json' \
-    -d "{\"mount\":\"${MOUNT}\",\"path\":\"${PATH_PREFIX}\",\"recursive\":true}" \
+    -d "{\"mount\":\"${MOUNT}\",\"path\":\"${PATH_PREFIX}\",\"recursive\":true,\"mode\":\"${HYDRATE_MODE}\"}" \
     >"$OUT_DIR/${TAG}-hydrate.json" 2>"$OUT_DIR/${TAG}-hydrate.err"
   HRC=$?
   H1=$(date +%s.%N)
