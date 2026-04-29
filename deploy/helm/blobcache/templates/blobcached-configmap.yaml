@@ -68,9 +68,7 @@ data:
     {{- with .Values.config.transport.peerMaxMaybeAttempts }}
     peer_max_maybe_attempts = {{ printf "%d" (int64 .) }}
     {{- end }}
-    {{- with .Values.config.transport.stampedeWaitMs }}
-    stampede_wait_ms = {{ printf "%d" (int64 .) }}
-    {{- end }}
+    stampede_wait_ms = {{ printf "%d" (int64 .Values.config.transport.stampedeWaitMs) }}
 
     [stats]
     bind = {{ .Values.config.stats.bind | quote }}
