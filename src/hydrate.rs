@@ -56,6 +56,7 @@ pub enum HydrateMode {
     Default,
     Broadcast,
     Ucc,
+    Ring,
 }
 
 impl Default for HydrateMode {
@@ -98,6 +99,46 @@ pub struct HydrateBroadcastShardResponse {
     pub elapsed_ms: u64,
     pub start_unix_ms: u64,
     pub end_unix_ms: u64,
+}
+
+/// Ring-allgather request: each receiver gets the full sharded plan
+/// (sorted-by-id ordering across the cluster) plus its own node id, and
+/// derives its rank / prev neighbor independently. After Phase A every
+/// node holds exactly `plan[my_rank].chunks`; the ring then performs
+/// N-1 sequential pull steps from the previous neighbor, picking up
+/// one shard per step until all N shards are local. Pull-based, so it
+/// reuses the existing `RdmaPeerClient::fetch_chunk` (with stampede-wait)
+/// and needs no separate transport. See `run_ring_shard` for the
+/// per-step algorithm.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HydrateRingShardRequest {
+    pub mount: String,
+    pub plan: Vec<BroadcastSource>,
+    pub my_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HydrateRingShardResponse {
+    pub fetched: u64,
+    pub bytes: u64,
+    pub errors: Vec<String>,
+    pub elapsed_ms: u64,
+    pub start_unix_ms: u64,
+    pub end_unix_ms: u64,
+    /// Per-step (pulls_ms, drain_ms, bytes) so coordinator can attribute
+    /// where ring time was spent.
+    pub steps: Vec<RingStepStat>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RingStepStat {
+    pub step: u32,
+    pub source_rank: u32,
+    pub pulls_ms: u64,
+    pub drain_ms: u64,
+    pub bytes: u64,
+    pub n_chunks: u64,
+    pub n_errors: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -588,6 +629,40 @@ pub async fn run_coordinator(
         );
     } else if mode == HydrateMode::Ucc {
         tracing::warn!("skipping hydrate Phase B (ucc) because Phase A reported errors");
+    } else if mode == HydrateMode::Ring && peers.iter().all(|p| p.errors.is_empty()) {
+        let phase_b_t0 = Instant::now();
+        broadcast_peers = run_ring_phase(
+            &req.mount,
+            &plan,
+            &me_id,
+            &me_transport_url,
+            fetcher.clone(),
+            mounts.clone(),
+            http.clone(),
+            global_timeout,
+        )
+        .await;
+        phase_b_elapsed_ms = Some(phase_b_t0.elapsed().as_millis() as u64);
+        let phase_b_bytes: u64 = broadcast_peers.iter().map(|p| p.bytes).sum();
+        let phase_b_mibs = if let Some(ms) = phase_b_elapsed_ms {
+            if ms > 0 {
+                (phase_b_bytes as f64 / 1024.0 / 1024.0) / (ms as f64 / 1000.0)
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+        tracing::info!(
+            elapsed_ms = phase_b_elapsed_ms.unwrap_or(0),
+            bytes = phase_b_bytes,
+            aggregate_mibs = phase_b_mibs,
+            n_targets = broadcast_peers.len(),
+            n_errors = broadcast_peers.iter().map(|p| p.errors.len()).sum::<usize>(),
+            "hydrate phase B (ring) complete"
+        );
+    } else if mode == HydrateMode::Ring {
+        tracing::warn!("skipping hydrate Phase B (ring) because Phase A reported errors");
     }
 
     let elapsed_ms = t0.elapsed().as_millis() as u64;
@@ -618,6 +693,7 @@ fn hydrate_mode(request_mode: Option<HydrateMode>) -> HydrateMode {
         match s.to_ascii_lowercase().as_str() {
             "broadcast" => return HydrateMode::Broadcast,
             "ucc" => return HydrateMode::Ucc,
+            "ring" => return HydrateMode::Ring,
             _ => {}
         }
     }
@@ -1075,5 +1151,337 @@ pub async fn run_broadcast_shard(
         elapsed_ms: t0.elapsed().as_millis() as u64,
         start_unix_ms,
         end_unix_ms: now_unix_ms(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_ring_phase(
+    mount: &str,
+    plan: &[BroadcastSource],
+    me_id: &str,
+    me_transport_url: &str,
+    fetcher: Arc<Fetcher>,
+    mounts: Arc<HashMap<String, MountConfig>>,
+    http: reqwest::Client,
+    global_timeout: std::time::Duration,
+) -> Vec<PerPeerStats> {
+    let mut sorted_plan: Vec<BroadcastSource> = plan.to_vec();
+    sorted_plan.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+    let n_targets = sorted_plan.len();
+    let mut handles = Vec::with_capacity(n_targets);
+    for receiver in sorted_plan.iter() {
+        let receiver_id = receiver.node_id.clone();
+        let receiver_url = receiver.transport_url.clone();
+        let assigned: u64 = sorted_plan
+            .iter()
+            .filter(|s| s.node_id != receiver_id)
+            .map(|s| s.chunks.len() as u64)
+            .sum();
+        let body = HydrateRingShardRequest {
+            mount: mount.to_string(),
+            plan: sorted_plan.clone(),
+            my_id: receiver_id.clone(),
+        };
+        if receiver_id == me_id {
+            let f = fetcher.clone();
+            let m = mounts.clone();
+            handles.push(tokio::spawn(async move {
+                let r = run_ring_shard(body, f, m).await;
+                PerPeerStats {
+                    node_id: receiver_id,
+                    assigned_chunks: assigned,
+                    fetched: r.fetched,
+                    bytes: r.bytes,
+                    errors: r.errors,
+                    elapsed_ms: r.elapsed_ms,
+                    start_unix_ms: r.start_unix_ms,
+                    end_unix_ms: r.end_unix_ms,
+                }
+            }));
+        } else {
+            let host = receiver_url
+                .trim_start_matches("http://")
+                .split(':')
+                .next()
+                .unwrap_or("")
+                .to_string();
+            let endpoint = format!("http://{host}:7773/hydrate-ring-shard");
+            let http = http.clone();
+            handles.push(tokio::spawn(async move {
+                let t0 = Instant::now();
+                let post_start_unix_ms = now_unix_ms();
+                let resp = http
+                    .post(&endpoint)
+                    .json(&body)
+                    .timeout(std::time::Duration::from_secs(3600))
+                    .send()
+                    .await;
+                match resp {
+                    Ok(r) => match r.json::<HydrateRingShardResponse>().await {
+                        Ok(s) => PerPeerStats {
+                            node_id: receiver_id,
+                            assigned_chunks: assigned,
+                            fetched: s.fetched,
+                            bytes: s.bytes,
+                            errors: s.errors,
+                            elapsed_ms: s.elapsed_ms,
+                            start_unix_ms: s.start_unix_ms,
+                            end_unix_ms: s.end_unix_ms,
+                        },
+                        Err(e) => PerPeerStats {
+                            node_id: receiver_id,
+                            assigned_chunks: assigned,
+                            fetched: 0,
+                            bytes: 0,
+                            errors: vec![format!("decode: {e}")],
+                            elapsed_ms: t0.elapsed().as_millis() as u64,
+                            start_unix_ms: post_start_unix_ms,
+                            end_unix_ms: now_unix_ms(),
+                        },
+                    },
+                    Err(e) => PerPeerStats {
+                        node_id: receiver_id,
+                        assigned_chunks: assigned,
+                        fetched: 0,
+                        bytes: 0,
+                        errors: vec![format!("post: {e}")],
+                        elapsed_ms: t0.elapsed().as_millis() as u64,
+                        start_unix_ms: post_start_unix_ms,
+                        end_unix_ms: now_unix_ms(),
+                    },
+                }
+            }));
+        }
+    }
+    let _ = me_transport_url;
+    let abort_handles: Vec<_> = handles.iter().map(|h| h.abort_handle()).collect();
+    let join_all = async {
+        let mut out = Vec::with_capacity(n_targets);
+        for h in handles {
+            match h.await {
+                Ok(s) => out.push(s),
+                Err(e) => out.push(PerPeerStats {
+                    node_id: "unknown".into(),
+                    assigned_chunks: 0,
+                    fetched: 0,
+                    bytes: 0,
+                    errors: vec![format!("join: {e}")],
+                    elapsed_ms: 0,
+                    start_unix_ms: 0,
+                    end_unix_ms: 0,
+                }),
+            }
+        }
+        out
+    };
+    match tokio::time::timeout(global_timeout, join_all).await {
+        Ok(p) => p,
+        Err(_) => {
+            for ah in abort_handles {
+                ah.abort();
+            }
+            vec![PerPeerStats {
+                node_id: "coordinator".into(),
+                assigned_chunks: 0,
+                fetched: 0,
+                bytes: 0,
+                errors: vec![format!(
+                    "phase-b ring coordinator timeout after {}s; aborted outstanding shards",
+                    global_timeout.as_secs()
+                )],
+                elapsed_ms: global_timeout.as_millis() as u64,
+                start_unix_ms: 0,
+                end_unix_ms: now_unix_ms(),
+            }]
+        }
+    }
+}
+
+pub async fn run_ring_shard(
+    req: HydrateRingShardRequest,
+    fetcher: Arc<Fetcher>,
+    mounts: Arc<HashMap<String, MountConfig>>,
+) -> HydrateRingShardResponse {
+    let t0 = Instant::now();
+    let start_unix_ms = now_unix_ms();
+    let mount = match mounts.get(&req.mount) {
+        Some(m) => m.clone(),
+        None => {
+            return HydrateRingShardResponse {
+                fetched: 0,
+                bytes: 0,
+                errors: vec![format!("unknown mount {}", req.mount)],
+                elapsed_ms: 0,
+                start_unix_ms,
+                end_unix_ms: now_unix_ms(),
+                steps: Vec::new(),
+            };
+        }
+    };
+    let world = req.plan.len();
+    if world < 2 {
+        return HydrateRingShardResponse {
+            fetched: 0,
+            bytes: 0,
+            errors: Vec::new(),
+            elapsed_ms: t0.elapsed().as_millis() as u64,
+            start_unix_ms,
+            end_unix_ms: now_unix_ms(),
+            steps: Vec::new(),
+        };
+    }
+    let my_rank = match req.plan.iter().position(|s| s.node_id == req.my_id) {
+        Some(r) => r,
+        None => {
+            return HydrateRingShardResponse {
+                fetched: 0,
+                bytes: 0,
+                errors: vec![format!("ring: my_id {} not in plan", req.my_id)],
+                elapsed_ms: t0.elapsed().as_millis() as u64,
+                start_unix_ms,
+                end_unix_ms: now_unix_ms(),
+                steps: Vec::new(),
+            };
+        }
+    };
+    let prev_rank = (my_rank + world - 1) % world;
+    let prev = &req.plan[prev_rank];
+    let prev_worker_addr: Option<Vec<u8>> = match prev.ucx_worker_addr_b64.as_ref() {
+        Some(s) => match BASE64_STANDARD.decode(s) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                return HydrateRingShardResponse {
+                    fetched: 0,
+                    bytes: 0,
+                    errors: vec![format!("ring: prev {} bad worker addr: {e}", prev.node_id)],
+                    elapsed_ms: t0.elapsed().as_millis() as u64,
+                    start_unix_ms,
+                    end_unix_ms: now_unix_ms(),
+                    steps: Vec::new(),
+                };
+            }
+        },
+        None => None,
+    };
+    tracing::info!(
+        world,
+        my_rank,
+        prev_rank,
+        prev_id = %prev.node_id,
+        "ring shard starting"
+    );
+    let chunk_conc = fetcher.chunk_concurrency_limit().max(1);
+    let mut total_fetched = 0u64;
+    let mut total_bytes = 0u64;
+    let mut total_errors: Vec<String> = Vec::new();
+    let mut steps: Vec<RingStepStat> = Vec::new();
+    for k in 1..world {
+        let source_rank = (my_rank + world - k) % world;
+        let source_chunks = &req.plan[source_rank].chunks;
+        let n_chunks = source_chunks.len();
+        let pulls_t0 = Instant::now();
+        let sem = Arc::new(tokio::sync::Semaphore::new(chunk_conc));
+        let mut handles = Vec::with_capacity(n_chunks);
+        for c in source_chunks.iter().cloned() {
+            let f = fetcher.clone();
+            let m = mount.clone();
+            let peer_id = prev.node_id.clone();
+            let transport_url = prev.transport_url.clone();
+            let wa = prev_worker_addr.clone();
+            let sem = sem.clone();
+            handles.push(tokio::spawn(async move {
+                let _ring_permit = match sem.acquire_owned().await {
+                    Ok(p) => p,
+                    Err(_) => {
+                        return (
+                            c,
+                            Err(crate::error::BcError::Other(
+                                "ring step semaphore closed".into(),
+                            )),
+                        );
+                    }
+                };
+                let permit = match f.acquire_chunk_permit().await {
+                    Ok(p) => p,
+                    Err(e) => return (c, Err(e)),
+                };
+                let res = f
+                    .pull_chunk_from_peer_wait(
+                        &m,
+                        &c.blob,
+                        c.offset,
+                        c.len,
+                        &peer_id,
+                        &transport_url,
+                        wa.as_deref(),
+                        300_000,
+                    )
+                    .await;
+                drop(permit);
+                drop(_ring_permit);
+                (c, res)
+            }));
+        }
+        let mut step_fetched = 0u64;
+        let mut step_bytes = 0u64;
+        let mut step_errors = 0u64;
+        for h in handles {
+            match h.await {
+                Ok((_, Ok(b))) => {
+                    step_fetched += 1;
+                    step_bytes += b.len() as u64;
+                }
+                Ok((c, Err(e))) => {
+                    step_errors += 1;
+                    if total_errors.len() < 32 {
+                        total_errors.push(format!(
+                            "step {k} from {} {}@{}: {e}",
+                            prev.node_id, c.blob, c.offset
+                        ));
+                    }
+                }
+                Err(e) => {
+                    step_errors += 1;
+                    if total_errors.len() < 32 {
+                        total_errors.push(format!("step {k} join: {e}"));
+                    }
+                }
+            }
+        }
+        let pulls_elapsed_ms = pulls_t0.elapsed().as_millis() as u64;
+        let drain_t0 = Instant::now();
+        fetcher.await_inserts_drained().await;
+        let drain_elapsed_ms = drain_t0.elapsed().as_millis() as u64;
+        tracing::info!(
+            step = k,
+            source_rank,
+            source_id = %req.plan[source_rank].node_id,
+            n_chunks = step_fetched,
+            bytes = step_bytes,
+            pulls_ms = pulls_elapsed_ms,
+            drain_ms = drain_elapsed_ms,
+            n_errors = step_errors,
+            "ring step complete"
+        );
+        steps.push(RingStepStat {
+            step: k as u32,
+            source_rank: source_rank as u32,
+            pulls_ms: pulls_elapsed_ms,
+            drain_ms: drain_elapsed_ms,
+            bytes: step_bytes,
+            n_chunks: step_fetched,
+            n_errors: step_errors,
+        });
+        total_fetched += step_fetched;
+        total_bytes += step_bytes;
+    }
+    HydrateRingShardResponse {
+        fetched: total_fetched,
+        bytes: total_bytes,
+        errors: total_errors,
+        elapsed_ms: t0.elapsed().as_millis() as u64,
+        start_unix_ms,
+        end_unix_ms: now_unix_ms(),
+        steps,
     }
 }

@@ -769,6 +769,31 @@ impl Fetcher {
         transport_url: &str,
         ucx_worker_addr: Option<&[u8]>,
     ) -> Result<Bytes> {
+        self.pull_chunk_from_peer_wait(
+            mount,
+            blob_path,
+            offset,
+            expected_len,
+            peer_id,
+            transport_url,
+            ucx_worker_addr,
+            0,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn pull_chunk_from_peer_wait(
+        self: &Arc<Self>,
+        mount: &MountConfig,
+        blob_path: &str,
+        offset: u64,
+        expected_len: u64,
+        peer_id: &str,
+        transport_url: &str,
+        ucx_worker_addr: Option<&[u8]>,
+        wait_ms: u32,
+    ) -> Result<Bytes> {
         let key = ChunkKey {
             mount: mount.name.clone(),
             blob: blob_path.to_string(),
@@ -788,7 +813,7 @@ impl Fetcher {
                 ucx_worker_addr,
                 &key,
                 expected_len as u32,
-                0,
+                wait_ms,
             )
             .await?;
         self.stats
