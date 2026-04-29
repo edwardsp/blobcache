@@ -17,7 +17,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libclang-dev \
     && rm -rf /var/lib/apt/lists/*
 
-ARG UCC_VERSION=v1.4.0
+ARG UCC_VERSION=v1.7.0
 RUN git clone --depth 1 --branch ${UCC_VERSION} https://github.com/openucx/ucc.git /tmp/ucc && \
     cd /tmp/ucc && \
     ./autogen.sh && \
