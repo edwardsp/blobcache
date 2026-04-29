@@ -132,7 +132,7 @@ config:
     chunkSize: 4194304          # 4 MiB; MUST match across cluster
   azure:
     poolMaxIdlePerHost: 512
-    workers: 8                  # see BENCHMARKS § v2.9 for tuning
+    workers: 16                 # see cold-read.md § Phase A audit (2026-04-29)
     blockSize: 4194304          # 4 MiB; 0 = use cache.chunkSize
   cluster:
     bind: "0.0.0.0:7771"
@@ -142,7 +142,7 @@ config:
     kind: rdma                  # "tcp" or "rdma" (image is built --features ucx)
     bind: "0.0.0.0:7772"
     advertise: []               # e.g. ["http://10.0.0.6:7772"]
-    chunkConcurrency: 32
+    chunkConcurrency: 128       # 32→128: hydrate Phase A was permit-bound (cold-read.md)
     peerConcurrency: 32
     prefetchDepth: 0
     prefetchThreshold: 3

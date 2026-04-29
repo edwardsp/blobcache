@@ -8,6 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     libfuse3-dev \
     libucx-dev \
+    libucc-dev \
     libibverbs-dev \
     librdmacm-dev \
     libclang-dev \
@@ -33,6 +34,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libfuse3-3 \
     fuse3 \
     libucx0 \
+    libucc1 \
     libibverbs1 \
     librdmacm1t64 \
     ucx-utils \

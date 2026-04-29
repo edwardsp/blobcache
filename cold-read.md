@@ -199,6 +199,33 @@ Listed roughly in expected leverage. Pick the ones you want to run.
    Trivial change, no code work, just `--set config.azure.workers=8`
    on helm upgrade.
 
+   **Update 2026-04-29**: deployed `azure.workers=8` was already in
+   force when run #9 executed (confirmed via `helm get values blobcache`
+   — chart default is `workers: 8` in values.yaml; user-supplied values
+   never overrode it). Despite that, run #9 Phase A clocked
+   ~127 MB/s/pod cold (24.6 GB / ~4 min). A targeted code-path audit
+   (explore agent, 2026-04-29) confirmed the knob is wired correctly:
+   `BlobFetcherPool::new` constructs N independent multi-thread tokio
+   runtimes, each owning its own `BlobClient` (which builds its own
+   `reqwest::Client` with independent HTTP/1.1 connection pool); the
+   hot path round-robins via `AtomicUsize` and dispatches every GET
+   onto the chosen worker's runtime via `worker.rt.spawn(...)`.
+   Hydrate's `run_shard` reaches this pool through
+   `Fetcher::fetch_chunk_origin_only → fetch_chunk_inner → do_fetch →
+   pool.get_blob_range`. So workers=8 is exercised, not silently capped.
+
+   That makes the remaining suspects: (a) `transport.chunk_concurrency`
+   (default 32) gating in-flight GETs; (b) Azure-side throttling on a
+   single storage account fanning out to 17 pods × ≤32 concurrent GETs
+   = 544 in-flight requests (visible in
+   `blob_request_retries_total` / `blob_retry_sleep_seconds_total`
+   if it's the cause); (c) per-pod NIC / VM SKU bandwidth ceiling.
+
+   No per-worker Prometheus label exists today — adding one
+   (`worker_id` on `blob_fetches_total` etc.) would prove the
+   round-robin is even across all 8 runtimes. Tracked as next step
+   below.
+
 3. **Bump prefetch `depth=8, concurrency=8`** (your suggestion).
    Current is `depth=4, concurrency=4`. Doubles read-ahead window per
    pod. Worth testing under baseline (stampede on) to see if it
