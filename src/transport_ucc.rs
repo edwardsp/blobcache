@@ -18,8 +18,11 @@ pub mod sys {
 
 use sys::*;
 
-const CREATE_TIMEOUT: Duration = Duration::from_secs(120);
 const COLLECTIVE_TIMEOUT: Duration = Duration::from_secs(300);
+const UCC_CONTEXT_PARAM_FIELD_OOB_MASK: u64 = 1 << 4;
+const UCC_TEAM_PARAM_FIELD_OOB_MASK: u64 = 1 << 6;
+const UCC_COLL_ARGS_FIELD_FLAGS_MASK: u64 = 1 << 2;
+const UCC_COLL_ARGS_FLAG_CONTIG_DST_BUFFER_MASK: u64 = 1 << 2;
 
 struct SendPtr<T>(*mut T);
 
@@ -77,7 +80,7 @@ impl UccCollectives {
 
         let mut lib_params: ucc_lib_params_t = unsafe { mem::zeroed() };
         let mut lib: ucc_lib_h = ptr::null_mut();
-        let init_status = unsafe { ucc_init(&mut lib_params, lib_config, &mut lib) };
+        let init_status = unsafe { ucc_lib_init(&mut lib_params, lib_config, &mut lib) };
         unsafe { ucc_lib_config_release(lib_config) };
         check_status("ucc_init", init_status)?;
 
@@ -121,23 +124,18 @@ impl UccCollectives {
         )?;
 
         let mut ctx_params: ucc_context_params_t = unsafe { mem::zeroed() };
-        ctx_params.mask = UCC_CONTEXT_PARAM_FIELD_OOB as u64;
+        ctx_params.mask = UCC_CONTEXT_PARAM_FIELD_OOB_MASK;
         ctx_params.oob = oob_coll(bridge_ptr, rank, world);
 
         let mut context: ucc_context_h = ptr::null_mut();
         let ctx_status = unsafe {
-            ucc_context_create_post(lib, &mut ctx_params, ctx_config, &mut context)
+            ucc_context_create(lib, &mut ctx_params, ctx_config, &mut context)
         };
         unsafe { ucc_context_config_release(ctx_config) };
-        check_status("ucc_context_create_post", ctx_status)?;
-
-        if let Err(e) = wait_context_create(context) {
-            unsafe { ucc_context_destroy(context) };
-            return Err(e);
-        }
+        check_status("ucc_context_create", ctx_status)?;
 
         let mut team_params: ucc_team_params_t = unsafe { mem::zeroed() };
-        team_params.mask = UCC_TEAM_PARAM_FIELD_OOB as u64;
+        team_params.mask = UCC_TEAM_PARAM_FIELD_OOB_MASK;
         team_params.oob = oob_coll(bridge_ptr, rank, world);
 
         let mut ctx_array = [context];
@@ -214,22 +212,22 @@ impl UccCollectives {
             )));
         }
 
-        let counts32 = to_u32_vec("counts", counts)?;
-        let displs32 = to_u32_vec("displacements", displs)?;
+        let counts64 = to_u64_vec("counts", counts)?;
+        let displs64 = to_u64_vec("displacements", displs)?;
         let mut coll: ucc_coll_args_t = unsafe { mem::zeroed() };
-        coll.mask = UCC_COLL_ARGS_FIELD_FLAGS as u64;
-        coll.flags = UCC_COLL_ARGS_FLAG_CONTIG_DST_BUFFER as u64;
+        coll.mask = UCC_COLL_ARGS_FIELD_FLAGS_MASK;
+        coll.flags = UCC_COLL_ARGS_FLAG_CONTIG_DST_BUFFER_MASK;
         coll.coll_type = ucc_coll_type_t_UCC_COLL_TYPE_ALLGATHERV;
         unsafe {
             coll.src.info.buffer = send.as_ptr() as *mut c_void;
             coll.src.info.count = send.len() as u64;
-            coll.src.info.datatype = ucc_datatype_t_UCC_DT_UINT8;
-            coll.src.info.mem_type = ucc_memory_type_t_UCC_MEMORY_TYPE_HOST;
+            coll.src.info.datatype = ucc_datatype_UCC_DT_UINT8;
+            coll.src.info.mem_type = ucc_memory_type_UCC_MEMORY_TYPE_HOST;
             coll.dst.info_v.buffer = recv.as_mut_ptr() as *mut c_void;
-            coll.dst.info_v.counts = counts32.as_ptr() as *mut c_void;
-            coll.dst.info_v.displacements = displs32.as_ptr() as *mut c_void;
-            coll.dst.info_v.datatype = ucc_datatype_t_UCC_DT_UINT8;
-            coll.dst.info_v.mem_type = ucc_memory_type_t_UCC_MEMORY_TYPE_HOST;
+            coll.dst.info_v.counts = counts64.as_ptr() as *mut u64;
+            coll.dst.info_v.displacements = displs64.as_ptr() as *mut u64;
+            coll.dst.info_v.datatype = ucc_datatype_UCC_DT_UINT8;
+            coll.dst.info_v.mem_type = ucc_memory_type_UCC_MEMORY_TYPE_HOST;
         }
 
         let mut req: ucc_coll_req_h = ptr::null_mut();
@@ -246,7 +244,7 @@ impl UccCollectives {
 
         let start = Instant::now();
         loop {
-            match unsafe { ucc_collective_test(req) } {
+            match unsafe { ucc_collective_test_ffi(req) } {
                 s if status_is_ok(s) => {
                     unsafe { ucc_collective_finalize(req) };
                     return Ok(());
@@ -320,6 +318,9 @@ extern "C" fn oob_allgather(
     let done = SendPtr(unsafe { &raw mut (*req_ptr).done });
     let ok = SendPtr(unsafe { &raw mut (*req_ptr).ok });
     let recv_ptr = SendPtr(recv as *mut u8);
+    let done_addr = done.0 as usize;
+    let ok_addr = ok.0 as usize;
+    let recv_addr = recv_ptr.0 as usize;
     let client = bridge.http_client.clone();
     let coord_url = bridge.coord_url.clone();
     let rank = bridge.rank;
@@ -329,9 +330,9 @@ extern "C" fn oob_allgather(
         match result {
             Ok(bytes) if bytes.len() == size.saturating_mul(world as usize) => {
                 unsafe {
-                    ptr::copy_nonoverlapping(bytes.as_ptr(), recv_ptr.0, bytes.len());
+                    ptr::copy_nonoverlapping(bytes.as_ptr(), recv_addr as *mut u8, bytes.len());
                 }
-                unsafe { (*ok.0).store(true, Ordering::Release) };
+                unsafe { (*(ok_addr as *mut AtomicBool)).store(true, Ordering::Release) };
             }
             Ok(bytes) => {
                 tracing::warn!(got = bytes.len(), want = size * world as usize, "ucc oob allgather size mismatch");
@@ -340,7 +341,7 @@ extern "C" fn oob_allgather(
                 tracing::warn!(error = %e, "ucc oob allgather failed");
             }
         }
-        unsafe { (*done.0).store(true, Ordering::Release) };
+        unsafe { (*(done_addr as *mut AtomicBool)).store(true, Ordering::Release) };
     });
     status_ok()
 }
@@ -369,23 +370,6 @@ extern "C" fn oob_free(request: *mut c_void) -> ucc_status_t {
     status_ok()
 }
 
-fn wait_context_create(context: ucc_context_h) -> Result<()> {
-    let start = Instant::now();
-    loop {
-        match unsafe { ucc_context_create_test(context) } {
-            s if status_is_ok(s) => return Ok(()),
-            s if status_is_progress(s) => {
-                unsafe { ucc_context_progress(context) };
-                if start.elapsed() > CREATE_TIMEOUT {
-                    return Err(BcError::Other("ucc context create timed out".into()));
-                }
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            s => return Err(status_error("ucc_context_create_test", s)),
-        }
-    }
-}
-
 fn wait_team_create(team: ucc_team_h, context: ucc_context_h) -> Result<()> {
     let start = Instant::now();
     loop {
@@ -403,11 +387,11 @@ fn wait_team_create(team: ucc_team_h, context: ucc_context_h) -> Result<()> {
     }
 }
 
-fn to_u32_vec(name: &str, values: &[usize]) -> Result<Vec<u32>> {
+fn to_u64_vec(name: &str, values: &[usize]) -> Result<Vec<u64>> {
     values
         .iter()
         .map(|v| {
-            u32::try_from(*v).map_err(|_| BcError::Other(format!("ucc allgatherv {name} value too large: {v}")))
+            u64::try_from(*v).map_err(|_| BcError::Other(format!("ucc allgatherv {name} value too large: {v}")))
         })
         .collect()
 }
@@ -450,4 +434,11 @@ fn status_progress() -> ucc_status_t {
 
 fn status_no_message() -> ucc_status_t {
     ucc_status_t_UCC_ERR_NO_MESSAGE
+}
+
+unsafe fn ucc_collective_test_ffi(request: ucc_coll_req_h) -> ucc_status_t {
+    unsafe extern "C" {
+        fn ucc_collective_test(request: ucc_coll_req_h) -> ucc_status_t;
+    }
+    unsafe { ucc_collective_test(request) }
 }
