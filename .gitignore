@@ -25,3 +25,5 @@ bench/sweep_workers*.out
 bench/deploy-configs
 benchmarks/out
 docs/INTEGRATION_PLAN.md
+
+night-progress.md
