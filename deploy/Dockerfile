@@ -52,6 +52,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ucx-utils \
     ibverbs-utils \
     ca-certificates \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /usr/local/lib/libucc* /usr/local/lib/

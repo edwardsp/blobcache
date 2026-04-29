@@ -220,6 +220,13 @@ pub async fn run_coordinator(
     http: reqwest::Client,
 ) -> Result<HydrateResponse> {
     let t0 = Instant::now();
+    let mode = req.mode.unwrap_or_default();
+    tracing::info!(
+        mount = %req.mount,
+        path = %req.path,
+        mode = ?mode,
+        "hydrate request received"
+    );
     let mount = mounts
         .get(&req.mount)
         .cloned()
@@ -280,7 +287,6 @@ pub async fn run_coordinator(
         }
     }
     let total_chunks = all_chunks.len() as u64;
-    let mode = req.mode.unwrap_or_default();
     if total_chunks == 0 {
         return Ok(HydrateResponse {
             mount: req.mount,
@@ -475,6 +481,20 @@ pub async fn run_coordinator(
         }
     }
     let phase_a_elapsed_ms = phase_a_t0.elapsed().as_millis() as u64;
+    let phase_a_bytes: u64 = peers.iter().map(|p| p.bytes).sum();
+    let phase_a_mibs = if phase_a_elapsed_ms > 0 {
+        (phase_a_bytes as f64 / 1024.0 / 1024.0) / (phase_a_elapsed_ms as f64 / 1000.0)
+    } else {
+        0.0
+    };
+    tracing::info!(
+        elapsed_ms = phase_a_elapsed_ms,
+        bytes = phase_a_bytes,
+        aggregate_mibs = phase_a_mibs,
+        n_peers = peers.len(),
+        n_errors = peers.iter().map(|p| p.errors.len()).sum::<usize>(),
+        "hydrate phase A complete"
+    );
 
     let mut broadcast_peers: Vec<PerPeerStats> = Vec::new();
     let mut phase_b_elapsed_ms: Option<u64> = None;
@@ -492,6 +512,27 @@ pub async fn run_coordinator(
         )
         .await;
         phase_b_elapsed_ms = Some(phase_b_t0.elapsed().as_millis() as u64);
+        let phase_b_bytes: u64 = broadcast_peers.iter().map(|p| p.bytes).sum();
+        let phase_b_mibs = if let Some(ms) = phase_b_elapsed_ms {
+            if ms > 0 {
+                (phase_b_bytes as f64 / 1024.0 / 1024.0) / (ms as f64 / 1000.0)
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+        tracing::info!(
+            elapsed_ms = phase_b_elapsed_ms.unwrap_or(0),
+            bytes = phase_b_bytes,
+            aggregate_mibs = phase_b_mibs,
+            n_targets = broadcast_peers.len(),
+            n_errors = broadcast_peers
+                .iter()
+                .map(|p| p.errors.len())
+                .sum::<usize>(),
+            "hydrate phase B (broadcast) complete"
+        );
     } else if mode == HydrateMode::Broadcast {
         tracing::warn!(
             "skipping hydrate Phase B (broadcast) because Phase A reported errors"
