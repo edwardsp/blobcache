@@ -26,6 +26,8 @@ RUN git clone --depth 1 --branch ${UCC_VERSION} https://github.com/openucx/ucc.g
     ldconfig && \
     rm -rf /tmp/ucc
 
+ENV PKG_CONFIG_PATH=/usr/local/lib/pkgconfig
+
 ARG RUST_VERSION=stable
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
     sh -s -- -y --default-toolchain ${RUST_VERSION} --profile minimal
@@ -38,7 +40,7 @@ COPY crates ./crates
 COPY src ./src
 COPY examples ./examples
 
-RUN cargo build --release --locked --features ucx
+RUN cargo build --release --locked --features ucc
 
 FROM ubuntu:24.04
 
