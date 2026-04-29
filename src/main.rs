@@ -24,6 +24,8 @@ mod transport;
 mod transport_ucx;
 #[cfg(feature = "ucc")]
 mod transport_ucc;
+#[cfg(feature = "ucc")]
+mod ucc_oob;
 
 use crate::blob_fetcher_pool::BlobFetcherPool;
 use crate::cache::DiskCache;
