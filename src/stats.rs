@@ -669,6 +669,47 @@ pub async fn serve(
                                         .body(Full::new(Bytes::from(body)))
                                         .unwrap()
                                 }
+                                (&Method::POST, "/hydrate-broadcast-shard") => {
+                                    let body = match req.into_body().collect().await {
+                                        Ok(c) => c.to_bytes(),
+                                        Err(e) => {
+                                            return Ok::<_, Infallible>(
+                                                Response::builder()
+                                                    .status(400)
+                                                    .body(Full::new(Bytes::from(format!(
+                                                        "body read: {e}"
+                                                    ))))
+                                                    .unwrap(),
+                                            );
+                                        }
+                                    };
+                                    let breq: crate::hydrate::HydrateBroadcastShardRequest =
+                                        match serde_json::from_slice(&body) {
+                                            Ok(r) => r,
+                                            Err(e) => {
+                                                return Ok::<_, Infallible>(
+                                                    Response::builder()
+                                                        .status(400)
+                                                        .body(Full::new(Bytes::from(format!(
+                                                            "json: {e}"
+                                                        ))))
+                                                        .unwrap(),
+                                                );
+                                            }
+                                        };
+                                    let r = crate::hydrate::run_broadcast_shard(
+                                        breq,
+                                        fetcher.clone(),
+                                        mounts.clone(),
+                                    )
+                                    .await;
+                                    let body = serde_json::to_vec(&r).unwrap();
+                                    Response::builder()
+                                        .status(200)
+                                        .header("content-type", "application/json")
+                                        .body(Full::new(Bytes::from(body)))
+                                        .unwrap()
+                                }
                                 _ => Response::builder()
                                     .status(404)
                                     .body(Full::new(Bytes::new()))

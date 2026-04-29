@@ -746,6 +746,62 @@ impl Fetcher {
         });
     }
 
+    /// Hydrate-broadcast helper: fetch a specific chunk from a specific peer
+    /// and insert it into the local cache. Bypasses bloom/HRW lookup, peer
+    /// fan-out, and Azure fallback. If the chunk is already cached locally
+    /// at the expected length, returns it without contacting the peer (Phase A
+    /// shard owners already have it). Caller (broadcast worker) controls
+    /// retries; failures are surfaced to be reported per-shard.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn pull_chunk_from_peer(
+        self: &Arc<Self>,
+        mount: &MountConfig,
+        blob_path: &str,
+        offset: u64,
+        expected_len: u64,
+        peer_id: &str,
+        transport_url: &str,
+        ucx_worker_addr: Option<&[u8]>,
+    ) -> Result<Bytes> {
+        let key = ChunkKey {
+            mount: mount.name.clone(),
+            blob: blob_path.to_string(),
+            offset,
+        };
+        if let Some(b) = self.cache.try_get(&key) {
+            if b.len() as u64 == expected_len {
+                return Ok(b);
+            }
+        }
+        let t_peer = std::time::Instant::now();
+        let data = self
+            .peers
+            .fetch_chunk(
+                peer_id,
+                transport_url,
+                ucx_worker_addr,
+                &key,
+                expected_len as u32,
+                0,
+            )
+            .await?;
+        self.stats
+            .chunk_peer_fetch_seconds
+            .observe(t_peer.elapsed().as_secs_f64());
+        if data.len() as u64 != expected_len {
+            self.stats.peer_fetches_err.inc();
+            return Err(BcError::Other(format!(
+                "broadcast peer {peer_id} returned wrong length: got {} want {} for {blob_path}@{offset}",
+                data.len(),
+                expected_len,
+            )));
+        }
+        self.stats.peer_fetches_ok.inc();
+        self.stats.peer_fetch_bytes.inc_by(data.len() as u64);
+        self.spawn_insert(key, data.clone());
+        Ok(data)
+    }
+
     /// Poll until every chunk previously handed to spawn_insert has been
     /// durably persisted to NVMe (tmp+fsync+rename completed) and removed
     /// from inflight_writes. Used by hydrate to make wall-time measurements

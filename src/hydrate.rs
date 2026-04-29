@@ -12,6 +12,7 @@ use crate::cluster::{Membership, NodeState};
 use crate::config::MountConfig;
 use crate::error::{BcError, Result};
 use crate::fetcher::Fetcher;
+use base64::prelude::{Engine as _, BASE64_STANDARD};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -47,6 +48,19 @@ pub struct HydrateShardResponse {
     pub end_unix_ms: u64,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum HydrateMode {
+    Default,
+    Broadcast,
+}
+
+impl Default for HydrateMode {
+    fn default() -> Self {
+        Self::Default
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HydrateRequest {
     pub mount: String,
@@ -54,6 +68,33 @@ pub struct HydrateRequest {
     pub path: String,
     #[serde(default)]
     pub recursive: Option<bool>,
+    #[serde(default)]
+    pub mode: Option<HydrateMode>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BroadcastSource {
+    pub node_id: String,
+    pub transport_url: String,
+    #[serde(default)]
+    pub ucx_worker_addr_b64: Option<String>,
+    pub chunks: Vec<ChunkSpec>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HydrateBroadcastShardRequest {
+    pub mount: String,
+    pub sources: Vec<BroadcastSource>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HydrateBroadcastShardResponse {
+    pub fetched: u64,
+    pub bytes: u64,
+    pub errors: Vec<String>,
+    pub elapsed_ms: u64,
+    pub start_unix_ms: u64,
+    pub end_unix_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,6 +119,14 @@ pub struct HydrateResponse {
     pub elapsed_ms: u64,
     pub aggregate_mibs: f64,
     pub peers: Vec<PerPeerStats>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<HydrateMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase_a_elapsed_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase_b_elapsed_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub broadcast_peers: Vec<PerPeerStats>,
 }
 
 /// Worker side: fetch the assigned chunks through the local Fetcher,
@@ -231,6 +280,7 @@ pub async fn run_coordinator(
         }
     }
     let total_chunks = all_chunks.len() as u64;
+    let mode = req.mode.unwrap_or_default();
     if total_chunks == 0 {
         return Ok(HydrateResponse {
             mount: req.mount,
@@ -241,16 +291,30 @@ pub async fn run_coordinator(
             elapsed_ms: t0.elapsed().as_millis() as u64,
             aggregate_mibs: 0.0,
             peers: Vec::new(),
+            mode: Some(mode),
+            phase_a_elapsed_ms: None,
+            phase_b_elapsed_ms: None,
+            broadcast_peers: Vec::new(),
         });
     }
 
-    // Collect alive peers (members_alive excludes self by design); add self
-    // first so chunk 0 always lands locally and uneven N-distribution is
-    // deterministic for benchmarking.
-    let mut targets: Vec<(String, Option<String>)> = vec![(me_id.clone(), None)];
-    for n in membership.members_all() {
+    // Each target is (node_id, Option<transport_url> -- None means self,
+    // Option<ucx_worker_addr_b64>). Self goes first so chunk 0 lands locally
+    // and uneven N-distribution is deterministic for benchmarking.
+    let alive_members = membership.members_all();
+    let me_worker_b64 = alive_members
+        .iter()
+        .find(|n| n.id == me_id)
+        .and_then(|n| n.ucx_worker_addr_b64.clone());
+    let mut targets: Vec<(String, Option<String>, Option<String>)> =
+        vec![(me_id.clone(), None, me_worker_b64.clone())];
+    for n in &alive_members {
         if matches!(n.state, NodeState::Alive) && n.id != me_id {
-            targets.push((n.id.clone(), Some(n.transport_url.clone())));
+            targets.push((
+                n.id.clone(),
+                Some(n.transport_url.clone()),
+                n.ucx_worker_addr_b64.clone(),
+            ));
         }
     }
     let n_targets = targets.len();
@@ -259,15 +323,29 @@ pub async fn run_coordinator(
         buckets[i % n_targets].push(c);
     }
 
+    // Snapshot the full sharding plan before consuming buckets so Phase B
+    // (broadcast) can tell each receiver which peer owns each chunk.
+    let plan: Vec<BroadcastSource> = targets
+        .iter()
+        .zip(buckets.iter())
+        .map(|((node_id, transport_url, worker_b64), chunks)| BroadcastSource {
+            node_id: node_id.clone(),
+            transport_url: transport_url
+                .clone()
+                .unwrap_or_else(|| me_transport_url.clone()),
+            ucx_worker_addr_b64: worker_b64.clone(),
+            chunks: chunks.clone(),
+        })
+        .collect();
+
+    let phase_a_t0 = Instant::now();
     let mut handles = Vec::with_capacity(n_targets);
-    for ((node_id, transport_url), chunks) in targets.into_iter().zip(buckets.into_iter()) {
+    for ((node_id, transport_url, _), chunks) in targets.into_iter().zip(buckets.into_iter()) {
         let assigned = chunks.len() as u64;
         let mount_name = req.mount.clone();
         if transport_url.is_none() {
-            // Local shard — call run_shard directly to avoid an HTTP self-call.
             let f = fetcher.clone();
             let m = mounts.clone();
-            let me_url = me_transport_url.clone();
             handles.push(tokio::spawn(async move {
                 let r = run_shard(
                     HydrateShardRequest {
@@ -278,7 +356,6 @@ pub async fn run_coordinator(
                     m,
                 )
                 .await;
-                let _ = me_url;
                 PerPeerStats {
                     node_id,
                     assigned_chunks: assigned,
@@ -291,10 +368,6 @@ pub async fn run_coordinator(
                 }
             }));
         } else {
-            // Remote shard — POST /hydrate-shard to peer's stats endpoint
-            // (port derived from gossip_url's host + the conventional :7773;
-            // we reuse transport_url's host since both gossip and transport
-            // are on the same node interface).
             let url = transport_url.unwrap();
             let host = url
                 .trim_start_matches("http://")
@@ -356,11 +429,6 @@ pub async fn run_coordinator(
     }
 
     let mut peers = Vec::with_capacity(n_targets);
-    // Per-shard remote HTTP timeout is 3600s; cap the whole hydrate at
-    // 3700s (override with BLOBCACHE_HYDRATE_TIMEOUT_SECS) so a single
-    // wedged local shard or a peer whose HTTP didn't fire can't block
-    // /hydrate indefinitely. On timeout we abort outstanding handles and
-    // return what completed, marking the rest as errors.
     let global_timeout_secs: u64 = std::env::var("BLOBCACHE_HYDRATE_TIMEOUT_SECS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -406,6 +474,30 @@ pub async fn run_coordinator(
             });
         }
     }
+    let phase_a_elapsed_ms = phase_a_t0.elapsed().as_millis() as u64;
+
+    let mut broadcast_peers: Vec<PerPeerStats> = Vec::new();
+    let mut phase_b_elapsed_ms: Option<u64> = None;
+    if mode == HydrateMode::Broadcast && peers.iter().all(|p| p.errors.is_empty()) {
+        let phase_b_t0 = Instant::now();
+        broadcast_peers = run_broadcast_phase(
+            &req.mount,
+            &plan,
+            &me_id,
+            &me_transport_url,
+            fetcher.clone(),
+            mounts.clone(),
+            http.clone(),
+            global_timeout,
+        )
+        .await;
+        phase_b_elapsed_ms = Some(phase_b_t0.elapsed().as_millis() as u64);
+    } else if mode == HydrateMode::Broadcast {
+        tracing::warn!(
+            "skipping hydrate Phase B (broadcast) because Phase A reported errors"
+        );
+    }
+
     let elapsed_ms = t0.elapsed().as_millis() as u64;
     let total_bytes: u64 = peers.iter().map(|p| p.bytes).sum();
     let aggregate_mibs = if elapsed_ms > 0 {
@@ -422,5 +514,245 @@ pub async fn run_coordinator(
         elapsed_ms,
         aggregate_mibs,
         peers,
+        mode: Some(mode),
+        phase_a_elapsed_ms: Some(phase_a_elapsed_ms),
+        phase_b_elapsed_ms,
+        broadcast_peers,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_broadcast_phase(
+    mount: &str,
+    plan: &[BroadcastSource],
+    me_id: &str,
+    me_transport_url: &str,
+    fetcher: Arc<Fetcher>,
+    mounts: Arc<HashMap<String, MountConfig>>,
+    http: reqwest::Client,
+    global_timeout: std::time::Duration,
+) -> Vec<PerPeerStats> {
+    let n_targets = plan.len();
+    let mut handles = Vec::with_capacity(n_targets);
+    for receiver in plan.iter() {
+        let receiver_id = receiver.node_id.clone();
+        let receiver_url = receiver.transport_url.clone();
+        let sources: Vec<BroadcastSource> = plan
+            .iter()
+            .filter(|s| s.node_id != receiver_id)
+            .cloned()
+            .collect();
+        let assigned: u64 = sources.iter().map(|s| s.chunks.len() as u64).sum();
+        let body = HydrateBroadcastShardRequest {
+            mount: mount.to_string(),
+            sources,
+        };
+        if receiver_id == me_id {
+            let f = fetcher.clone();
+            let m = mounts.clone();
+            handles.push(tokio::spawn(async move {
+                let r = run_broadcast_shard(body, f, m).await;
+                PerPeerStats {
+                    node_id: receiver_id,
+                    assigned_chunks: assigned,
+                    fetched: r.fetched,
+                    bytes: r.bytes,
+                    errors: r.errors,
+                    elapsed_ms: r.elapsed_ms,
+                    start_unix_ms: r.start_unix_ms,
+                    end_unix_ms: r.end_unix_ms,
+                }
+            }));
+        } else {
+            let host = receiver_url
+                .trim_start_matches("http://")
+                .split(':')
+                .next()
+                .unwrap_or("")
+                .to_string();
+            let endpoint = format!("http://{host}:7773/hydrate-broadcast-shard");
+            let http = http.clone();
+            handles.push(tokio::spawn(async move {
+                let t0 = Instant::now();
+                let post_start_unix_ms = now_unix_ms();
+                let resp = http
+                    .post(&endpoint)
+                    .json(&body)
+                    .timeout(std::time::Duration::from_secs(3600))
+                    .send()
+                    .await;
+                match resp {
+                    Ok(r) => match r.json::<HydrateBroadcastShardResponse>().await {
+                        Ok(s) => PerPeerStats {
+                            node_id: receiver_id,
+                            assigned_chunks: assigned,
+                            fetched: s.fetched,
+                            bytes: s.bytes,
+                            errors: s.errors,
+                            elapsed_ms: s.elapsed_ms,
+                            start_unix_ms: s.start_unix_ms,
+                            end_unix_ms: s.end_unix_ms,
+                        },
+                        Err(e) => PerPeerStats {
+                            node_id: receiver_id,
+                            assigned_chunks: assigned,
+                            fetched: 0,
+                            bytes: 0,
+                            errors: vec![format!("decode: {e}")],
+                            elapsed_ms: t0.elapsed().as_millis() as u64,
+                            start_unix_ms: post_start_unix_ms,
+                            end_unix_ms: now_unix_ms(),
+                        },
+                    },
+                    Err(e) => PerPeerStats {
+                        node_id: receiver_id,
+                        assigned_chunks: assigned,
+                        fetched: 0,
+                        bytes: 0,
+                        errors: vec![format!("post: {e}")],
+                        elapsed_ms: t0.elapsed().as_millis() as u64,
+                        start_unix_ms: post_start_unix_ms,
+                        end_unix_ms: now_unix_ms(),
+                    },
+                }
+            }));
+        }
+    }
+    let _ = me_transport_url;
+    let abort_handles: Vec<_> = handles.iter().map(|h| h.abort_handle()).collect();
+    let join_all = async {
+        let mut out = Vec::with_capacity(n_targets);
+        for h in handles {
+            match h.await {
+                Ok(s) => out.push(s),
+                Err(e) => out.push(PerPeerStats {
+                    node_id: "unknown".into(),
+                    assigned_chunks: 0,
+                    fetched: 0,
+                    bytes: 0,
+                    errors: vec![format!("join: {e}")],
+                    elapsed_ms: 0,
+                    start_unix_ms: 0,
+                    end_unix_ms: 0,
+                }),
+            }
+        }
+        out
+    };
+    match tokio::time::timeout(global_timeout, join_all).await {
+        Ok(p) => p,
+        Err(_) => {
+            for ah in abort_handles {
+                ah.abort();
+            }
+            vec![PerPeerStats {
+                node_id: "coordinator".into(),
+                assigned_chunks: 0,
+                fetched: 0,
+                bytes: 0,
+                errors: vec![format!(
+                    "phase-b coordinator timeout after {}s; aborted outstanding shards",
+                    global_timeout.as_secs()
+                )],
+                elapsed_ms: global_timeout.as_millis() as u64,
+                start_unix_ms: 0,
+                end_unix_ms: now_unix_ms(),
+            }]
+        }
+    }
+}
+
+pub async fn run_broadcast_shard(
+    req: HydrateBroadcastShardRequest,
+    fetcher: Arc<Fetcher>,
+    mounts: Arc<HashMap<String, MountConfig>>,
+) -> HydrateBroadcastShardResponse {
+    let t0 = Instant::now();
+    let start_unix_ms = now_unix_ms();
+    let mount = match mounts.get(&req.mount) {
+        Some(m) => m.clone(),
+        None => {
+            return HydrateBroadcastShardResponse {
+                fetched: 0,
+                bytes: 0,
+                errors: vec![format!("unknown mount {}", req.mount)],
+                elapsed_ms: 0,
+                start_unix_ms,
+                end_unix_ms: now_unix_ms(),
+            };
+        }
+    };
+    let mut handles = Vec::new();
+    for src in req.sources {
+        let worker_addr: Option<Vec<u8>> = match src.ucx_worker_addr_b64.as_ref() {
+            Some(s) => match BASE64_STANDARD.decode(s) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    tracing::warn!(
+                        peer = %src.node_id,
+                        error = %e,
+                        "broadcast source has invalid ucx worker addr; will skip its chunks"
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
+        for c in src.chunks {
+            let f = fetcher.clone();
+            let m = mount.clone();
+            let peer_id = src.node_id.clone();
+            let transport_url = src.transport_url.clone();
+            let wa = worker_addr.clone();
+            handles.push(tokio::spawn(async move {
+                let permit = match f.acquire_chunk_permit().await {
+                    Ok(p) => p,
+                    Err(e) => return (peer_id, c, Err(e)),
+                };
+                let res = f
+                    .pull_chunk_from_peer(
+                        &m,
+                        &c.blob,
+                        c.offset,
+                        c.len,
+                        &peer_id,
+                        &transport_url,
+                        wa.as_deref(),
+                    )
+                    .await;
+                drop(permit);
+                (peer_id, c, res)
+            }));
+        }
+    }
+    let mut fetched = 0u64;
+    let mut bytes = 0u64;
+    let mut errors = Vec::new();
+    for h in handles {
+        match h.await {
+            Ok((_, _, Ok(b))) => {
+                fetched += 1;
+                bytes += b.len() as u64;
+            }
+            Ok((p, c, Err(e))) => {
+                if errors.len() < 32 {
+                    errors.push(format!("from {p} {}@{}: {e}", c.blob, c.offset));
+                }
+            }
+            Err(e) => {
+                if errors.len() < 32 {
+                    errors.push(format!("join: {e}"));
+                }
+            }
+        }
+    }
+    fetcher.await_inserts_drained().await;
+    HydrateBroadcastShardResponse {
+        fetched,
+        bytes,
+        errors,
+        elapsed_ms: t0.elapsed().as_millis() as u64,
+        start_unix_ms,
+        end_unix_ms: now_unix_ms(),
+    }
 }
