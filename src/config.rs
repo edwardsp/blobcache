@@ -23,9 +23,22 @@ pub struct CacheConfig {
     pub max_bytes: u64,
     #[serde(default = "default_chunk_size")]
     pub chunk_size: u64,
+    /// When true (default), chunks fetched from a peer are written to the
+    /// local on-disk cache so subsequent local reads hit instantly. When
+    /// false, peer-fetched chunks are served to the caller but never
+    /// inserted, so the local cache only grows from blob fetches (i.e.
+    /// hydrate Phase A shards + on-demand blob misses). Useful for
+    /// maximising effective cluster cache capacity (no replication) and
+    /// for benchmarking peer-fetch throughput without the NVMe-write
+    /// path on the critical path. Blob fetches always cache regardless.
+    #[serde(default = "default_cache_on_peer_fetch")]
+    pub cache_on_peer_fetch: bool,
 }
 fn default_chunk_size() -> u64 {
     4 * 1024 * 1024
+}
+fn default_cache_on_peer_fetch() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -50,6 +50,7 @@ pub struct Fetcher {
     prefetch_depth: u32,
     prefetch_threshold: u32,
     prefetch_origin_only: bool,
+    cache_on_peer_fetch: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -102,6 +103,7 @@ impl Fetcher {
         prefetch_threshold: u32,
         prefetch_concurrency: usize,
         prefetch_origin_only: bool,
+        cache_on_peer_fetch: bool,
         peer_index: Arc<PeerIndex>,
         peer_max_candidates: usize,
         peer_max_yes_attempts: usize,
@@ -139,6 +141,7 @@ impl Fetcher {
             prefetch_depth,
             prefetch_threshold: prefetch_threshold.max(1),
             prefetch_origin_only,
+            cache_on_peer_fetch,
         }
     }
 
@@ -588,7 +591,9 @@ impl Fetcher {
                 }
                 self.stats.peer_fetches_ok.inc();
                 self.stats.peer_fetch_bytes.inc_by(data.len() as u64);
-                self.spawn_insert(key.clone(), data.clone());
+                if self.cache_on_peer_fetch {
+                    self.spawn_insert(key.clone(), data.clone());
+                }
                 self.note_fetch_origin(&key.mount, &key.blob, false);
                 Ok(Some(data))
             }
@@ -829,7 +834,9 @@ impl Fetcher {
         }
         self.stats.peer_fetches_ok.inc();
         self.stats.peer_fetch_bytes.inc_by(data.len() as u64);
-        self.spawn_insert(key, data.clone());
+        if self.cache_on_peer_fetch {
+            self.spawn_insert(key, data.clone());
+        }
         Ok(data)
     }
 
@@ -960,6 +967,7 @@ impl Fetcher {
             prefetch_depth: self.prefetch_depth,
             prefetch_threshold: self.prefetch_threshold,
             prefetch_origin_only: self.prefetch_origin_only,
+            cache_on_peer_fetch: self.cache_on_peer_fetch,
         }
     }
 

@@ -130,6 +130,11 @@ config:
     # workloads.
     maxBytes: 10995116277760    # 10 TiB
     chunkSize: 4194304          # 4 MiB; MUST match across cluster
+    cacheOnPeerFetch: true      # false = peer-fetched chunks bypass local NVMe cache
+                                # (blob fetches always cache regardless); maximises
+                                # effective cluster cache capacity by avoiding
+                                # replication and removes the cache-write from the
+                                # peer-read hot path
   azure:
     poolMaxIdlePerHost: 512
     workers: 8                  # production default; bumping above 8 has not shown a Phase A win
