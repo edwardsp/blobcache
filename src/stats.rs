@@ -34,6 +34,13 @@ pub struct Stats {
     pub blob_request_retries_total: IntCounterVec,
     pub blob_request_giveups_total: IntCounter,
     pub blob_retry_sleep_seconds_total: prometheus::Counter,
+    // Per-attempt blob HTTP request wall time (single send().await + body
+    // drain). Wide buckets up to 60s because Azure can stall multi-second
+    // under throttle. blob_request_seconds_max is a gauge of the longest
+    // observed request since process start (monotone) so a single >30s
+    // outlier is visible without histogram quantile estimation.
+    pub blob_request_seconds: Histogram,
+    pub blob_request_seconds_max: prometheus::Gauge,
     pub peer_fetches_ok: IntCounter,
     pub peer_fetches_miss: IntCounter,
     pub peer_fetches_err: IntCounter,
@@ -120,6 +127,21 @@ impl Stats {
         let blob_retry_sleep_seconds_total = prometheus::Counter::new(
             "blobcache_blob_retry_sleep_seconds_total",
             "cumulative seconds slept in exponential backoff between blob retries",
+        )
+        .unwrap();
+        let blob_request_seconds = Histogram::with_opts(
+            HistogramOpts::new(
+                "blobcache_blob_request_seconds",
+                "wall time for one Azure blob HTTP request attempt (send + body drain)",
+            )
+            .buckets(vec![
+                0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0,
+            ]),
+        )
+        .unwrap();
+        let blob_request_seconds_max = prometheus::Gauge::new(
+            "blobcache_blob_request_seconds_max",
+            "longest observed single blob HTTP request since process start",
         )
         .unwrap();
         let peer_fetches_ok =
@@ -333,6 +355,9 @@ impl Stats {
             .unwrap();
         r.register(Box::new(blob_retry_sleep_seconds_total.clone()))
             .unwrap();
+        r.register(Box::new(blob_request_seconds.clone())).unwrap();
+        r.register(Box::new(blob_request_seconds_max.clone()))
+            .unwrap();
         for g in [&cache_bytes, &members_alive, &members_dead] {
             r.register(Box::new(g.clone())).unwrap();
         }
@@ -362,6 +387,8 @@ impl Stats {
             blob_request_retries_total,
             blob_request_giveups_total,
             blob_retry_sleep_seconds_total,
+            blob_request_seconds,
+            blob_request_seconds_max,
             peer_fetches_ok,
             peer_fetches_miss,
             peer_fetches_err,

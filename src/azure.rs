@@ -253,8 +253,16 @@ impl BlobClient {
             if let Some(b) = body.clone() {
                 req = req.body(b);
             }
+            let t_send = std::time::Instant::now();
             match req.send().await {
                 Ok(resp) => {
+                    let elapsed = t_send.elapsed().as_secs_f64();
+                    if let Some(m) = &self.metrics {
+                        m.blob_request_seconds.observe(elapsed);
+                        if elapsed > m.blob_request_seconds_max.get() {
+                            m.blob_request_seconds_max.set(elapsed);
+                        }
+                    }
                     let status = resp.status();
                     // 401 with a bearer credential: token may have rotated
                     // server-side (key rolled) or our cached one is stale
@@ -294,8 +302,13 @@ impl BlobClient {
                     if attempt < max_attempts
                         && (e.is_timeout() || e.is_connect() || e.is_request() || e.is_body()) =>
                 {
+                    let elapsed = t_send.elapsed().as_secs_f64();
                     let delay = backoff_ms(attempt);
                     if let Some(m) = &self.metrics {
+                        m.blob_request_seconds.observe(elapsed);
+                        if elapsed > m.blob_request_seconds_max.get() {
+                            m.blob_request_seconds_max.set(elapsed);
+                        }
                         m.blob_request_retries_total
                             .with_label_values(&["net"])
                             .inc();
@@ -306,7 +319,12 @@ impl BlobClient {
                     continue;
                 }
                 Err(e) => {
+                    let elapsed = t_send.elapsed().as_secs_f64();
                     if let Some(m) = &self.metrics {
+                        m.blob_request_seconds.observe(elapsed);
+                        if elapsed > m.blob_request_seconds_max.get() {
+                            m.blob_request_seconds_max.set(elapsed);
+                        }
                         m.blob_request_status_total
                             .with_label_values(&["err"])
                             .inc();

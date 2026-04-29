@@ -31,6 +31,7 @@ LOG=${LOG:-/tmp/e2e.log}
 PF_LOCAL_PORT=${PF_LOCAL_PORT:-17773}
 HYDRATE_TIMEOUT_S=${HYDRATE_TIMEOUT_S:-3700}
 READ_TIMEOUT_S=${READ_TIMEOUT_S:-3600}
+HYDRATE_MODE=${HYDRATE_MODE:-default}
 
 exec >"$LOG" 2>&1
 
@@ -57,7 +58,7 @@ echo "=== HYDRATE_START=$(date -u +%FT%TZ) ==="
 HYDRATE_START_S=$(date +%s.%N)
 curl -sS --max-time "$HYDRATE_TIMEOUT_S" -X POST "http://127.0.0.1:${PF_LOCAL_PORT}/hydrate" \
   -H 'content-type: application/json' \
-  -d "{\"mount\":\"${MOUNT}\",\"path\":\"${PATH_PREFIX}\",\"recursive\":true}" \
+  -d "{\"mount\":\"${MOUNT}\",\"path\":\"${PATH_PREFIX}\",\"recursive\":true,\"mode\":\"${HYDRATE_MODE}\"}" \
   >/tmp/hydrate.json 2>/tmp/hydrate.err
 HYDRATE_RC=$?
 HYDRATE_END_S=$(date +%s.%N)
