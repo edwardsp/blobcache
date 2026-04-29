@@ -1,4 +1,6 @@
 /target
+**/target/
+crates/*/Cargo.lock
 **/*.rs.bk
 Cargo.lock.tmp
 .DS_Store

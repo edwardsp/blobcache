@@ -57,12 +57,20 @@ pnet_datalink = "0.35"
 # dedicated single-thread runtime in src/transport_ucx.rs.
 ucx1-sys = { version = "0.1", optional = true }
 
+# UCC collectives (optional). Vendored sys crate (crates/ucc-sys) compiled
+# only when the `ucc` feature is enabled, so default builds never need
+# libucc-dev present.
+ucc-sys = { path = "crates/ucc-sys", optional = true }
+
 [features]
 default = []
 # UCX (RDMA over InfiniBand) peer transport.
 # Requires libucx-dev + libibverbs-dev + librdmacm-dev at build time and
 # libucx0 + libibverbs1 + librdmacm1t64 at runtime.
 ucx = ["dep:ucx1-sys"]
+# UCC (Unified Collective Communication) for hydrate allgatherv.
+# Requires libucc-dev at build time, libucc1 at runtime. Stacks on UCX.
+ucc = ["dep:ucc-sys", "ucx"]
 
 [profile.release]
 debug = 1
@@ -71,3 +79,6 @@ codegen-units = 1
 
 [patch.crates-io]
 ucx1-sys = { git = "https://github.com/edwardsp/async-ucx", branch = "system-link" }
+
+[workspace]
+members = ["crates/ucc-sys"]
