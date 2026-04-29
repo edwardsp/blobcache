@@ -269,8 +269,6 @@ fn unix_now() -> u64 {
 pub struct GossipServer {
     pub membership: Membership,
     pub peer_index: Option<Arc<crate::peerindex::PeerIndex>>,
-    #[cfg(feature = "ucc")]
-    pub oob_coord: Option<Arc<crate::ucc_oob::OobCoordinator>>,
 }
 
 impl GossipServer {
@@ -278,22 +276,11 @@ impl GossipServer {
         Self {
             membership,
             peer_index: None,
-            #[cfg(feature = "ucc")]
-            oob_coord: None,
         }
     }
 
     pub fn with_peer_index(mut self, peer_index: Arc<crate::peerindex::PeerIndex>) -> Self {
         self.peer_index = Some(peer_index);
-        self
-    }
-
-    #[cfg(feature = "ucc")]
-    pub fn with_oob_coordinator(
-        mut self,
-        coord: Arc<crate::ucc_oob::OobCoordinator>,
-    ) -> Self {
-        self.oob_coord = Some(coord);
         self
     }
 
@@ -311,30 +298,18 @@ impl GossipServer {
         tracing::info!(%addr, "cluster gossip listening");
         let me = self.membership;
         let pi = self.peer_index;
-        #[cfg(feature = "ucc")]
-        let oob = self.oob_coord;
         loop {
             let (stream, _peer) = listener.accept().await?;
             let me = me.clone();
             let pi = pi.clone();
-            #[cfg(feature = "ucc")]
-            let oob = oob.clone();
             tokio::spawn(async move {
                 let io = TokioIo::new(stream);
                 let _ = http1::Builder::new().serve_connection(io, service_fn(move |req: Request<Incoming>| {
                     let me = me.clone();
                     let pi = pi.clone();
-                    #[cfg(feature = "ucc")]
-                    let oob = oob.clone();
                     async move {
                         let path = req.uri().path().to_string();
                         let method = req.method().clone();
-                        #[cfg(feature = "ucc")]
-                        if path.starts_with("/ucc/oob/") {
-                            if let Some(coord) = oob.as_ref() {
-                                return Ok::<_, Infallible>(handle_oob(coord, &method, &path, req).await);
-                            }
-                        }
                         let resp = match (&method, path.as_str()) {
                             (&Method::POST, "/cluster/sync") => {
                                 let body = req.collect().await.map(|b| b.to_bytes()).unwrap_or_default();
@@ -455,80 +430,4 @@ async fn gossip_with(client: &reqwest::Client, m: &Membership, peer_url: &str) -
     m.touch_peer(&from_id);
     m.stats.gossip_rounds.inc();
     Ok(())
-}
-
-#[cfg(feature = "ucc")]
-async fn handle_oob(
-    coord: &Arc<crate::ucc_oob::OobCoordinator>,
-    method: &hyper::Method,
-    path: &str,
-    req: hyper::Request<hyper::body::Incoming>,
-) -> hyper::Response<http_body_util::Full<hyper::body::Bytes>> {
-    use http_body_util::{BodyExt, Full};
-    use hyper::body::Bytes as HBytes;
-    use hyper::Response;
-    use std::time::Duration;
-
-    let rest = match path.strip_prefix("/ucc/oob/") {
-        Some(s) => s,
-        None => return Response::builder().status(404).body(Full::new(HBytes::new())).unwrap(),
-    };
-
-    if method == hyper::Method::POST {
-        let mut parts = rest.splitn(2, '/');
-        let tag = parts.next().unwrap_or("");
-        let rank_s = parts.next().unwrap_or("");
-        if tag.is_empty() || rank_s.is_empty() {
-            return Response::builder().status(400)
-                .body(Full::new(HBytes::from_static(b"missing tag/rank"))).unwrap();
-        }
-        let rank: u32 = match rank_s.parse() {
-            Ok(r) => r,
-            Err(_) => return Response::builder().status(400)
-                .body(Full::new(HBytes::from_static(b"bad rank"))).unwrap(),
-        };
-        let world: u32 = match req.uri().query()
-            .and_then(|q| url::form_urlencoded::parse(q.as_bytes())
-                .find(|(k, _)| k == "world").map(|(_, v)| v.into_owned()))
-            .and_then(|v| v.parse().ok())
-        {
-            Some(w) => w,
-            None => return Response::builder().status(400)
-                .body(Full::new(HBytes::from_static(b"missing world query"))).unwrap(),
-        };
-        let body = match req.collect().await {
-            Ok(b) => b.to_bytes().to_vec(),
-            Err(_) => return Response::builder().status(400)
-                .body(Full::new(HBytes::from_static(b"bad body"))).unwrap(),
-        };
-        match coord.store(tag, rank, world, body) {
-            Ok(_) => Response::builder().status(200).body(Full::new(HBytes::new())).unwrap(),
-            Err(e) => Response::builder().status(409)
-                .body(Full::new(HBytes::from(format!("{e}")))).unwrap(),
-        }
-    } else if method == hyper::Method::GET {
-        let tag = rest;
-        if tag.is_empty() || tag.contains('/') {
-            return Response::builder().status(400)
-                .body(Full::new(HBytes::from_static(b"missing tag"))).unwrap();
-        }
-        let world: u32 = match req.uri().query()
-            .and_then(|q| url::form_urlencoded::parse(q.as_bytes())
-                .find(|(k, _)| k == "world").map(|(_, v)| v.into_owned()))
-            .and_then(|v| v.parse().ok())
-        {
-            Some(w) => w,
-            None => return Response::builder().status(400)
-                .body(Full::new(HBytes::from_static(b"missing world query"))).unwrap(),
-        };
-        match coord.collect(tag, world, Duration::from_secs(60)).await {
-            Ok(bytes) => Response::builder().status(200)
-                .header("content-type", "application/octet-stream")
-                .body(Full::new(HBytes::from(bytes))).unwrap(),
-            Err(e) => Response::builder().status(504)
-                .body(Full::new(HBytes::from(format!("{e}")))).unwrap(),
-        }
-    } else {
-        Response::builder().status(405).body(Full::new(HBytes::new())).unwrap()
-    }
 }

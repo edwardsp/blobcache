@@ -118,29 +118,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bindgen"
-version = "0.69.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "271383c67ccabffb7381723dea0672a673f292304fcb45c01cc648c7a8d58088"
-dependencies = [
- "bitflags",
- "cexpr",
- "clang-sys",
- "itertools",
- "lazy_static",
- "lazycell",
- "log",
- "prettyplease",
- "proc-macro2",
- "quote",
- "regex",
- "rustc-hash 1.1.0",
- "shlex",
- "syn",
- "which",
-]
-
-[[package]]
 name = "bitflags"
 version = "2.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -177,7 +154,6 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
- "ucc-sys",
  "ucx1-sys",
  "url",
 ]
@@ -874,15 +850,6 @@ name = "is_terminal_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
-
-[[package]]
-name = "itertools"
-version = "0.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba291022dbbd398a455acf126c1e341954079855bc60dfdda641363bd6922569"
-dependencies = [
- "either",
-]
 
 [[package]]
 name = "itoa"
@@ -1981,19 +1948,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40ce102ab67701b8526c123c1bab5cbe42d7040ccfd0f64af1a385808d2f43de"
 
 [[package]]
-name = "ucc-sys"
-version = "0.1.0"
-dependencies = [
- "bindgen 0.69.5",
- "pkg-config",
-]
-
-[[package]]
 name = "ucx1-sys"
 version = "0.1.0"
 source = "git+https://github.com/edwardsp/async-ucx?branch=system-link#e8d40c3aacdd33d607ee6d4a632eee0cab559838"
 dependencies = [
- "bindgen 0.66.1",
+ "bindgen",
  "pkg-config",
 ]
 

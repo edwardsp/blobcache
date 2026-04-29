@@ -22,10 +22,6 @@ mod stats;
 mod transport;
 #[cfg(feature = "ucx")]
 mod transport_ucx;
-#[cfg(feature = "ucc")]
-mod transport_ucc;
-#[cfg(feature = "ucc")]
-mod ucc_oob;
 
 use crate::blob_fetcher_pool::BlobFetcherPool;
 use crate::cache::DiskCache;
@@ -314,17 +310,9 @@ fn main() -> anyhow::Result<()> {
         }
         _ => unreachable!(),
     }
-    #[cfg(feature = "ucc")]
-    let oob_coord = crate::ucc_oob::OobCoordinator::new();
-
     rt.spawn({
         let m = membership.clone();
-        #[allow(unused_mut)]
-        let mut s = cluster::GossipServer::new(m).with_peer_index(peer_index.clone());
-        #[cfg(feature = "ucc")]
-        {
-            s = s.with_oob_coordinator(oob_coord.clone());
-        }
+        let s = cluster::GossipServer::new(m).with_peer_index(peer_index.clone());
         async move {
             if let Err(e) = s.serve(cluster_addr).await {
                 tracing::error!(error = %e, "gossip server died");
@@ -347,16 +335,6 @@ fn main() -> anyhow::Result<()> {
         stats.clone(),
         cfg.transport.bloom_pull_secs,
     ));
-    #[cfg(feature = "ucc")]
-    let ucc_handle = initialise_ucc(
-        &rt,
-        membership.clone(),
-        oob_coord.clone(),
-        matches!(cfg.transport.kind.as_str(), "rdma"),
-    );
-    #[cfg(not(feature = "ucc"))]
-    let ucc_handle: Option<crate::hydrate::UccHydrateHandle> = None;
-
     rt.spawn(stats::serve(
         stats.clone(),
         stats_addr,
@@ -368,7 +346,6 @@ fn main() -> anyhow::Result<()> {
         cfg.cache.chunk_size,
         node_id.clone(),
         advertise.clone(),
-        ucc_handle.clone(),
     ));
 
     let handle = rt.handle().clone();
@@ -409,55 +386,6 @@ async fn wait_signal() {
     let mut sigint =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).expect("sigint");
     tokio::select! { _ = sigterm.recv() => {}, _ = sigint.recv() => {} }
-}
-
-#[cfg(feature = "ucc")]
-fn initialise_ucc(
-    rt: &tokio::runtime::Runtime,
-    membership: Membership,
-    oob_coord: Arc<crate::ucc_oob::OobCoordinator>,
-    register_with_ucx: bool,
-) -> Option<crate::hydrate::UccHydrateHandle> {
-    let start = std::time::Instant::now();
-    let min_world = std::env::var("BLOBCACHE_UCC_MIN_WORLD")
-        .ok()
-        .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(1);
-    let wait_secs = std::env::var("BLOBCACHE_UCC_STARTUP_WAIT_SECS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(120);
-    let deadline = start + std::time::Duration::from_secs(wait_secs);
-    loop {
-        let (_coord_url, rank, world) = crate::ucc_oob::elect_coordinator(&membership);
-        if world >= min_world {
-            match crate::transport_ucc::UccCollectives::new(
-                rank,
-                world,
-                Arc::new(membership.clone()),
-                rt.handle().clone(),
-                oob_coord,
-            ) {
-                Ok(ucc) => {
-                    tracing::info!(rank, world, "UCC collectives initialised");
-                    if register_with_ucx {
-                        #[cfg(feature = "ucx")]
-                        crate::transport_ucx::register_ucc_collectives(ucc.clone());
-                    }
-                    return Some(crate::hydrate::UccHydrateHandle(ucc));
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "UCC initialisation failed");
-                    return None;
-                }
-            }
-        }
-        if std::time::Instant::now() >= deadline {
-            tracing::warn!(world, min_world, "UCC startup wait expired; hydrate ucc mode disabled");
-            return None;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(500));
-    }
 }
 
 fn init_tracing(level: &str) {

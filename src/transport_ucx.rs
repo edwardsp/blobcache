@@ -60,14 +60,6 @@ const INBOUND_DRAIN_BUDGET: usize = 32;
 use crate::cache::{ChunkKey, DiskCache};
 use crate::error::{BcError, Result};
 
-#[cfg(feature = "ucc")]
-static UCC_COLLECTIVES: OnceLock<Arc<crate::transport_ucc::UccCollectives>> = OnceLock::new();
-
-#[cfg(feature = "ucc")]
-pub fn register_ucc_collectives(ucc: Arc<crate::transport_ucc::UccCollectives>) {
-    let _ = UCC_COLLECTIVES.set(ucc);
-}
-
 const MAGIC: u32 = 0xBC10_C001;
 const STATUS_OK: u32 = 0;
 const STATUS_MISS: u32 = 1;
@@ -1358,10 +1350,6 @@ async fn progress_worker(
                 tokio::task::yield_now().await;
                 budget = PROGRESS_BUDGET;
             }
-        }
-        #[cfg(feature = "ucc")]
-        if let Some(ucc) = UCC_COLLECTIVES.get() {
-            ucc.progress();
         }
         if did_work {
             inbound_ready.notify_one();

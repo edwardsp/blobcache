@@ -17,17 +17,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libclang-dev \
     && rm -rf /var/lib/apt/lists/*
 
-ARG UCC_VERSION=v1.7.0
-RUN git clone --depth 1 --branch ${UCC_VERSION} https://github.com/openucx/ucc.git /tmp/ucc && \
-    cd /tmp/ucc && \
-    ./autogen.sh && \
-    ./configure --prefix=/usr/local --with-ucx=/usr && \
-    make -j"$(nproc)" install && \
-    ldconfig && \
-    rm -rf /tmp/ucc
-
-ENV PKG_CONFIG_PATH=/usr/local/lib/pkgconfig
-
 ARG RUST_VERSION=stable
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
     sh -s -- -y --default-toolchain ${RUST_VERSION} --profile minimal
@@ -40,7 +29,7 @@ COPY crates ./crates
 COPY src ./src
 COPY examples ./examples
 
-RUN cargo build --release --locked --features ucc
+RUN cargo build --release --locked --features ucx
 
 FROM ubuntu:24.04
 
@@ -57,9 +46,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /usr/local/lib/libucc* /usr/local/lib/
-COPY --from=builder /usr/local/lib/ucc /usr/local/lib/ucc
-RUN ldconfig
 COPY --from=builder /src/target/release/blobcached /usr/local/bin/blobcached
 
 ENTRYPOINT ["/usr/local/bin/blobcached"]
