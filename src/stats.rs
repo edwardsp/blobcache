@@ -10,6 +10,7 @@ pub struct Stats {
     pub cache_misses: IntCounter,
     pub cache_evictions: IntCounter,
     pub cache_inserts: IntCounter,
+    pub cache_reconcile_drops: IntCounter,
     pub cache_bytes: IntGauge,
     pub blob_fetches: IntCounter,
     pub blob_fetch_bytes: IntCounter,
@@ -100,6 +101,11 @@ impl Stats {
             IntCounter::new("blobcache_cache_evictions_total", "cache evictions").unwrap();
         let cache_inserts =
             IntCounter::new("blobcache_cache_inserts_total", "cache inserts").unwrap();
+        let cache_reconcile_drops = IntCounter::new(
+            "blobcache_cache_reconcile_drops_total",
+            "entries dropped because backing file was missing on disk (would have caused stale-bloom false positives)",
+        )
+        .unwrap();
         let cache_bytes = IntGauge::new("blobcache_cache_bytes", "cache bytes in use").unwrap();
         let blob_fetches = IntCounter::new("blobcache_blob_fetches_total", "blob fetches").unwrap();
         let blob_fetch_bytes =
@@ -319,6 +325,7 @@ impl Stats {
             &cache_misses,
             &cache_evictions,
             &cache_inserts,
+            &cache_reconcile_drops,
             &blob_fetches,
             &blob_fetch_bytes,
             &blob_request_giveups_total,
@@ -387,6 +394,7 @@ impl Stats {
             cache_misses,
             cache_evictions,
             cache_inserts,
+            cache_reconcile_drops,
             cache_bytes,
             blob_fetches,
             blob_fetch_bytes,
@@ -521,6 +529,9 @@ pub async fn serve(
                                         .inc_by(cs.evictions.load(Ordering::Relaxed));
                                     s.cache_inserts.reset();
                                     s.cache_inserts.inc_by(cs.inserts.load(Ordering::Relaxed));
+                                    s.cache_reconcile_drops.reset();
+                                    s.cache_reconcile_drops
+                                        .inc_by(cs.reconcile_drops.load(Ordering::Relaxed));
                                     s.cache_bytes
                                         .set(cs.bytes_in_use.load(Ordering::Relaxed) as i64);
                                     let all = membership.members_all();
@@ -553,6 +564,7 @@ pub async fn serve(
                                             "misses": cs.misses.load(Ordering::Relaxed),
                                             "evictions": cs.evictions.load(Ordering::Relaxed),
                                             "inserts": cs.inserts.load(Ordering::Relaxed),
+                                            "reconcile_drops": cs.reconcile_drops.load(Ordering::Relaxed),
                                             "bytes_in_use": cs.bytes_in_use.load(Ordering::Relaxed),
                                         },
                                         "cluster": {
