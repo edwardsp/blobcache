@@ -101,7 +101,7 @@ def print_latency(label, stats):
     )
 
 def main(N):
-    base = f'/home/paul/Microsoft/blobcache/bench/results/N{N}'
+    base = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'results', f'N{N}')
     print(f'\n=== N={N} ===')
     if not os.path.exists(base):
         print('(no results)')

@@ -8,8 +8,7 @@ Dataset: `models/nvidia_DeepSeek-R1-0528-NVFP4-v2/` —
 **350 files / 98 804 chunks / 385.0 GiB** (411.34 GB) on the storage
 account.
 
-The 18th gb300 VM (`vmss00001n`, 10.16.0.22) was `NotReady` at run start
-and excluded.
+The 18th gb300 VM (`node-Z`) was `NotReady` at run start and excluded.
 
 ## Timeline (UTC, correlate against Grafana)
 
@@ -35,7 +34,7 @@ Storage public-access toggled on for the run via
 
 ## Hydrate
 
-Coordinator: `vmss000011`. POST `/hydrate` with
+Coordinator: `node-A`. POST `/hydrate` with
 `{mount: "models", path: "nvidia_DeepSeek-R1-0528-NVFP4-v2/",
 recursive: true}` shards all chunks across the 16 reachable peers.
 
@@ -50,7 +49,7 @@ recursive: true}` shards all chunks across the 16 reachable peers.
 | Errors              | 0              |
 | Peers reporting     | 16 of 17       |
 
-The 17th peer (`vmss000015`, just-restarted pod) had not finished
+The 17th peer (`node-B`, just-restarted pod) had not finished
 gossip-joining when the coordinator polled; its chunks were
 re-distributed across the 16 ready peers.
 
@@ -110,16 +109,16 @@ sized to fit the working set.
 
 | Pod / node                                | Pass 1 bytes | Pass 2 bytes | Notes                |
 |-------------------------------------------|-------------:|-------------:|----------------------|
-| `blobcache-blobcached-hqp6v` / vmss000015 |          0 B |          0 B | hydrate-shard missed |
-| `blobcache-blobcached-krtxx` / vmss000010 |     ~1.6 GB  |          —   | UCX peer-fetch stall |
-| `blobcache-blobcached-k7cqd` / vmss00001e |     ~4–8 GB  |          —   | UCX peer-fetch stall |
-| `blobcache-blobcached-bf9ht` / vmss00001c |    ~9–17 GB  |          —   | UCX peer-fetch stall |
-| `blobcache-blobcached-6hpx4` / vmss00001b |   ~15–30 GB  |          —   | UCX peer-fetch stall |
+| `pod-B` / node-B |          0 B |          0 B | hydrate-shard missed |
+| `pod-C` / node-C |     ~1.6 GB  |          —   | UCX peer-fetch stall |
+| `pod-D` / node-D |     ~4–8 GB  |          —   | UCX peer-fetch stall |
+| `pod-E` / node-E |    ~9–17 GB  |          —   | UCX peer-fetch stall |
+| `pod-F` / node-F |   ~15–30 GB  |          —   | UCX peer-fetch stall |
 
 The same five pods stalled on both passes. No errors logged in the
 daemons; the FUSE `read()` syscalls were blocked inside `Fetcher` on a
 peer-fetch that never returned. Hydrate had succeeded for 4 of these
-5 (only `vmss000015` was missing entirely), so the local shard was
+5 (only `node-B` was missing entirely), so the local shard was
 present, but reading any *other* shard across those nodes' UCX endpoints
 hung.
 
@@ -176,17 +175,17 @@ egress (hydrate is the only spike).
    image rebuild needed.
 4. ✅ **Investigated, fabric ruled out** — `ucx_perftest` (rc_mlx5,
    1 MiB / 200 iter) was run between the healthy coordinator
-   (`vmss000011`) and each of the five stalling nodes, plus a
+   (`node-A`) and each of the five stalling nodes, plus a
    healthy↔healthy control:
 
    | Server-side node | Bandwidth | 50 %ile latency |
    |---|---:|---:|
-   | vmss00001b (stuck)              | 42 753 MB/s | 22.98 µs |
-   | vmss00001c (stuck)              | 42 871 MB/s | 22.94 µs |
-   | vmss00001e (stuck)              | 42 736 MB/s | 22.94 µs |
-   | vmss000015 (stuck)              | 43 001 MB/s | 22.98 µs |
-   | vmss000010 (stuck)              | 42 480 MB/s | 23.04 µs |
-   | vmss00001f (control, healthy)   | 42 937 MB/s | 22.98 µs |
+   | node-F (stuck)                  | 42 753 MB/s | 22.98 µs |
+   | node-E (stuck)                  | 42 871 MB/s | 22.94 µs |
+   | node-D (stuck)                  | 42 736 MB/s | 22.94 µs |
+   | node-B (stuck)                  | 43 001 MB/s | 22.98 µs |
+   | node-C (stuck)                  | 42 480 MB/s | 23.04 µs |
+   | node-G (control, healthy)       | 42 937 MB/s | 22.98 µs |
 
    All five "bad" pairs sustain ~42 GB/s (≈336 Gbps), within 1.2 % of
    the healthy control and at the line rate of a single mlx5 rail.
