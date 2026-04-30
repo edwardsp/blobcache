@@ -40,6 +40,11 @@ SKIP_HYDRATE=${SKIP_HYDRATE:-0}
 SKIP_WIPE=${SKIP_WIPE:-0}
 HYDRATE_TIMEOUT_S=${HYDRATE_TIMEOUT_S:-3700}
 HYDRATE_MODE=${HYDRATE_MODE:-default}
+# Barrier sleep between hydrate completion and PASS1 start. Lets bloom-version
+# bumps propagate via gossip (~1.5s) and remote pods complete bloom-pull (default
+# 5s) before PASS1 reads start, so peers can find each other's hydrated chunks
+# without falling back to Azure blob.
+POST_HYDRATE_SLEEP_S=${POST_HYDRATE_SLEEP_S:-0}
 
 mkdir -p "$OUT_DIR"
 LOG="$OUT_DIR/${RUN_TAG}-run.log"
@@ -91,6 +96,13 @@ if [ "$SKIP_HYDRATE" != "1" ]; then
   HYD_T1=$(date +%s.%N)
   echo "=== HYDRATE_END=$(date -u +%FT%TZ) rc=$HYD_RC wall=$(fdiff "$HYD_T1" "$HYD_T0")s bytes=$(wc -c <"$OUT_DIR/${RUN_TAG}-hydrate.json") ==="
   head -c 600 "$OUT_DIR/${RUN_TAG}-hydrate.json"; echo
+fi
+
+if [ "$POST_HYDRATE_SLEEP_S" -gt 0 ] 2>/dev/null; then
+  echo
+  echo "=== POST_HYDRATE_SLEEP_START=$(date -u +%FT%T.%NZ) duration=${POST_HYDRATE_SLEEP_S}s ==="
+  sleep "$POST_HYDRATE_SLEEP_S"
+  echo "=== POST_HYDRATE_SLEEP_END=$(date -u +%FT%T.%NZ) ==="
 fi
 
 SNAP_BEFORE="$OUT_DIR/${RUN_TAG}-snap-before.tsv"
