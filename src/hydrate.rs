@@ -96,6 +96,13 @@ pub struct HydrateBroadcastShardResponse {
     pub elapsed_ms: u64,
     pub start_unix_ms: u64,
     pub end_unix_ms: u64,
+    // Total chunks the receiver was asked to pull (sum of req.sources[].chunks).
+    // The coordinator already knows this from the request it built, but echoing
+    // it back lets the coordinator detect protocol-version skew and lets
+    // operators see the assigned/fetched/errors triple at a glance in logs.
+    // Defaulted for backward compat with pre-fix daemons mid-rolling-upgrade.
+    #[serde(default)]
+    pub assigned: u64,
 }
 
 /// Ring-allgather coordinator-driven step request: each /hydrate-ring-step
@@ -732,16 +739,39 @@ async fn run_broadcast_phase(
                     .await;
                 match resp {
                     Ok(r) => match r.json::<HydrateBroadcastShardResponse>().await {
-                        Ok(s) => PerPeerStats {
-                            node_id: receiver_id,
-                            assigned_chunks: assigned,
-                            fetched: s.fetched,
-                            bytes: s.bytes,
-                            errors: s.errors,
-                            elapsed_ms: s.elapsed_ms,
-                            start_unix_ms: s.start_unix_ms,
-                            end_unix_ms: s.end_unix_ms,
-                        },
+                        Ok(s) => {
+                            let mut errors = s.errors;
+                            // Cross-check the receiver's view against ours.
+                            // s.assigned == 0 means the receiver is pre-fix
+                            // (serde default) - skip the strict equality but
+                            // still apply the fetched+errors < assigned guard
+                            // so partial responses don't slip through.
+                            if s.assigned != 0 && s.assigned != assigned {
+                                errors.insert(0, format!(
+                                    "protocol skew: coordinator assigned={assigned} receiver assigned={}",
+                                    s.assigned
+                                ));
+                            }
+                            let accounted = s.fetched.saturating_add(errors.len() as u64);
+                            if accounted < assigned {
+                                let lost = assigned - accounted;
+                                errors.push(format!(
+                                    "coordinator silent-loss check: assigned={assigned} fetched={} reported_errors={} lost={lost}",
+                                    s.fetched,
+                                    errors.len()
+                                ));
+                            }
+                            PerPeerStats {
+                                node_id: receiver_id,
+                                assigned_chunks: assigned,
+                                fetched: s.fetched,
+                                bytes: s.bytes,
+                                errors,
+                                elapsed_ms: s.elapsed_ms,
+                                start_unix_ms: s.start_unix_ms,
+                                end_unix_ms: s.end_unix_ms,
+                            }
+                        }
                         Err(e) => PerPeerStats {
                             node_id: receiver_id,
                             assigned_chunks: assigned,
@@ -828,9 +858,11 @@ pub async fn run_broadcast_shard(
                 elapsed_ms: 0,
                 start_unix_ms,
                 end_unix_ms: now_unix_ms(),
+                assigned: 0,
             };
         }
     };
+    let assigned: u64 = req.sources.iter().map(|s| s.chunks.len() as u64).sum();
     // Round-robin chunks across sources so concurrent permits land on
     // different peers (run #9 found that a source-major ordering pinned every
     // receiver to the same source[0] first, serialising 16 sources through one
@@ -948,9 +980,24 @@ pub async fn run_broadcast_shard(
     let drain_t0 = Instant::now();
     fetcher.await_inserts_drained().await;
     let drain_elapsed_ms = drain_t0.elapsed().as_millis() as u64;
+    // Silent-loss detection. errors is capped at 32 entries above to keep the
+    // response payload bounded, so a shard that failed 1000 chunks would have
+    // returned errors.len() == 32 with fetched << assigned and the coordinator
+    // could not tell that from a normal partial. Synthesize a single
+    // counted-error so n_errors > 0 surfaces in coordinator logs and the
+    // response carries an honest accounting.
+    let accounted = fetched.saturating_add(errors.len() as u64);
+    if accounted < assigned {
+        let lost = assigned - accounted;
+        errors.push(format!(
+            "silent loss: assigned={assigned} fetched={fetched} reported_errors={} lost={lost}",
+            errors.len()
+        ));
+    }
     tracing::info!(
         n_chunks = fetched,
         bytes,
+        assigned,
         pulls_ms = pulls_elapsed_ms,
         drain_ms = drain_elapsed_ms,
         n_errors = errors.len(),
@@ -963,6 +1010,7 @@ pub async fn run_broadcast_shard(
         elapsed_ms: t0.elapsed().as_millis() as u64,
         start_unix_ms,
         end_unix_ms: now_unix_ms(),
+        assigned,
     }
 }
 
