@@ -48,7 +48,17 @@ fn main() -> anyhow::Result<()> {
     let cfg = Config::from_path(&args.config).context("load config")?;
     tracing::info!(?cfg.cache.dir, "starting blobcached");
 
+    // Bound the main runtime worker count. perf-record on the v2.9 baseline
+    // showed ~15.6% CPU in __aarch64_swp8_acq_rel inside the tokio
+    // multi-thread scheduler's work-stealing path, all attributed to the
+    // "blobcached"-named threads of this runtime (the per-worker blob-fetch
+    // runtimes were idle on cache-hit / peer-RDMA workloads). The default
+    // worker count is num_cpus() which is ~72 on GB300; that many workers
+    // contending on the same work-stealing queues generates atomic-op
+    // overhead that dominates the read hot path. Cap at 8 to match the
+    // azure.workers convention; revisit if perf shows queue starvation.
     let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(8)
         .enable_all()
         .thread_name("blobcached")
         .build()?;
