@@ -419,9 +419,20 @@ async fn run_bloom_rebuild_loop(
         tick.tick().await;
         let pi = peer_index.clone();
         let c = cache.clone();
-        // Bloom rebuild walks the live cache key set and re-hashes all entries; do
-        // it on a blocking thread so the tokio worker is not stalled by I/O.
+        // Reconcile the in-memory entries map against the filesystem BEFORE
+        // snapshotting live_keys() for the rebuild. Without this, files that
+        // vanished externally (NVMe loss, manual rm, external wipe between
+        // ticks) stay in entries{}, get re-hashed into the new bloom, and we
+        // keep advertising chunks we cannot serve until the daemon restarts.
         let res = tokio::task::spawn_blocking(move || {
+            let (dropped, bytes) = c.reconcile_with_disk();
+            if dropped > 0 {
+                tracing::warn!(
+                    dropped_entries = dropped,
+                    bytes_reclaimed = bytes,
+                    "bloom rebuild: reconciled stale cache entries before snapshot"
+                );
+            }
             pi.rebuild_local_from_cache(&c);
             pi.local_version()
         })

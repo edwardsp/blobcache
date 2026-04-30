@@ -45,6 +45,13 @@ pub struct CacheStats {
     pub evictions: AtomicU64,
     pub bytes_in_use: AtomicU64,
     pub inserts: AtomicU64,
+    // Entries dropped by reconcile_with_disk because the underlying file
+    // vanished while still tracked in memory (NVMe loss, manual rm, an
+    // external wipe between bloom rebuilds, etc.). Each increment means the
+    // bloom filter would have advertised a chunk we cannot actually serve;
+    // the reconciliation pass exists precisely to keep that count from
+    // poisoning peer routing.
+    pub reconcile_drops: AtomicU64,
 }
 
 struct Entry {
@@ -262,6 +269,53 @@ impl DiskCache {
     pub fn live_keys(&self) -> Vec<ChunkKey> {
         let g = self.inner.lock();
         g.entries.keys().cloned().collect()
+    }
+
+    /// Walk tracked entries and drop any whose backing file has vanished
+    /// from disk. Returns (entries_dropped, bytes_reclaimed).
+    ///
+    /// Why: live_keys() reads in-memory state only. If files disappear out
+    /// from under the daemon (NVMe replacement, partial corruption, an
+    /// external `rm`, or a benchmark harness wiping the cache dir without
+    /// restarting the process) the entries map keeps lying about what we
+    /// hold. The bloom rebuild then re-publishes those phantom keys, peers
+    /// route requests to us, we answer NotFound, and the requester records
+    /// a bloom_false_positive — silent degradation that persists until
+    /// the daemon restarts. This pass closes the loop by syncing the
+    /// in-memory tracking back to filesystem reality before the next
+    /// rebuild_local_from_cache snapshot.
+    pub fn reconcile_with_disk(self: &Arc<Self>) -> (u64, u64) {
+        let keys: Vec<ChunkKey> = {
+            let g = self.inner.lock();
+            g.entries.keys().cloned().collect()
+        };
+        let mut missing: Vec<ChunkKey> = Vec::new();
+        for k in keys {
+            let p = self.path_for(&k);
+            if !p.exists() {
+                missing.push(k);
+            }
+        }
+        if missing.is_empty() {
+            return (0, 0);
+        }
+        let mut dropped = 0u64;
+        let mut bytes_reclaimed = 0u64;
+        let mut g = self.inner.lock();
+        for k in &missing {
+            if let Some(e) = g.entries.remove(k) {
+                g.lru.remove(&e.last_access_seq);
+                g.bytes = g.bytes.saturating_sub(e.size);
+                bytes_reclaimed = bytes_reclaimed.saturating_add(e.size);
+                dropped += 1;
+            }
+        }
+        self.stats.bytes_in_use.store(g.bytes, Ordering::Relaxed);
+        drop(g);
+        self.stats
+            .reconcile_drops
+            .fetch_add(dropped, Ordering::Relaxed);
+        (dropped, bytes_reclaimed)
     }
 
     fn touch_lru(self: &Arc<Self>, key: &ChunkKey) -> bool {
