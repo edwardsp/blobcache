@@ -253,6 +253,7 @@ fn main() -> anyhow::Result<()> {
         cfg.transport.peer_max_yes_attempts,
         cfg.transport.peer_max_maybe_attempts,
         cfg.transport.stampede_wait_ms,
+        cfg.transport.peer_yes_wait_ms,
         mounts.clone(),
     ));
 

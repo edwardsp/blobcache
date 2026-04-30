@@ -166,6 +166,10 @@ config:
     peerMaxYesAttempts: 2
     peerMaxMaybeAttempts: 2
     stampedeWaitMs: 5000
+    # When a bloom-positive peer replies MISS, retry by subscribing to its
+    # in-flight insert (singleflight) for up to N ms before falling back to
+    # blob. 0 = current/legacy behavior (immediate blob fallback).
+    peerYesWaitMs: 0
   stats:
     bind: "0.0.0.0:7773"
   # REQUIRED: at least one mount entry. Each entry becomes a [[mounts]]

@@ -154,6 +154,8 @@ pub struct TransportConfig {
     pub peer_max_maybe_attempts: usize,
     #[serde(default = "default_stampede_wait_ms")]
     pub stampede_wait_ms: u32,
+    #[serde(default = "default_peer_yes_wait_ms")]
+    pub peer_yes_wait_ms: u32,
 }
 fn default_chunk_concurrency() -> usize {
     32
@@ -193,6 +195,9 @@ fn default_peer_max_maybe_attempts() -> usize {
 }
 fn default_stampede_wait_ms() -> u32 {
     5000
+}
+fn default_peer_yes_wait_ms() -> u32 {
+    0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

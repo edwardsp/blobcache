@@ -84,6 +84,14 @@ pub struct Fetcher {
     pub peer_max_yes_attempts: usize,
     pub peer_max_maybe_attempts: usize,
     pub stampede_wait_ms: u32,
+    /// Per-peer wait_ms passed to bloom-positive ("yes-set") peers when the
+    /// requester races a remote insertion. With wait_ms=0 the peer server
+    /// short-circuits to disk-only and reports MISS the moment a chunk isn't
+    /// yet renamed-into-place, even if singleflight is mid-fetch. Setting this
+    /// to a small value (e.g. 100-500 ms) lets the peer subscribe to the
+    /// in-flight insert and stream the result rather than forcing the
+    /// requester back to blob.
+    pub peer_yes_wait_ms: u32,
     // Mount lookup table so the stampede-leader path (serve_peer_chunk) can
     // reconstruct the blob path from a ChunkKey when no MountConfig is on
     // the call stack (the request arrived from a peer, not from FUSE).
@@ -158,6 +166,7 @@ impl Fetcher {
         peer_max_yes_attempts: usize,
         peer_max_maybe_attempts: usize,
         stampede_wait_ms: u32,
+        peer_yes_wait_ms: u32,
         mounts: Arc<HashMap<String, MountConfig>>,
     ) -> Self {
         let permits = chunk_concurrency.max(1);
@@ -180,6 +189,7 @@ impl Fetcher {
             peer_max_yes_attempts: peer_max_yes_attempts.max(1),
             peer_max_maybe_attempts: peer_max_maybe_attempts.max(1),
             stampede_wait_ms,
+            peer_yes_wait_ms,
             mounts,
             inflight: Arc::new(Mutex::new(HashMap::new())),
             chunk_sem: Arc::new(Semaphore::new(permits)),
@@ -537,8 +547,9 @@ impl Fetcher {
             }
             for (idx, peer) in ordered.iter() {
                 let was_yes = *idx < yes_len;
+                let wait_ms = if was_yes { self.peer_yes_wait_ms } else { 0 };
                 if let Some(data) = self
-                    .try_peer_fetch(peer, key, expected_len, was_yes, 0)
+                    .try_peer_fetch(peer, key, expected_len, was_yes, wait_ms)
                     .await?
                 {
                     return Ok(data);
@@ -1037,6 +1048,7 @@ impl Fetcher {
             peer_max_yes_attempts: self.peer_max_yes_attempts,
             peer_max_maybe_attempts: self.peer_max_maybe_attempts,
             stampede_wait_ms: self.stampede_wait_ms,
+            peer_yes_wait_ms: self.peer_yes_wait_ms,
             mounts: self.mounts.clone(),
             inflight: self.inflight.clone(),
             chunk_sem: self.chunk_sem.clone(),

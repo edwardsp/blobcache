@@ -134,7 +134,11 @@ impl PeerService {
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
         let t_cg = std::time::Instant::now();
-        let got = self.cache.try_get(&key);
+        let cache = self.cache.clone();
+        let key_bg = key.clone();
+        let got = tokio::task::spawn_blocking(move || cache.try_get(&key_bg))
+            .await
+            .unwrap_or(None);
         self.stats
             .server_cache_get_seconds
             .observe(t_cg.elapsed().as_secs_f64());
