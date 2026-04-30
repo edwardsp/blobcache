@@ -59,6 +59,7 @@ pub struct Stats {
     pub peer_bloom_yes: IntCounter,
     pub peer_bloom_no_holder: IntCounter,
     pub peer_bloom_false_positive: IntCounter,
+    pub peer_bloom_stale_drops: IntCounter,
     pub peer_bloom_pulls_total: IntCounter,
     pub peer_bloom_pull_errors_total: IntCounter,
     pub peer_stampede_leader: IntCounter,
@@ -217,6 +218,11 @@ impl Stats {
             "bloom-positive peers that returned NotFound",
         )
         .unwrap();
+        let peer_bloom_stale_drops = IntCounter::new(
+            "blobcache_peer_bloom_stale_drops_total",
+            "remote bloom views dropped after a was_yes NotFound (forces refetch on next bloom-pull tick)",
+        )
+        .unwrap();
         let peer_bloom_pulls_total = IntCounter::new(
             "blobcache_peer_bloom_pulls_total",
             "successful peer bloom pulls",
@@ -346,6 +352,7 @@ impl Stats {
             &peer_bloom_yes,
             &peer_bloom_no_holder,
             &peer_bloom_false_positive,
+            &peer_bloom_stale_drops,
             &peer_bloom_pulls_total,
             &peer_bloom_pull_errors_total,
             &peer_stampede_leader,
@@ -421,6 +428,7 @@ impl Stats {
             peer_bloom_yes,
             peer_bloom_no_holder,
             peer_bloom_false_positive,
+            peer_bloom_stale_drops,
             peer_bloom_pulls_total,
             peer_bloom_pull_errors_total,
             peer_stampede_leader,

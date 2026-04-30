@@ -680,6 +680,16 @@ impl Fetcher {
                 self.stats.peer_fetches_miss.inc();
                 if was_yes {
                     self.stats.peer_bloom_false_positive.inc();
+                    // Self-correction: our cached view of this peer's bloom said
+                    // it had this chunk, but the peer says it doesn't. Either
+                    // the peer evicted (stale bits) or its on-disk state
+                    // diverged from its bloom (stale entries pre-Fix-1). Drop
+                    // our remote view; the next bloom-pull tick refetches the
+                    // current version. Without this, every subsequent
+                    // rank_candidates call keeps routing to the same liar peer
+                    // until bloom_pull_secs elapses.
+                    self.peer_index.drop_remote(&peer.id);
+                    self.stats.peer_bloom_stale_drops.inc();
                 }
                 Ok(None)
             }
