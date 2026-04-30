@@ -29,13 +29,21 @@ type InflightTx = broadcast::Sender<std::result::Result<Bytes, String>>;
 // to keep within-chunk locality (FUSE issues ~32 sub-reads per 4 MiB chunk)
 // without writing to disk. lru::LruCache is entry-bounded; we wrap it with
 // running byte accounting and evict from the back until under the cap.
-struct PeerLru {
+//
+// Sharded N-ways (audit §2.7) so concurrent FUSE readers on independent
+// chunks don't serialise on a single mutex. Each shard owns 1/N of the
+// total byte cap; ChunkKey is hashed (DefaultHasher) to pick the shard.
+// Distribution is uniform over (mount, blob, offset) so any single hot
+// blob spreads across all shards rather than pinning one.
+const PEER_LRU_SHARDS: usize = 16;
+
+struct PeerLruShard {
     inner: LruCache<ChunkKey, Bytes>,
     bytes: u64,
     cap_bytes: u64,
 }
 
-impl PeerLru {
+impl PeerLruShard {
     fn new(cap_bytes: u64) -> Self {
         Self {
             inner: LruCache::unbounded(),
@@ -71,6 +79,47 @@ impl PeerLru {
     }
 }
 
+pub struct PeerLru {
+    shards: Vec<Mutex<PeerLruShard>>,
+}
+
+impl PeerLru {
+    fn new(total_cap_bytes: u64) -> Self {
+        // Round up so the sum of shard caps is >= total_cap_bytes (avoids
+        // off-by-one shrinkage when total isn't divisible by shard count).
+        let per_shard = total_cap_bytes.div_ceil(PEER_LRU_SHARDS as u64);
+        let mut shards = Vec::with_capacity(PEER_LRU_SHARDS);
+        for _ in 0..PEER_LRU_SHARDS {
+            shards.push(Mutex::new(PeerLruShard::new(per_shard)));
+        }
+        Self { shards }
+    }
+
+    fn shard_for(&self, key: &ChunkKey) -> &Mutex<PeerLruShard> {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        key.hash(&mut h);
+        let idx = (h.finish() as usize) % self.shards.len();
+        &self.shards[idx]
+    }
+
+    fn get(&self, key: &ChunkKey) -> Option<Bytes> {
+        self.shard_for(key).lock().get(key)
+    }
+
+    fn put(&self, key: ChunkKey, val: Bytes) {
+        let shard = self.shard_for(&key);
+        shard.lock().put(key, val);
+    }
+
+    fn clear(&self) {
+        for shard in &self.shards {
+            shard.lock().clear();
+        }
+    }
+}
+
 pub struct Fetcher {
     pub cache: Arc<DiskCache>,
     pub pool: Arc<BlobFetcherPool>,
@@ -98,7 +147,7 @@ pub struct Fetcher {
     prefetch_threshold: u32,
     prefetch_origin_only: bool,
     cache_on_peer_fetch: bool,
-    peer_lru: Option<Arc<Mutex<PeerLru>>>,
+    peer_lru: Option<Arc<PeerLru>>,
 }
 
 #[derive(Clone, Copy)]
@@ -192,7 +241,7 @@ impl Fetcher {
             prefetch_origin_only,
             cache_on_peer_fetch,
             peer_lru: if peer_lru_bytes > 0 {
-                Some(Arc::new(Mutex::new(PeerLru::new(peer_lru_bytes))))
+                Some(Arc::new(PeerLru::new(peer_lru_bytes)))
             } else {
                 None
             },
@@ -321,7 +370,7 @@ impl Fetcher {
         }
 
         if let Some(lru) = &self.peer_lru {
-            let hit = lru.lock().get(&key);
+            let hit = lru.get(&key);
             if let Some(bytes) = hit {
                 if bytes.len() as u64 == expected_chunk_len {
                     let end = (sub_offset + sub_len) as usize;
@@ -399,7 +448,7 @@ impl Fetcher {
         }
 
         if let Some(lru) = &self.peer_lru {
-            let hit = lru.lock().get(&key);
+            let hit = lru.get(&key);
             if let Some(bytes) = hit {
                 if bytes.len() as u64 == expected_len {
                     self.stats.peer_lru_hits.inc();
@@ -671,7 +720,7 @@ impl Fetcher {
                 if self.cache_on_peer_fetch {
                     self.spawn_insert(key.clone(), data.clone());
                 } else if let Some(lru) = &self.peer_lru {
-                    lru.lock().put(key.clone(), data.clone());
+                    lru.put(key.clone(), data.clone());
                 }
                 self.note_fetch_origin(&key.mount, &key.blob, false);
                 Ok(Some(data))
@@ -946,7 +995,7 @@ impl Fetcher {
         self.inflight_writes.clear();
         self.seq_state.clear();
         if let Some(lru) = &self.peer_lru {
-            lru.lock().clear();
+            lru.clear();
         }
         self.peer_index.rebuild_local_from_cache(&self.cache);
         Ok((files, bytes))
