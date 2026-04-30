@@ -53,6 +53,12 @@ HYDRATE_MODE=${HYDRATE_MODE:-default}
 POST_HYDRATE_SLEEP_S=${POST_HYDRATE_SLEEP_S:-0}
 POST_PASS1_SLEEP_S=${POST_PASS1_SLEEP_S:-0}
 RUN_PASS2=${RUN_PASS2:-0}
+# If set to 1: after the initial hydrate (any mode) and POST_HYDRATE_SLEEP_S,
+# issue a second /hydrate with mode=broadcast to perform the cluster-wide
+# gather (replicate every chunk to every node). POST_GATHER_SLEEP_S adds a
+# barrier between the gather and PASS1.
+RUN_GATHER=${RUN_GATHER:-0}
+POST_GATHER_SLEEP_S=${POST_GATHER_SLEEP_S:-0}
 
 mkdir -p "$OUT_DIR"
 LOG="$OUT_DIR/${RUN_TAG}-run.log"
@@ -81,8 +87,8 @@ if [ "$SKIP_WIPE" != "1" ]; then
   while read -r pod node; do
     [ -z "$pod" ] && continue
     (
-      kubectl --request-timeout=120s -n "$NS" exec "$pod" -- \
-        sh -c 'rm -f /mnt/nvme/blobcache-cache/* 2>&1 | head -3; echo "wiped"' >/dev/null 2>&1
+      kubectl --request-timeout=180s -n "$NS" exec "$pod" -- \
+        sh -c 'find /mnt/nvme/blobcache-cache/ -mindepth 1 -delete 2>&1 | head -3; REM=$(find /mnt/nvme/blobcache-cache/ -mindepth 1 | wc -l); SZ=$(du -s /mnt/nvme/blobcache-cache/ 2>/dev/null | awk "{print \$1}"); echo "wiped remaining=$REM bytes_kb=$SZ"' >"$OUT_DIR/${RUN_TAG}-wipe-${pod}.log" 2>&1
     ) &
   done <"$PODS_FILE"
   wait
@@ -111,6 +117,29 @@ if [ "$POST_HYDRATE_SLEEP_S" -gt 0 ] 2>/dev/null; then
   echo "=== POST_HYDRATE_SLEEP_START=$(date -u +%FT%T.%NZ) duration=${POST_HYDRATE_SLEEP_S}s ==="
   sleep "$POST_HYDRATE_SLEEP_S"
   echo "=== POST_HYDRATE_SLEEP_END=$(date -u +%FT%T.%NZ) ==="
+fi
+
+if [ "$RUN_GATHER" = "1" ]; then
+  COORD2=$(head -1 "$PODS_FILE" | awk '{print $1}')
+  echo
+  echo "=== GATHER_START=$(date -u +%FT%TZ) coordinator=$COORD2 ==="
+  GAT_T0=$(date +%s.%N)
+  kubectl --request-timeout="${HYDRATE_TIMEOUT_S}s" -n "$NS" exec "$COORD2" -- \
+    curl -sS --max-time "$HYDRATE_TIMEOUT_S" -X POST "http://127.0.0.1:7773/hydrate" \
+      -H 'content-type: application/json' \
+      -d "{\"mount\":\"${MOUNT}\",\"path\":\"${PATH_PREFIX}\",\"recursive\":true,\"mode\":\"broadcast\"}" \
+    >"$OUT_DIR/${RUN_TAG}-gather.json" 2>"$OUT_DIR/${RUN_TAG}-gather.err"
+  GAT_RC=$?
+  GAT_T1=$(date +%s.%N)
+  echo "=== GATHER_END=$(date -u +%FT%TZ) rc=$GAT_RC wall=$(fdiff "$GAT_T1" "$GAT_T0")s bytes=$(wc -c <"$OUT_DIR/${RUN_TAG}-gather.json") ==="
+  head -c 600 "$OUT_DIR/${RUN_TAG}-gather.json"; echo
+
+  if [ "$POST_GATHER_SLEEP_S" -gt 0 ] 2>/dev/null; then
+    echo
+    echo "=== POST_GATHER_SLEEP_START=$(date -u +%FT%T.%NZ) duration=${POST_GATHER_SLEEP_S}s ==="
+    sleep "$POST_GATHER_SLEEP_S"
+    echo "=== POST_GATHER_SLEEP_END=$(date -u +%FT%T.%NZ) ==="
+  fi
 fi
 
 SNAP_BEFORE="$OUT_DIR/${RUN_TAG}-snap-before.tsv"

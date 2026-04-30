@@ -47,6 +47,8 @@ snapshot() {
   pat=$(printf '^%s ' "${METRIC_NAMES[@]}" | sed 's/ $//' | tr ' ' '|')
 
   echo "# snapshot ts=$(date -u +%FT%T.%NZ)" >>"$out"
+  local tmpdir
+  tmpdir=$(mktemp -d)
   while read -r pod node; do
     [ -z "$pod" ] && continue
     (
@@ -57,10 +59,12 @@ snapshot() {
       while IFS= read -r line; do
         [ -z "$line" ] && continue
         printf '%s\t%s\t%s\n' "$pod" "$node" "$line"
-      done <<<"$body"
+      done <<<"$body" >"$tmpdir/$pod"
     ) &
   done <<<"$pods"
   wait
+  cat "$tmpdir"/* 2>/dev/null >>"$out"
+  rm -rf "$tmpdir"
 }
 
 diff_snapshot() {
