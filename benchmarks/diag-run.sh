@@ -30,6 +30,12 @@ set -uo pipefail
 NS=${NS:-blobcache}
 MOUNT=${MOUNT:-models}
 PATH_PREFIX=${PATH_PREFIX:?PATH_PREFIX required}
+# Normalize: ensure trailing slash so the FUSE-mount glob
+# /mnt/nvme/blobcache-mnt/$MOUNT/$PATH_PREFIX$READ_GLOB
+# expands to a directory listing (.../prefix/*.ext) rather than a sibling
+# pattern (.../prefix*.ext) when callers omit the slash. The /hydrate JSON
+# accepts either form.
+case "$PATH_PREFIX" in */) ;; *) PATH_PREFIX="$PATH_PREFIX/" ;; esac
 READ_GLOB=${READ_GLOB:-*.safetensors}
 READ_ORDER=${READ_ORDER:-alpha}
 SHUFFLE_SEED=${SHUFFLE_SEED:-}
