@@ -21,6 +21,7 @@ data:
     [azure]
     pool_max_idle_per_host = {{ printf "%d" (int64 .Values.config.azure.poolMaxIdlePerHost) }}
     workers = {{ printf "%d" (int64 .Values.config.azure.workers) }}
+    main_worker_threads = {{ printf "%d" (int64 .Values.config.azure.mainWorkerThreads) }}
     block_size = {{ printf "%d" (int64 .Values.config.azure.blockSize) }}
 
     [cluster]

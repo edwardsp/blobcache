@@ -72,6 +72,14 @@ pub struct AzureConfig {
     /// past that ceiling we need multiple independent runtimes.
     #[serde(default = "default_workers")]
     pub workers: usize,
+    /// Worker thread cap for the main tokio runtime that drives FUSE
+    /// handlers, gossip, peer-transport server, and stats. Default 8 caps
+    /// the work-stealing scheduler atomic-op overhead seen at the
+    /// `num_cpus()` default on high-core nodes (≈15 % CPU on GB300 at 128
+    /// cores). The blob-fetch runtimes (see `workers`) are sized
+    /// independently and not affected by this knob.
+    #[serde(default = "default_main_worker_threads")]
+    pub main_worker_threads: usize,
 }
 
 impl Default for AzureConfig {
@@ -80,6 +88,7 @@ impl Default for AzureConfig {
             pool_max_idle_per_host: default_pool_max_idle_per_host(),
             block_size: 0,
             workers: default_workers(),
+            main_worker_threads: default_main_worker_threads(),
         }
     }
 }
@@ -90,6 +99,10 @@ fn default_pool_max_idle_per_host() -> usize {
 
 fn default_workers() -> usize {
     1
+}
+
+fn default_main_worker_threads() -> usize {
+    8
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -221,6 +234,11 @@ impl Config {
         }
         if self.azure.workers == 0 {
             return Err(BcError::Config("azure.workers must be >= 1".into()));
+        }
+        if self.azure.main_worker_threads == 0 {
+            return Err(BcError::Config(
+                "azure.main_worker_threads must be >= 1".into(),
+            ));
         }
         if self.azure.block_size != 0 {
             if self.azure.block_size < self.cache.chunk_size {

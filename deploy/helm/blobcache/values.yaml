@@ -142,6 +142,8 @@ config:
   azure:
     poolMaxIdlePerHost: 512
     workers: 8                  # production default; bumping above 8 has not shown a Phase A win
+    mainWorkerThreads: 8        # cap main tokio runtime worker threads (FUSE/gossip/peer-server/stats);
+                                # 8 measured -10% PASS1 wall vs num_cpus()=128 default on GB300
     blockSize: 4194304          # 4 MiB; 0 = use cache.chunkSize
   cluster:
     bind: "0.0.0.0:7771"
