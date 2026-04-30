@@ -134,7 +134,14 @@ impl PeerService {
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
         let t_cg = std::time::Instant::now();
-        let got = self.cache.try_get(&key);
+        // Offload the synchronous disk read to a blocking thread so a slow
+        // NVMe read does not stall the tokio worker and starve other peer
+        // requests sharing it. try_get does std::fs::read inline.
+        let cache = self.cache.clone();
+        let key_bg = key.clone();
+        let got = tokio::task::spawn_blocking(move || cache.try_get(&key_bg))
+            .await
+            .unwrap_or(None);
         self.stats
             .server_cache_get_seconds
             .observe(t_cg.elapsed().as_secs_f64());

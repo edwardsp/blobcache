@@ -51,6 +51,8 @@ HYDRATE_MODE=${HYDRATE_MODE:-default}
 # 5s) before PASS1 reads start, so peers can find each other's hydrated chunks
 # without falling back to Azure blob.
 POST_HYDRATE_SLEEP_S=${POST_HYDRATE_SLEEP_S:-0}
+POST_PASS1_SLEEP_S=${POST_PASS1_SLEEP_S:-0}
+RUN_PASS2=${RUN_PASS2:-0}
 
 mkdir -p "$OUT_DIR"
 LOG="$OUT_DIR/${RUN_TAG}-run.log"
@@ -168,9 +170,64 @@ echo "=== SNAP_AFTER=$(date -u +%FT%T.%NZ) ==="
 "$SCRIPT_DIR/diag-straggler.sh" snapshot "$SNAP_AFTER"
 echo "snap-after lines=$(wc -l <"$SNAP_AFTER")"
 
+P2_WALL=""
+if [ "$RUN_PASS2" = "1" ]; then
+  if [ "$POST_PASS1_SLEEP_S" -gt 0 ] 2>/dev/null; then
+    echo
+    echo "=== POST_PASS1_SLEEP_START=$(date -u +%FT%T.%NZ) duration=${POST_PASS1_SLEEP_S}s ==="
+    sleep "$POST_PASS1_SLEEP_S"
+    echo "=== POST_PASS1_SLEEP_END=$(date -u +%FT%T.%NZ) ==="
+  fi
+
+  SNAP_BEFORE2="$OUT_DIR/${RUN_TAG}-snap-before2.tsv"
+  SNAP_AFTER2="$OUT_DIR/${RUN_TAG}-snap-after2.tsv"
+  echo
+  echo "=== SNAP_BEFORE2=$(date -u +%FT%T.%NZ) ==="
+  "$SCRIPT_DIR/diag-straggler.sh" snapshot "$SNAP_BEFORE2"
+  echo "snap-before2 lines=$(wc -l <"$SNAP_BEFORE2")"
+
+  PASS2_TSV="$OUT_DIR/${RUN_TAG}-pass2.tsv"
+  echo
+  echo "=== READ_PASS2_START=$(date -u +%FT%T.%NZ) order=$READ_ORDER ==="
+  P2_T0=$(date +%s.%N)
+  : >"$PASS2_TSV"
+  while read -r pod node; do
+    [ -z "$pod" ] && continue
+    (
+      OUT=$(kubectl --request-timeout="${READ_TIMEOUT_S}s" -n "$NS" exec "$pod" -- bash -c "
+$ORDER_SCRIPT
+START=\$(date +%s.%N)
+TOTAL=0
+COUNT=0
+for f in \"\${FILES[@]}\"; do
+  [ -e \"\$f\" ] || continue
+  S=\$(stat -c %s \"\$f\")
+  cat \"\$f\" >/dev/null 2>&1 || true
+  TOTAL=\$((TOTAL+S))
+  COUNT=\$((COUNT+1))
+done
+END=\$(date +%s.%N)
+WALL=\$(awk -v a=\"\$END\" -v b=\"\$START\" 'BEGIN{printf \"%.3f\", a-b}')
+echo \"files=\$COUNT bytes=\$TOTAL wall_s=\$WALL\"
+" 2>&1)
+      printf '%s\t%s\t%s\n' "$pod" "$node" "$OUT" >>"$PASS2_TSV"
+    ) &
+  done <"$PODS_FILE"
+  wait
+  P2_T1=$(date +%s.%N)
+  P2_WALL=$(fdiff "$P2_T1" "$P2_T0")
+  echo "=== READ_PASS2_END=$(date -u +%FT%T.%NZ) wall=${P2_WALL}s ==="
+  sort -t $'\t' -k1 "$PASS2_TSV" | head
+  echo
+
+  echo "=== SNAP_AFTER2=$(date -u +%FT%T.%NZ) ==="
+  "$SCRIPT_DIR/diag-straggler.sh" snapshot "$SNAP_AFTER2"
+  echo "snap-after2 lines=$(wc -l <"$SNAP_AFTER2")"
+fi
+
 echo
 echo "=========================================="
-echo "DIAG_RUN_END=$(date -u +%FT%T.%NZ) wall_pass1=${P1_WALL}s"
+echo "DIAG_RUN_END=$(date -u +%FT%T.%NZ) wall_pass1=${P1_WALL}s${P2_WALL:+ wall_pass2=${P2_WALL}s}"
 echo "=========================================="
 echo "tag=$RUN_TAG"
 echo "out_dir=$OUT_DIR"
