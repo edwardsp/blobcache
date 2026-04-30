@@ -1,7 +1,7 @@
 # Results: bound main tokio runtime to 8 worker threads
 
 **Branch**: `perf-fuse-splice`  **Commit**: `a21232e`  **Image**: `sha-a21232e-arm64`
-**Date**: 2026-04-30  **Cluster**: 17× GB300 (`aks-gb300-99067820-vmss*`)
+**Date**: 2026-04-30  **Cluster**: 17× GB300 nodes
 **Dataset**: `nvidia_DeepSeek-R1-0528-NVFP4-v2/` — 350 files, 413.3 GiB, 98 804 chunks of 4 MiB
 
 ## TL;DR
@@ -48,7 +48,7 @@ All runs use the v2.9 baseline knobs (`benchmarks/RESULTS-2026-04-30-shardlru.md
 
 (GB300 actually has 128 cores, not 72 — the comment was written before runtime verification. Doesn't change the conclusion: 128 → 8 is a 16× reduction.)
 
-Verified post-deploy on `blobcache-blobcached-54p7w`:
+Verified post-deploy on one sample pod:
 
 ```
 === unique thread names ===
@@ -84,7 +84,7 @@ Spread (max−min) drops 105.9 → 82.3 s, meaning the straggler tail is also im
 
 Hydrate is bandwidth-bound on the blob-fetch runtimes (which we did **not** touch). The 1.9 s difference is well inside hydrate noise (we've seen ±5 s across same-image runs on prior dates). No regression.
 
-## perf-record comparison (60 s @ 99 Hz on `vmss000012` during active read pass)
+## perf-record comparison (60 s @ 99 Hz on one sample node during active read pass)
 
 Baseline: 10 390 samples (`/tmp/bench-shardlru/perf-baseline.data`)
 mainrt8: 9 410 samples (`/tmp/bench-mainrt8/perf-mainrt8.data`)
@@ -142,7 +142,7 @@ mainrt8: 9 410 samples (`/tmp/bench-mainrt8/perf-mainrt8.data`)
 - Commit: `a21232e` on branch `perf-fuse-splice`
 - Image: `ghcr.io/edwardsp/blobcache:sha-a21232e-arm64` (built via `gh workflow run container.yml --ref perf-fuse-splice`, GH run `25153200876`)
 - Bench artifacts: `/tmp/bench-mainrt8/` (3 run logs, 3 pass1 TSVs, 1 hydrate JSON)
-- perf data: `/tmp/bench-mainrt8/perf-mainrt8.data` (9 410 samples; 60 s @ 99 Hz on pod `blobcache-blobcached-54p7w`, vmss `aks-gb300-99067820-vmss000012`, during pass3 read)
+- perf data: `/tmp/bench-mainrt8/perf-mainrt8.data` (9 410 samples; 60 s @ 99 Hz on one sample pod, during pass3 read)
 - Helm values diff vs baseline: only `image.tag` (`sha-83924a7-arm64` → `sha-a21232e-arm64`)
 
 ## Timings (UTC, for Grafana correlation)
