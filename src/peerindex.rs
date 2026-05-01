@@ -6,6 +6,7 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
 const BLOOM_K: usize = 4;
+#[allow(dead_code)]
 pub const BLOOM_BITS_DEFAULT: usize = 1 << 23;
 
 #[derive(Clone)]
@@ -17,7 +18,7 @@ pub struct Bloom {
 impl Bloom {
     pub fn new(m_bits: usize) -> Self {
         let m_bits = m_bits.max(64);
-        let words = (m_bits + 63) / 64;
+        let words = m_bits.div_ceil(64);
         Self {
             bits: vec![0u64; words],
             m_bits,
@@ -32,7 +33,7 @@ impl Bloom {
         if m_bits < 64 {
             return None;
         }
-        let words = (m_bits + 63) / 64;
+        let words = m_bits.div_ceil(64);
         let payload = &b[8..];
         if payload.len() != words * 8 {
             return None;
@@ -70,6 +71,7 @@ impl Bloom {
         true
     }
 
+    #[allow(dead_code)]
     pub fn byte_len(&self) -> usize {
         8 + self.bits.len() * 8
     }
@@ -123,6 +125,7 @@ pub struct PeerIndex {
     // this to membership.set_bloom_version so peers see a fresh version
     // immediately after a local insert (rather than waiting up to
     // bloom_rebuild_secs for the periodic rebuild to bump it).
+    #[allow(clippy::type_complexity)]
     on_version_change: RwLock<Option<Arc<dyn Fn(u64) + Send + Sync>>>,
 }
 

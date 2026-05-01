@@ -13,6 +13,7 @@ use crate::stats::Stats;
 
 pub const API_VERSION: &str = "2024-11-04";
 
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct BlobInfo {
     pub name: String,
@@ -22,6 +23,7 @@ pub struct BlobInfo {
     pub etag: Option<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct ListedBlob {
     pub name: String,

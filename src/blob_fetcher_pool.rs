@@ -60,8 +60,8 @@ impl BlobFetcherPool {
                 .with_context(|| format!("build blob worker runtime {i}"))?;
             let mut blobs = HashMap::new();
             for m in mounts {
-                let cred = Credential::resolve(&m.account, m.sas_token.as_deref())
-                    .with_context(|| {
+                let cred =
+                    Credential::resolve(&m.account, m.sas_token.as_deref()).with_context(|| {
                         format!("resolve credentials for mount {} (worker {i})", m.name)
                     })?;
                 blobs.insert(
@@ -90,6 +90,7 @@ impl BlobFetcherPool {
         self.view.clone()
     }
 
+    #[allow(dead_code)]
     pub fn blob_for(&self, mount: &str) -> Option<Arc<BlobClient>> {
         self.view.get(mount).cloned()
     }

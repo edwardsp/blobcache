@@ -84,6 +84,7 @@ pub struct PeerStats {
     pub rdma_non_rdma_lane: IntCounter,
     pub server_handler_seconds: Histogram,
     pub server_cache_get_seconds: Histogram,
+    #[allow(dead_code)]
     pub server_send_seconds: Histogram,
 }
 pub struct ClusterStats {
@@ -285,12 +286,10 @@ impl Stats {
         let members_dead = IntGauge::new("blobcache_cluster_members_dead", "dead members").unwrap();
 
         let mk_hist = |name: &str, help: &str| {
-            Histogram::with_opts(
-                HistogramOpts::new(name, help).buckets(vec![
-                    0.0001, 0.00025, 0.0005, 0.001, 0.002, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25,
-                    0.5, 1.0,
-                ]),
-            )
+            Histogram::with_opts(HistogramOpts::new(name, help).buckets(vec![
+                0.0001, 0.00025, 0.0005, 0.001, 0.002, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5,
+                1.0,
+            ]))
             .unwrap()
         };
         let chunk_total_seconds = mk_hist(
@@ -468,6 +467,7 @@ impl Stats {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn serve(
     stats: Arc<Stats>,
     addr: std::net::SocketAddr,

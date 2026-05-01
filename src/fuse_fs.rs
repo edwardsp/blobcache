@@ -1,7 +1,7 @@
 use dashmap::DashMap;
 use fuser::{
-    FileAttr, FileType, Filesystem, KernelConfig, ReplyAttr, ReplyData, ReplyDirectory,
-    ReplyEntry, Request,
+    FileAttr, FileType, Filesystem, KernelConfig, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry,
+    Request,
 };
 use libc::{EIO, ENOENT, ENOTDIR};
 use std::collections::{HashMap, HashSet};
@@ -127,7 +127,7 @@ impl BlobFs {
             NodeKind::File { size, mtime, .. } => FileAttr {
                 ino: node.ino,
                 size: *size,
-                blocks: (*size + 511) / 512,
+                blocks: (*size).div_ceil(512),
                 atime: *mtime,
                 mtime: *mtime,
                 ctime: *mtime,
@@ -304,6 +304,7 @@ impl BlobFs {
         g.children.entry(ino).or_default();
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn upsert_file(
         &self,
         g: &mut Inner,

@@ -83,8 +83,7 @@ fn main() -> anyhow::Result<()> {
             if host == "0.0.0.0" || host.is_empty() {
                 let local = nic::enumerate(true)
                     .into_iter()
-                    .filter(|a| matches!(a.ip, std::net::IpAddr::V4(_)))
-                    .next();
+                    .find(|a| matches!(a.ip, std::net::IpAddr::V4(_)));
                 match local {
                     Some(a) => format!("http://{}:{}", a.ip, port),
                     None => format!("http://127.0.0.1:{port}"),
@@ -103,8 +102,7 @@ fn main() -> anyhow::Result<()> {
             if host == "0.0.0.0" || host.is_empty() {
                 let local = nic::enumerate(true)
                     .into_iter()
-                    .filter(|a| matches!(a.ip, std::net::IpAddr::V4(_)))
-                    .next();
+                    .find(|a| matches!(a.ip, std::net::IpAddr::V4(_)));
                 match local {
                     Some(a) => format!("http://{}:{}", a.ip, port),
                     None => format!("http://127.0.0.1:{port}"),

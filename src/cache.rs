@@ -204,7 +204,7 @@ impl DiskCache {
             }
         };
         let mut buf = vec![0u8; range_len as usize];
-        if let Err(_) = f.read_exact_at(&mut buf, range_offset) {
+        if f.read_exact_at(&mut buf, range_offset).is_err() {
             self.stats.misses.fetch_add(1, Ordering::Relaxed);
             return None;
         }
@@ -224,6 +224,7 @@ impl DiskCache {
     /// payload directly into the tail of that buffer, eliminating the
     /// 4 MiB userspace memcpy that `try_get` + `extend_from_slice(payload)`
     /// would otherwise incur for every served peer chunk.
+    #[allow(dead_code)]
     pub fn try_get_into_slice(self: &Arc<Self>, key: &ChunkKey, dst: &mut [u8]) -> Option<usize> {
         use std::os::unix::fs::FileExt;
         let entry_size = {
@@ -247,7 +248,7 @@ impl DiskCache {
                 return None;
             }
         };
-        if let Err(_) = f.read_exact_at(dst, 0) {
+        if f.read_exact_at(dst, 0).is_err() {
             self.stats.misses.fetch_add(1, Ordering::Relaxed);
             return None;
         }
@@ -451,6 +452,7 @@ impl DiskCache {
         Ok((removed_files, removed_bytes))
     }
 
+    #[allow(dead_code)]
     pub fn local_path(&self, key: &ChunkKey) -> Option<PathBuf> {
         let p = self.path_for(key);
         if p.exists() {
@@ -460,6 +462,7 @@ impl DiskCache {
         }
     }
 
+    #[allow(dead_code)]
     pub fn root(&self) -> &Path {
         &self.root
     }

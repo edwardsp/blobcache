@@ -106,10 +106,10 @@ impl RecvSlab {
         check_status("ucp_mem_map", status)?;
 
         let mut advise: ucp_mem_advise_params_t = unsafe { mem::zeroed() };
-        advise.field_mask =
-            (ucp_mem_advise_params_field::UCP_MEM_ADVISE_PARAM_FIELD_ADDRESS.0 as u64)
-                | (ucp_mem_advise_params_field::UCP_MEM_ADVISE_PARAM_FIELD_LENGTH.0 as u64)
-                | (ucp_mem_advise_params_field::UCP_MEM_ADVISE_PARAM_FIELD_ADVICE.0 as u64);
+        advise.field_mask = (ucp_mem_advise_params_field::UCP_MEM_ADVISE_PARAM_FIELD_ADDRESS.0
+            as u64)
+            | (ucp_mem_advise_params_field::UCP_MEM_ADVISE_PARAM_FIELD_LENGTH.0 as u64)
+            | (ucp_mem_advise_params_field::UCP_MEM_ADVISE_PARAM_FIELD_ADVICE.0 as u64);
         advise.address = backing.as_ptr() as *mut c_void;
         advise.length = total as _;
         advise.advice = ucp_mem_advice::UCP_MADV_WILLNEED;
@@ -146,11 +146,10 @@ impl RecvSlab {
             .acquire_owned()
             .await
             .map_err(|_| BcError::Peer("RecvSlab semaphore closed".into()))?;
-        let idx = self
-            .free
-            .borrow_mut()
-            .pop()
-            .ok_or_else(|| BcError::Peer("RecvSlab free list empty (semaphore desync)".into()))?;
+        let idx =
+            self.free.borrow_mut().pop().ok_or_else(|| {
+                BcError::Peer("RecvSlab free list empty (semaphore desync)".into())
+            })?;
         Ok(SlabSlot {
             slab: self.clone(),
             idx,
@@ -416,9 +415,8 @@ async fn run_runtime(
         return Err(e);
     }
 
-    let worker_addr_blob = unsafe {
-        std::slice::from_raw_parts(worker_addr.cast::<u8>(), worker_addr_len).to_vec()
-    };
+    let worker_addr_blob =
+        unsafe { std::slice::from_raw_parts(worker_addr.cast::<u8>(), worker_addr_len).to_vec() };
     let state = Rc::new(RefCell::new(RuntimeState::new(
         ucx.worker,
         local_peer_id,
@@ -490,7 +488,15 @@ fn dispatch_cmd(state: SharedRuntimeState, cmd: RdmaCmd) {
                 wait_ms,
                 reply,
             } => {
-                let result = client_fetch(state.clone(), &peer_id, &peer_addr_blob, &key, length, wait_ms).await;
+                let result = client_fetch(
+                    state.clone(),
+                    &peer_id,
+                    &peer_addr_blob,
+                    &key,
+                    length,
+                    wait_ms,
+                )
+                .await;
                 let _ = reply.send(result);
             }
             RdmaCmd::Health {
@@ -513,7 +519,11 @@ fn dispatch_cmd(state: SharedRuntimeState, cmd: RdmaCmd) {
     });
 }
 
-async fn update_peer(state: SharedRuntimeState, peer_id: &str, peer_addr_blob: &[u8]) -> Result<()> {
+async fn update_peer(
+    state: SharedRuntimeState,
+    peer_id: &str,
+    peer_addr_blob: &[u8],
+) -> Result<()> {
     let removed = state
         .borrow_mut()
         .update_peer_addr_blob(peer_id, peer_addr_blob);
@@ -548,7 +558,8 @@ fn drain_inbound(
 
         tokio::task::spawn_local(async move {
             if let Err(e) =
-                handle_inbound_request(state_c, cache_c, stats_c, msg, recv_len, sender_tag, cps_c).await
+                handle_inbound_request(state_c, cache_c, stats_c, msg, recv_len, sender_tag, cps_c)
+                    .await
             {
                 tracing::warn!(error = %e, "inbound UCX request handler failed");
             }
@@ -602,11 +613,12 @@ async fn handle_inbound_request(
         let mut buf: Vec<u8> = Vec::with_capacity(total);
         buf.extend_from_slice(&STATUS_OK.to_le_bytes());
         buf.extend_from_slice(&(size_us as u32).to_le_bytes());
-        let payload_slice = unsafe {
-            std::slice::from_raw_parts_mut(buf.as_mut_ptr().add(8), size_us)
-        };
+        let payload_slice =
+            unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr().add(8), size_us) };
         cache2.try_get_into_slice(&key2, payload_slice)?;
-        unsafe { buf.set_len(total); }
+        unsafe {
+            buf.set_len(total);
+        }
         Some((buf, size_us))
     })
     .await
@@ -615,7 +627,8 @@ async fn handle_inbound_request(
         Err(e) => {
             tracing::warn!(error = %e, "cache try_get_into blocking task failed");
             let response = encode_response(STATUS_ERR, &[])?;
-            let _ = server_send_response(state, &request.requester_peer_id, resp_tag, &response).await;
+            let _ =
+                server_send_response(state, &request.requester_peer_id, resp_tag, &response).await;
             return Ok(());
         }
     };
@@ -771,7 +784,11 @@ impl RuntimeState {
         }
     }
 
-    fn update_peer_addr_blob(&mut self, peer_id: &str, peer_addr_blob: &[u8]) -> Option<RemovedEndpoint> {
+    fn update_peer_addr_blob(
+        &mut self,
+        peer_id: &str,
+        peer_addr_blob: &[u8],
+    ) -> Option<RemovedEndpoint> {
         self.peer_addr_blobs
             .insert(peer_id.to_string(), peer_addr_blob.to_vec());
 
@@ -797,13 +814,19 @@ impl RuntimeState {
         None
     }
 
-    fn checkout_endpoint(&mut self, peer_id: &str, peer_addr_blob: &[u8]) -> Result<CheckedOutEndpoint> {
+    fn checkout_endpoint(
+        &mut self,
+        peer_id: &str,
+        peer_addr_blob: &[u8],
+    ) -> Result<CheckedOutEndpoint> {
         let mut verify_ep = None;
         let ep = {
             let slot = match self.peer_eps.get_mut(peer_id) {
                 Some(slot) => {
                     if slot.broken.load(Ordering::SeqCst) {
-                        return Err(BcError::Peer(format!("UCX endpoint is broken for peer {peer_id}")));
+                        return Err(BcError::Peer(format!(
+                            "UCX endpoint is broken for peer {peer_id}"
+                        )));
                     }
                     if slot.peer_addr_blob != peer_addr_blob {
                         return Err(BcError::Peer(format!(
@@ -916,8 +939,16 @@ async fn client_fetch(
         close_removed_endpoint(removed).await;
     }
 
-    let result =
-        client_fetch_inner(worker, checked_out.ep, key, length, wait_ms, &requester_peer_id, &slab).await;
+    let result = client_fetch_inner(
+        worker,
+        checked_out.ep,
+        key,
+        length,
+        wait_ms,
+        &requester_peer_id,
+        &slab,
+    )
+    .await;
     if should_mark_endpoint_broken(&result) {
         state.borrow_mut().mark_peer_ep_broken(peer_id);
     }
@@ -1064,7 +1095,12 @@ fn release_callback_arg(callback_arg: *mut Arc<AtomicBool>) {
     }
 }
 
-fn encode_request(key: &ChunkKey, length: u32, requester_peer_id: &str, wait_ms: u32) -> Result<Vec<u8>> {
+fn encode_request(
+    key: &ChunkKey,
+    length: u32,
+    requester_peer_id: &str,
+    wait_ms: u32,
+) -> Result<Vec<u8>> {
     let mount = key.mount.as_bytes();
     let blob = key.blob.as_bytes();
     let requester = requester_peer_id.as_bytes();
@@ -1078,7 +1114,8 @@ fn encode_request(key: &ChunkKey, length: u32, requester_peer_id: &str, wait_ms:
         return Err(BcError::Peer("requester peer id too long".into()));
     }
 
-    let mut req = Vec::with_capacity(4 + 1 + mount.len() + 2 + blob.len() + 8 + 4 + 2 + requester.len() + 4);
+    let mut req =
+        Vec::with_capacity(4 + 1 + mount.len() + 2 + blob.len() + 8 + 4 + 2 + requester.len() + 4);
     req.extend_from_slice(&MAGIC.to_be_bytes());
     req.push(mount.len() as u8);
     req.extend_from_slice(mount);
@@ -1128,7 +1165,11 @@ fn decode_request(data: &[u8]) -> Result<ChunkRequest> {
     }
 
     Ok(ChunkRequest {
-        key: ChunkKey { mount, blob, offset },
+        key: ChunkKey {
+            mount,
+            blob,
+            offset,
+        },
         length,
         requester_peer_id,
         wait_ms,
