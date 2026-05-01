@@ -138,6 +138,7 @@ impl Drop for LeaderGuard {
 }
 
 impl Fetcher {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         cache: Arc<DiskCache>,
         pool: Arc<BlobFetcherPool>,
@@ -366,10 +367,11 @@ impl Fetcher {
 
     fn note_fetch_origin(&self, mount_name: &str, blob_path: &str, from_blob: bool) {
         let key = format!("{}\0{}", mount_name, blob_path);
-        let mut e = self
-            .seq_state
-            .entry(key)
-            .or_insert(SeqState { last_end: 0, consecutive: 0, blob_streak: 0 });
+        let mut e = self.seq_state.entry(key).or_insert(SeqState {
+            last_end: 0,
+            consecutive: 0,
+            blob_streak: 0,
+        });
         if from_blob {
             e.blob_streak = e.blob_streak.saturating_add(1);
         } else {
@@ -823,8 +825,7 @@ impl Fetcher {
         let digest = key_digest(&k);
         tokio::spawn(async move {
             let t_ins = std::time::Instant::now();
-            let insert_res =
-                tokio::task::spawn_blocking(move || cache.insert(k, &data)).await;
+            let insert_res = tokio::task::spawn_blocking(move || cache.insert(k, &data)).await;
             stats
                 .chunk_cache_insert_seconds
                 .observe(t_ins.elapsed().as_secs_f64());
@@ -940,6 +941,7 @@ impl Fetcher {
         }
     }
 
+    #[allow(dead_code)]
     pub fn insert_received_chunk(self: &Arc<Self>, key: ChunkKey, data: Bytes) {
         self.spawn_insert(key, data);
     }
@@ -1080,10 +1082,11 @@ impl Fetcher {
         let cs = self.chunk_size;
         let key = format!("{}\0{}", mount.name, blob_path);
         let (consecutive, blob_streak) = {
-            let mut e = self
-                .seq_state
-                .entry(key)
-                .or_insert(SeqState { last_end: 0, consecutive: 0, blob_streak: 0 });
+            let mut e = self.seq_state.entry(key).or_insert(SeqState {
+                last_end: 0,
+                consecutive: 0,
+                blob_streak: 0,
+            });
             // Sequential = read starts exactly where the previous one ended,
             // or within one chunk ahead (covers FUSE sub-read reordering and
             // small skipped slack from prefetch-warmed reads).
@@ -1104,7 +1107,11 @@ impl Fetcher {
             return;
         }
 
-        let cur_chunk = if req_end == 0 { 0 } else { ((req_end - 1) / cs) * cs };
+        let cur_chunk = if req_end == 0 {
+            0
+        } else {
+            ((req_end - 1) / cs) * cs
+        };
         for i in 1..=self.prefetch_depth as u64 {
             let off = cur_chunk + i * cs;
             if off >= file_size {

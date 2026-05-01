@@ -22,11 +22,7 @@ pub const PROTO_VERSION: &str = "v1";
 // subscription or by becoming the leader for a blob fetch) within the
 // caller-supplied deadline; None to signal "give up, return 404 to the peer".
 pub type ChunkProvider = Arc<
-    dyn Fn(
-            ChunkKey,
-            u64,
-            u32,
-        ) -> Pin<Box<dyn Future<Output = Option<Bytes>> + Send + 'static>>
+    dyn Fn(ChunkKey, u64, u32) -> Pin<Box<dyn Future<Output = Option<Bytes>> + Send + 'static>>
         + Send
         + Sync,
 >;
@@ -125,14 +121,8 @@ impl PeerService {
             blob,
             offset,
         };
-        let wait_ms: u32 = qs
-            .get("wait_ms")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
-        let expected_len: u64 = qs
-            .get("len")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
+        let wait_ms: u32 = qs.get("wait_ms").and_then(|v| v.parse().ok()).unwrap_or(0);
+        let expected_len: u64 = qs.get("len").and_then(|v| v.parse().ok()).unwrap_or(0);
         let t_cg = std::time::Instant::now();
         // Offload the synchronous disk read to a blocking thread so a slow
         // NVMe read does not stall the tokio worker and starve other peer
@@ -148,9 +138,7 @@ impl PeerService {
         let resolved = match got {
             Some(b) => Some(b),
             None => match (&self.chunk_provider, wait_ms, expected_len) {
-                (Some(provider), w, l) if w > 0 && l > 0 => {
-                    provider(key.clone(), l, w).await
-                }
+                (Some(provider), w, l) if w > 0 && l > 0 => provider(key.clone(), l, w).await,
                 _ => None,
             },
         };
@@ -266,7 +254,8 @@ impl PeerClient {
                 let worker_addr = peer_worker_addr.ok_or_else(|| {
                     BcError::Peer(format!("missing ucx worker address for peer {peer_id}"))
                 })?;
-                c.fetch_chunk(peer_id, worker_addr, key, length, wait_ms).await
+                c.fetch_chunk(peer_id, worker_addr, key, length, wait_ms)
+                    .await
             }
         }
     }

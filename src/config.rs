@@ -222,7 +222,7 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.cache.chunk_size == 0 || self.cache.chunk_size % 4096 != 0 {
+        if self.cache.chunk_size == 0 || !self.cache.chunk_size.is_multiple_of(4096) {
             return Err(BcError::Config(
                 "cache.chunk_size must be multiple of 4096".into(),
             ));
@@ -246,7 +246,7 @@ impl Config {
                     "azure.block_size must be >= cache.chunk_size when set".into(),
                 ));
             }
-            if self.azure.block_size % self.cache.chunk_size != 0 {
+            if !self.azure.block_size.is_multiple_of(self.cache.chunk_size) {
                 return Err(BcError::Config(
                     "azure.block_size must be a multiple of cache.chunk_size".into(),
                 ));

@@ -50,16 +50,12 @@ pub struct HydrateShardResponse {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum HydrateMode {
+    #[default]
     Default,
     Broadcast,
     Ring,
-}
-
-impl Default for HydrateMode {
-    fn default() -> Self {
-        Self::Default
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -272,6 +268,7 @@ pub async fn run_shard(
 /// Coordinator side: list blobs, enumerate chunks, round-robin shard to
 /// alive peers (including self), POST each peer their batch in parallel,
 /// and aggregate results.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_coordinator(
     req: HydrateRequest,
     chunk_size: u64,
@@ -399,14 +396,16 @@ pub async fn run_coordinator(
     let plan: Vec<BroadcastSource> = targets
         .iter()
         .zip(buckets.iter())
-        .map(|((node_id, transport_url, worker_b64), chunks)| BroadcastSource {
-            node_id: node_id.clone(),
-            transport_url: transport_url
-                .clone()
-                .unwrap_or_else(|| me_transport_url.clone()),
-            ucx_worker_addr_b64: worker_b64.clone(),
-            chunks: chunks.clone(),
-        })
+        .map(
+            |((node_id, transport_url, worker_b64), chunks)| BroadcastSource {
+                node_id: node_id.clone(),
+                transport_url: transport_url
+                    .clone()
+                    .unwrap_or_else(|| me_transport_url.clone()),
+                ucx_worker_addr_b64: worker_b64.clone(),
+                chunks: chunks.clone(),
+            },
+        )
         .collect();
 
     let phase_a_t0 = Instant::now();
@@ -414,7 +413,7 @@ pub async fn run_coordinator(
     for ((node_id, transport_url, _), chunks) in targets.into_iter().zip(buckets.into_iter()) {
         let assigned = chunks.len() as u64;
         let mount_name = req.mount.clone();
-        if transport_url.is_none() {
+        let Some(url) = transport_url else {
             let f = fetcher.clone();
             let m = mounts.clone();
             handles.push(tokio::spawn(async move {
@@ -438,8 +437,9 @@ pub async fn run_coordinator(
                     end_unix_ms: r.end_unix_ms,
                 }
             }));
-        } else {
-            let url = transport_url.unwrap();
+            continue;
+        };
+        {
             let host = url
                 .trim_start_matches("http://")
                 .split(':')
@@ -600,9 +600,7 @@ pub async fn run_coordinator(
             "hydrate phase B (broadcast) complete"
         );
     } else if mode == HydrateMode::Broadcast {
-        tracing::warn!(
-            "skipping hydrate Phase B (broadcast) because Phase A reported errors"
-        );
+        tracing::warn!("skipping hydrate Phase B (broadcast) because Phase A reported errors");
     } else if mode == HydrateMode::Ring && peers.iter().all(|p| p.errors.is_empty()) {
         let phase_b_t0 = Instant::now();
         let (peers_out, steps_out) = run_ring_phase(
@@ -635,7 +633,10 @@ pub async fn run_coordinator(
             aggregate_mibs = phase_b_mibs,
             n_targets = broadcast_peers.len(),
             n_steps = ring_steps.len(),
-            n_errors = broadcast_peers.iter().map(|p| p.errors.len()).sum::<usize>(),
+            n_errors = broadcast_peers
+                .iter()
+                .map(|p| p.errors.len())
+                .sum::<usize>(),
             "hydrate phase B (ring) complete"
         );
     } else if mode == HydrateMode::Ring {
@@ -926,9 +927,9 @@ pub async fn run_broadcast_shard(
                             return (
                                 peer_id,
                                 c,
-                            Err(crate::error::BcError::Other(
-                                "broadcast per-src semaphore closed".into(),
-                            )),
+                                Err(crate::error::BcError::Other(
+                                    "broadcast per-src semaphore closed".into(),
+                                )),
                             );
                         }
                     };

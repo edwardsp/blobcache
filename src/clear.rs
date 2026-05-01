@@ -84,7 +84,7 @@ pub async fn run_coordinator(
 
     let mut handles = Vec::with_capacity(n_targets);
     for (node_id, transport_url) in targets.into_iter() {
-        if transport_url.is_none() {
+        let Some(url) = transport_url else {
             let f = fetcher.clone();
             handles.push(tokio::spawn(async move {
                 let r = run_shard(f).await;
@@ -98,8 +98,9 @@ pub async fn run_coordinator(
                     error: r.error,
                 }
             }));
-        } else {
-            let url = transport_url.unwrap();
+            continue;
+        };
+        {
             let host = url
                 .trim_start_matches("http://")
                 .split(':')

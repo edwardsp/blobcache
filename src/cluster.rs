@@ -63,6 +63,7 @@ pub struct Membership {
     // Fired when sweep() transitions a peer to Dead. Lets the PeerIndex
     // forget that peer's bloom immediately rather than waiting up to
     // bloom_pull_secs for run_bloom_pull_loop's reconciliation pass.
+    #[allow(clippy::type_complexity)]
     on_peer_dead: Option<Arc<dyn Fn(&str) + Send + Sync>>,
 }
 
