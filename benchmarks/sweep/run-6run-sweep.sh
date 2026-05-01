@@ -49,8 +49,15 @@ reinstall() {
   helm -n "$NS" install   "$RELEASE" "$REPO_ROOT/$CHART" -f "$values" --wait --timeout 10m
   kubectl --request-timeout=15s -n "$NS" rollout status ds/blobcache-blobcached --timeout=10m
   wait_http_ready
-  # Brief settle for gossip + bloom warmup.
-  sleep 15
+  # Settle window: 60s covers two needs.
+  #   1. Gossip + bloom warmup.
+  #   2. Prometheus scrape baseline. PodMonitor scrape interval is 15s and
+  #      rate() needs >=2 samples in its 1-min window. With only 15s of
+  #      pre-workload runtime the first trial of a fresh-pod sweep produces
+  #      flat Grafana panels even when GBs are moving (observed: t1 invisible,
+  #      t2 of identical workload clearly visible because pods had been
+  #      scraped ~50 times by then). 60s gives Prometheus 4+ baseline scrapes.
+  sleep 60
 }
 
 # wait_http_ready: poll every blobcached pod's stats endpoint (:7773/metrics)
