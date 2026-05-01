@@ -1944,7 +1944,9 @@ mod wire_protocol_tests {
     fn response_decode_rejects_payload_larger_than_requested() {
         let bytes = encode_response(STATUS_OK, &vec![0u8; 8]).unwrap();
         let err = decode_response(&bytes, 4).unwrap_err();
-        assert!(format!("{err}").to_lowercase().contains("larger than requested"));
+        assert!(format!("{err}")
+            .to_lowercase()
+            .contains("larger than requested"));
     }
 
     #[test]

@@ -70,11 +70,17 @@ fn from_env_ignores_partial_shared_key() {
     clear_auth_env();
     set("AZURE_STORAGE_ACCOUNT", "x");
     let c = Credential::from_env().expect("ok");
-    assert!(c.is_none(), "account-only without key must NOT produce SharedKey");
+    assert!(
+        c.is_none(),
+        "account-only without key must NOT produce SharedKey"
+    );
     clear_auth_env();
     set("AZURE_STORAGE_KEY", "Zm9v");
     let c = Credential::from_env().expect("ok");
-    assert!(c.is_none(), "key-only without account must NOT produce SharedKey");
+    assert!(
+        c.is_none(),
+        "key-only without account must NOT produce SharedKey"
+    );
     clear_auth_env();
 }
 

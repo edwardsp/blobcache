@@ -5,13 +5,13 @@ How blobcache is tested, what's covered, and how to run it.
 ## Quick run
 
 ```sh
-cargo test                         # all tests, TCP feature set
-cargo test --features ucx          # adds the UCX wire-protocol unit tests
+cargo test                         # all tests, TCP feature set (matches CI)
+cargo test --features ucx          # adds the UCX wire-protocol unit tests (local only; needs UCX libs)
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-CI runs the same commands on every push to a PR branch.
+CI runs `cargo test --release --locked` on x86_64 + aarch64 Linux, plus `cargo fmt --check` and `cargo clippy -D warnings`, on every push and PR.
 
 ## Test inventory
 
@@ -222,4 +222,6 @@ cargo test config::                            # all config validation tests
 
 ## CI
 
-`.github/workflows/build.yml` runs `cargo test` (default features) and `cargo test --features ucx` on every push. Both must pass before a PR can merge.
+`.github/workflows/build.yml` builds and runs `cargo test --release --locked` on every push/PR for both `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu` targets, plus `cargo fmt --check` and `cargo clippy -D warnings`. All must pass before a PR can merge.
+
+The `ucx` feature is **not** built or tested in this workflow — `ucx1-sys` vendors UCX 1.18.1 from source and fails on the Ubuntu-runner GCC's `-Werror` flags. UCX builds (and the `wire_protocol_tests` module) are exercised by the container image workflow (`deploy/Dockerfile`) on a base image with the matching MOFED/UCX stack. Run them locally with `cargo test --features ucx wire_protocol_tests` if you have UCX installed.

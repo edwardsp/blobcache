@@ -20,7 +20,8 @@ fn sign_request_known_input_regression() {
         ("x-ms-date", "Fri, 01 May 2026 12:00:00 GMT"),
         ("x-ms-version", "2021-12-02"),
     ]);
-    let key_b64 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    let key_b64 =
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
     let sig = sign_request("acct", key_b64, "GET", &url, &headers, None);
 
@@ -86,8 +87,10 @@ fn sign_request_xms_headers_canonicalised_in_sorted_order() {
 fn sign_request_query_params_canonicalised_in_sorted_order() {
     let k = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
     let h = hm(&[("x-ms-date", "d")]);
-    let u1 = Url::parse("https://acct.blob.core.windows.net/c/b?comp=list&restype=container").unwrap();
-    let u2 = Url::parse("https://acct.blob.core.windows.net/c/b?restype=container&comp=list").unwrap();
+    let u1 =
+        Url::parse("https://acct.blob.core.windows.net/c/b?comp=list&restype=container").unwrap();
+    let u2 =
+        Url::parse("https://acct.blob.core.windows.net/c/b?restype=container&comp=list").unwrap();
     assert_eq!(
         sign_request("acct", k, "GET", &u1, &h, None),
         sign_request("acct", k, "GET", &u2, &h, None),

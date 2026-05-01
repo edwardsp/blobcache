@@ -190,9 +190,12 @@ async fn malformed_chunk_path_returns_400() {
         .await
         .unwrap();
     assert_eq!(r.status(), 400, "missing offset query param");
-    let r = reqwest::get(format!("{}/v1/chunk/m?blob=b&offset=notanumber", url_for(addr)))
-        .await
-        .unwrap();
+    let r = reqwest::get(format!(
+        "{}/v1/chunk/m?blob=b&offset=notanumber",
+        url_for(addr)
+    ))
+    .await
+    .unwrap();
     assert_eq!(r.status(), 400, "non-numeric offset");
 }
 

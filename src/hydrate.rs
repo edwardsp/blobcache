@@ -1396,9 +1396,15 @@ mod hydrate_mode_tests {
     #[test]
     fn request_mode_used_when_no_env() {
         with_env(None, || {
-            assert_eq!(hydrate_mode(Some(HydrateMode::Broadcast)), HydrateMode::Broadcast);
+            assert_eq!(
+                hydrate_mode(Some(HydrateMode::Broadcast)),
+                HydrateMode::Broadcast
+            );
             assert_eq!(hydrate_mode(Some(HydrateMode::Ring)), HydrateMode::Ring);
-            assert_eq!(hydrate_mode(Some(HydrateMode::Default)), HydrateMode::Default);
+            assert_eq!(
+                hydrate_mode(Some(HydrateMode::Default)),
+                HydrateMode::Default
+            );
         });
     }
 
@@ -1406,8 +1412,14 @@ mod hydrate_mode_tests {
     fn env_broadcast_overrides_request() {
         with_env(Some("broadcast"), || {
             assert_eq!(hydrate_mode(None), HydrateMode::Broadcast);
-            assert_eq!(hydrate_mode(Some(HydrateMode::Ring)), HydrateMode::Broadcast);
-            assert_eq!(hydrate_mode(Some(HydrateMode::Default)), HydrateMode::Broadcast);
+            assert_eq!(
+                hydrate_mode(Some(HydrateMode::Ring)),
+                HydrateMode::Broadcast
+            );
+            assert_eq!(
+                hydrate_mode(Some(HydrateMode::Default)),
+                HydrateMode::Broadcast
+            );
         });
     }
 
@@ -1415,7 +1427,10 @@ mod hydrate_mode_tests {
     fn env_ring_overrides_request() {
         with_env(Some("ring"), || {
             assert_eq!(hydrate_mode(None), HydrateMode::Ring);
-            assert_eq!(hydrate_mode(Some(HydrateMode::Broadcast)), HydrateMode::Ring);
+            assert_eq!(
+                hydrate_mode(Some(HydrateMode::Broadcast)),
+                HydrateMode::Ring
+            );
         });
     }
 
@@ -1440,7 +1455,10 @@ mod hydrate_mode_tests {
     #[test]
     fn env_empty_string_falls_back() {
         with_env(Some(""), || {
-            assert_eq!(hydrate_mode(Some(HydrateMode::Broadcast)), HydrateMode::Broadcast);
+            assert_eq!(
+                hydrate_mode(Some(HydrateMode::Broadcast)),
+                HydrateMode::Broadcast
+            );
         });
     }
 
