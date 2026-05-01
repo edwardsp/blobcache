@@ -40,7 +40,7 @@ mkdir -p "$OUT_DIR"
 "$SCRIPT_DIR/render-overlay.sh" "$SCRIPT_DIR/values-cache-peer-on.yaml.tmpl"  > "$OUT_DIR/values-on.yaml"
 
 SUMMARY="$OUT_DIR/sweep-summary.tsv"
-printf 'tag\tstart_utc\tend_utc\thydrate_s\tgather_s\tpass1_s\tpass2_s\n' > "$SUMMARY"
+printf 'tag\tstart_utc\tend_utc\thydrate_s\tgather_s\tpass1_s\tpass2_s\thyd_status\n' > "$SUMMARY"
 
 reinstall() {
   local values="$1"
@@ -48,8 +48,73 @@ reinstall() {
   helm -n "$NS" uninstall "$RELEASE" --wait --timeout 5m >/dev/null 2>&1 || true
   helm -n "$NS" install   "$RELEASE" "$REPO_ROOT/$CHART" -f "$values" --wait --timeout 10m
   kubectl --request-timeout=15s -n "$NS" rollout status ds/blobcache-blobcached --timeout=10m
+  wait_http_ready
   # Brief settle for gossip + bloom warmup.
   sleep 15
+}
+
+# wait_http_ready: poll every blobcached pod's stats endpoint (:7773/metrics)
+# until ALL respond 200, with a hard timeout. k8s `rollout status` only
+# guarantees the container is running; the embedded HTTP server may not yet
+# be accepting connections. Hydrate POSTs to /hydrate-shard fail silently
+# otherwise (one peer never fetches its 5,812-chunk shard, evident only as
+# blob-fetch surge during PASS1 - sweep run 2026-05-01T12:56Z reproduced this).
+wait_http_ready() {
+  local timeout_s=120 poll_s=2 deadline expected ready ips
+  deadline=$(( $(date +%s) + timeout_s ))
+  expected="$(kubectl -n "$NS" get ds blobcache-blobcached -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || echo 0)"
+  echo "==[ wait_http_ready: polling :7773/metrics on $expected pods, timeout ${timeout_s}s ]=="
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    ips="$(kubectl -n "$NS" get pods -l app.kubernetes.io/component=blobcached \
+             -o jsonpath='{range .items[?(@.status.phase=="Running")]}{.status.podIP}{"\n"}{end}' 2>/dev/null \
+           | grep -v '^$' | tr '\n' ' ')"
+    if [ -n "$ips" ]; then
+      ready="$(kubectl -n "$NS" exec blobcache-builder -- bash -c "
+        ok=0
+        for ip in $ips; do
+          curl -sf -m 2 \"http://\$ip:7773/metrics\" -o /dev/null 2>/dev/null && ok=\$((ok+1))
+        done
+        echo \$ok
+      " 2>/dev/null || echo 0)"
+      if [ "$ready" -ge "$expected" ] && [ "$expected" -gt 0 ]; then
+        echo "==[ wait_http_ready: $ready/$expected pods healthy at $(date -u +%FT%TZ) ]=="
+        return 0
+      fi
+    fi
+    sleep "$poll_s"
+  done
+  echo "==[ wait_http_ready: TIMEOUT - $ready/$expected pods responded after ${timeout_s}s ]==" >&2
+  return 1
+}
+
+# verify_hydrate: parse hydrate.json and abort the trial if any peer reported
+# errors or under-fetched its assigned shard. Catches the silent-loss class of
+# bug where coordinator records errs>0 but rc=0, leaving chunks missing from
+# the cluster bloom. Returns 0 if healthy, 1 otherwise (caller decides whether
+# to skip the trial vs continue with PASS1 polluted by blob fallback).
+verify_hydrate() {
+  local hydrate_json="$1" tag="$2"
+  if [ ! -s "$hydrate_json" ]; then
+    echo "==[ verify_hydrate $tag: missing $hydrate_json ]==" >&2
+    return 1
+  fi
+  python3 - "$hydrate_json" "$tag" <<'PY'
+import json, sys
+hyd_path, tag = sys.argv[1], sys.argv[2]
+d = json.load(open(hyd_path))
+peers = d.get('peers', [])
+bad = []
+for p in peers:
+    a = p.get('assigned_chunks', 0)
+    f = p.get('fetched', 0)
+    e = p.get('errors', [])
+    if e or (a > 0 and f != a):
+        bad.append((p.get('node_id', '?'), a, f, len(e), (e[:1] or [''])[0]))
+print(f"verify_hydrate {tag}: {len(peers)} peers, {len(bad)} unhealthy")
+for n, a, f, ec, msg in bad:
+    print(f"  UNHEALTHY {n}: assigned={a} fetched={f} errs={ec} first={msg!r}")
+sys.exit(1 if bad else 0)
+PY
 }
 
 # Args: <tag> <values-file> <run_gather:0|1>
@@ -76,6 +141,13 @@ trial() {
 
   end_utc="$(date -u +%FT%TZ)"
 
+  local hydrate_json="$OUT_DIR/${tag}-hydrate.json"
+  local hyd_status="ok"
+  if ! verify_hydrate "$hydrate_json" "$tag"; then
+    hyd_status="FAIL"
+    echo "==[ TRIAL $tag: hydrate verification FAILED - results polluted, see hydrate.json ]==" >&2
+  fi
+
   # Extract durations from the run log.
   local log="$OUT_DIR/${tag}-run.log"
   local hyd gat p1 p2
@@ -84,8 +156,8 @@ trial() {
   p1="$(grep -oE 'READ_PASS1_END=[^ ]+ wall=[0-9.]+s'    "$log" 2>/dev/null | grep -oE 'wall=[0-9.]+' | head -1 | cut -d= -f2 || echo '')"
   p2="$(grep -oE 'READ_PASS2_END=[^ ]+ wall=[0-9.]+s'    "$log" 2>/dev/null | grep -oE 'wall=[0-9.]+' | head -1 | cut -d= -f2 || echo '')"
 
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-    "$tag" "$start_utc" "$end_utc" "${hyd:--}" "${gat:--}" "${p1:--}" "${p2:--}" \
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$tag" "$start_utc" "$end_utc" "${hyd:--}" "${gat:--}" "${p1:--}" "${p2:--}" "$hyd_status" \
     | tee -a "$SUMMARY"
   echo "==[ TRIAL $tag end=$end_utc ]=="
 }

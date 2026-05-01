@@ -44,7 +44,7 @@ export BLOBCACHE_IMAGE_TAG=sha-<short>-arm64
 The sweep takes ~70 minutes wall (6 trials × ~7 min compute + helm
 reinstall overhead). Output:
 
-- `$OUT_DIR/sweep-summary.tsv` — one line per trial: `tag start_utc end_utc hydrate_s gather_s pass1_s pass2_s`
+- `$OUT_DIR/sweep-summary.tsv` — one line per trial: `tag start_utc end_utc hydrate_s gather_s pass1_s pass2_s hyd_status` (`hyd_status=ok` means every peer fetched its full assigned shard with zero errors; `FAIL` means at least one peer underfetched and PASS1 will be polluted by blob fallback)
 - `$OUT_DIR/<tag>-{run.log,pass1.tsv,pass2.tsv,hydrate.json,gather.json,snap-*.tsv}`
 - `$OUT_DIR/values-{off,on}.yaml` — rendered overlays (do not commit)
 
