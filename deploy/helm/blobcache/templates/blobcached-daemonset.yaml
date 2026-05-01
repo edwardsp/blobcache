@@ -101,6 +101,19 @@ spec:
             - name: stats
               containerPort: 7773
               protocol: TCP
+          # Cold start can take several minutes when the on-disk chunk cache
+          # is large (DiskCache::open scans every chunk to populate the LRU,
+          # ~1 s per 1k chunks on NVMe). The startupProbe gives that scan
+          # room to finish before liveness/readiness take over. Once it
+          # succeeds k8s switches over and never re-runs it.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: stats
+            initialDelaySeconds: {{ .Values.probes.startup.initialDelaySeconds | default 5 }}
+            periodSeconds: {{ .Values.probes.startup.periodSeconds | default 10 }}
+            timeoutSeconds: {{ .Values.probes.startup.timeoutSeconds | default 3 }}
+            failureThreshold: {{ .Values.probes.startup.failureThreshold | default 30 }}
           livenessProbe:
             httpGet:
               path: /healthz
