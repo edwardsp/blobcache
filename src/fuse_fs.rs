@@ -455,55 +455,74 @@ impl Filesystem for BlobFs {
         let me = self.clone_handles();
         let fuse_reads = self.fuse_reads.clone();
         let fuse_read_bytes = self.fuse_read_bytes.clone();
-        self.rt.spawn(async move {
-            let t_read = std::time::Instant::now();
-            let (full_path, file_size) = {
-                let g = me.inner.read().await;
-                match g.by_ino.get(&ino) {
-                    Some(n) => match &n.kind {
-                        NodeKind::File { size, .. } => (n.full_path.clone(), *size),
-                        _ => {
-                            reply.error(libc::EISDIR);
+        let rid = crate::request_id::RequestId::new();
+        let span = tracing::info_span!(
+            "fuse_read",
+            rid = %rid,
+            mount = %me.mount.name,
+            ino = ino,
+            offset = offset,
+            size = size,
+        );
+        self.rt.spawn(tracing::Instrument::instrument(
+            async move {
+                let t_read = std::time::Instant::now();
+                let (full_path, file_size) = {
+                    let g = me.inner.read().await;
+                    match g.by_ino.get(&ino) {
+                        Some(n) => match &n.kind {
+                            NodeKind::File { size, .. } => (n.full_path.clone(), *size),
+                            _ => {
+                                reply.error(libc::EISDIR);
+                                return;
+                            }
+                        },
+                        None => {
+                            reply.error(ENOENT);
                             return;
                         }
-                    },
-                    None => {
-                        reply.error(ENOENT);
-                        return;
+                    }
+                };
+                if (offset as u64) >= file_size {
+                    reply.data(&[]);
+                    return;
+                }
+                let length = (size as u64).min(file_size - offset as u64);
+                fuse_reads.fetch_add(1, Ordering::Relaxed);
+                match me
+                    .fetcher
+                    .fetch_range(
+                        &me.mount,
+                        &full_path,
+                        offset as u64,
+                        length,
+                        file_size,
+                        Some(&rid),
+                    )
+                    .await
+                {
+                    Ok(b) => {
+                        fuse_read_bytes.fetch_add(b.len() as u64, Ordering::Relaxed);
+                        me.fetcher.stats.fuse_reads.inc();
+                        me.fetcher.stats.fuse_read_bytes.inc_by(b.len() as u64);
+                        me.fetcher
+                            .stats
+                            .fuse_read_seconds
+                            .observe(t_read.elapsed().as_secs_f64());
+                        reply.data(&b);
+                    }
+                    Err(e) => {
+                        tracing::error!(?e, "read failed");
+                        me.fetcher
+                            .stats
+                            .fuse_read_seconds
+                            .observe(t_read.elapsed().as_secs_f64());
+                        reply.error(EIO);
                     }
                 }
-            };
-            if (offset as u64) >= file_size {
-                reply.data(&[]);
-                return;
-            }
-            let length = (size as u64).min(file_size - offset as u64);
-            fuse_reads.fetch_add(1, Ordering::Relaxed);
-            match me
-                .fetcher
-                .fetch_range(&me.mount, &full_path, offset as u64, length, file_size)
-                .await
-            {
-                Ok(b) => {
-                    fuse_read_bytes.fetch_add(b.len() as u64, Ordering::Relaxed);
-                    me.fetcher.stats.fuse_reads.inc();
-                    me.fetcher.stats.fuse_read_bytes.inc_by(b.len() as u64);
-                    me.fetcher
-                        .stats
-                        .fuse_read_seconds
-                        .observe(t_read.elapsed().as_secs_f64());
-                    reply.data(&b);
-                }
-                Err(e) => {
-                    tracing::error!(?e, "read failed");
-                    me.fetcher
-                        .stats
-                        .fuse_read_seconds
-                        .observe(t_read.elapsed().as_secs_f64());
-                    reply.error(EIO);
-                }
-            }
-        });
+            },
+            span,
+        ));
     }
 
     fn readdir(

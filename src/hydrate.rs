@@ -223,7 +223,7 @@ pub async fn run_shard(
                 Err(e) => return (c, Err(e)),
             };
             let res = f
-                .fetch_chunk_origin_only(&m, &c.blob, c.offset, c.len)
+                .fetch_chunk_origin_only(&m, &c.blob, c.offset, c.len, None)
                 .await;
             drop(permit);
             (c, res)
@@ -946,6 +946,7 @@ pub async fn run_broadcast_shard(
                             &peer_id,
                             &transport_url,
                             wa.as_deref(),
+                            None,
                         )
                         .await;
                     drop(permit);
@@ -1312,6 +1313,7 @@ pub async fn run_ring_step(
                     &transport_url,
                     wa.as_deref(),
                     0,
+                    None,
                 )
                 .await;
             drop(permit);

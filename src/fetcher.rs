@@ -226,10 +226,11 @@ impl Fetcher {
         blob_path: &str,
         offset: u64,
         expected_len: u64,
+        rid: Option<&crate::request_id::RequestId>,
     ) -> Result<Bytes> {
         let t_total = std::time::Instant::now();
         let res = self
-            .fetch_chunk_inner(mount, blob_path, offset, expected_len, false)
+            .fetch_chunk_inner(mount, blob_path, offset, expected_len, false, rid)
             .await;
         self.stats
             .chunk_total_seconds
@@ -254,10 +255,11 @@ impl Fetcher {
         blob_path: &str,
         offset: u64,
         expected_len: u64,
+        rid: Option<&crate::request_id::RequestId>,
     ) -> Result<Bytes> {
         let t_total = std::time::Instant::now();
         let res = self
-            .fetch_chunk_inner(mount, blob_path, offset, expected_len, true)
+            .fetch_chunk_inner(mount, blob_path, offset, expected_len, true, rid)
             .await;
         self.stats
             .chunk_total_seconds
@@ -295,6 +297,7 @@ impl Fetcher {
     /// requested slice, avoiding the 32x read amplification when FUSE splits
     /// a 4 MiB read into 32 x 128 KiB sub-reads (each previously caused a
     /// full 4 MiB cache read).
+    #[allow(clippy::too_many_arguments)]
     pub async fn fetch_chunk_range(
         &self,
         mount: &MountConfig,
@@ -303,6 +306,7 @@ impl Fetcher {
         sub_offset: u64,
         sub_len: u64,
         expected_chunk_len: u64,
+        rid: Option<&crate::request_id::RequestId>,
     ) -> Result<Bytes> {
         let t_total = std::time::Instant::now();
         let res = self
@@ -313,6 +317,7 @@ impl Fetcher {
                 sub_offset,
                 sub_len,
                 expected_chunk_len,
+                rid,
             )
             .await;
         self.stats
@@ -321,6 +326,7 @@ impl Fetcher {
         res
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn fetch_chunk_range_inner(
         &self,
         mount: &MountConfig,
@@ -329,6 +335,7 @@ impl Fetcher {
         sub_offset: u64,
         sub_len: u64,
         expected_chunk_len: u64,
+        rid: Option<&crate::request_id::RequestId>,
     ) -> Result<Bytes> {
         if sub_len == 0 {
             return Ok(Bytes::new());
@@ -378,7 +385,14 @@ impl Fetcher {
         // Slice miss: full-chunk fetch (will populate cache for subsequent
         // sub-reads), then slice.
         let full = self
-            .fetch_chunk_inner(mount, blob_path, chunk_offset, expected_chunk_len, false)
+            .fetch_chunk_inner(
+                mount,
+                blob_path,
+                chunk_offset,
+                expected_chunk_len,
+                false,
+                rid,
+            )
             .await?;
         let end = (sub_offset + sub_len) as usize;
         if end > full.len() {
@@ -412,6 +426,7 @@ impl Fetcher {
         offset: u64,
         expected_len: u64,
         bypass_peers: bool,
+        rid: Option<&crate::request_id::RequestId>,
     ) -> Result<Bytes> {
         let key = ChunkKey {
             mount: mount.name.clone(),
@@ -519,7 +534,7 @@ impl Fetcher {
             armed: true,
         };
         let result = self
-            .do_fetch(mount, blob_path, &key, expected_len, bypass_peers)
+            .do_fetch(mount, blob_path, &key, expected_len, bypass_peers, rid)
             .await;
         if let Some(tx) = guard.disarm() {
             let msg = match &result {
@@ -538,6 +553,7 @@ impl Fetcher {
         key: &ChunkKey,
         expected_len: u64,
         bypass_peers: bool,
+        rid: Option<&crate::request_id::RequestId>,
     ) -> Result<Bytes> {
         if !bypass_peers {
             let alive = self.membership.members_alive();
@@ -568,7 +584,7 @@ impl Fetcher {
             for (idx, peer) in ordered.iter() {
                 let was_yes = *idx < yes_len;
                 if let Some(data) = self
-                    .try_peer_fetch(peer, key, expected_len, was_yes, 0)
+                    .try_peer_fetch(peer, key, expected_len, was_yes, 0, rid)
                     .await?
                 {
                     return Ok(data);
@@ -588,7 +604,14 @@ impl Fetcher {
                     if let Some(peer) = alive.iter().find(|n| n.id == hrw_top_id) {
                         self.stats.peer_stampede_follower.inc();
                         if let Some(data) = self
-                            .try_peer_fetch(peer, key, expected_len, false, self.stampede_wait_ms)
+                            .try_peer_fetch(
+                                peer,
+                                key,
+                                expected_len,
+                                false,
+                                self.stampede_wait_ms,
+                                rid,
+                            )
                             .await?
                         {
                             self.stats.peer_stampede_follower_ok.inc();
@@ -641,6 +664,7 @@ impl Fetcher {
         expected_len: u64,
         was_yes: bool,
         wait_ms: u32,
+        rid: Option<&crate::request_id::RequestId>,
     ) -> Result<Option<Bytes>> {
         let worker_addr = match &peer.ucx_worker_addr_b64 {
             Some(encoded) => match BASE64_STANDARD.decode(encoded) {
@@ -678,6 +702,7 @@ impl Fetcher {
                 key,
                 expected_len as u32,
                 wait_ms,
+                rid,
             )
             .await;
         self.stats
@@ -896,6 +921,7 @@ impl Fetcher {
         peer_id: &str,
         transport_url: &str,
         ucx_worker_addr: Option<&[u8]>,
+        rid: Option<&crate::request_id::RequestId>,
     ) -> Result<Bytes> {
         self.pull_chunk_from_peer_wait(
             mount,
@@ -906,6 +932,7 @@ impl Fetcher {
             transport_url,
             ucx_worker_addr,
             0,
+            rid,
         )
         .await
     }
@@ -921,6 +948,7 @@ impl Fetcher {
         transport_url: &str,
         ucx_worker_addr: Option<&[u8]>,
         wait_ms: u32,
+        rid: Option<&crate::request_id::RequestId>,
     ) -> Result<Bytes> {
         let key = ChunkKey {
             mount: mount.name.clone(),
@@ -942,6 +970,7 @@ impl Fetcher {
                 &key,
                 expected_len as u32,
                 wait_ms,
+                rid,
             )
             .await?;
         self.stats
@@ -1009,6 +1038,7 @@ impl Fetcher {
         offset: u64,
         length: u64,
         file_size: u64,
+        rid: Option<&crate::request_id::RequestId>,
     ) -> Result<Bytes> {
         if length == 0 {
             return Ok(Bytes::new());
@@ -1039,11 +1069,20 @@ impl Fetcher {
             let mc = mount.clone();
             let bp = blob_path.to_string();
             let me = self.clone_handles();
+            let rid_owned = rid.cloned();
             tasks.push(tokio::spawn(async move {
                 let _permit = me.acquire_chunk_permit().await?;
-                me.fetch_chunk_range(&mc, &bp, o, take_start, sub_len, chunk_len)
-                    .await
-                    .map(|b| (o, b))
+                me.fetch_chunk_range(
+                    &mc,
+                    &bp,
+                    o,
+                    take_start,
+                    sub_len,
+                    chunk_len,
+                    rid_owned.as_ref(),
+                )
+                .await
+                .map(|b| (o, b))
             }));
             o = match o.checked_add(cs) {
                 Some(n) => n,
@@ -1180,9 +1219,10 @@ impl Fetcher {
                     return;
                 };
                 let res = if origin_only {
-                    me.fetch_chunk_origin_only(&mc, &bp, off, chunk_len).await
+                    me.fetch_chunk_origin_only(&mc, &bp, off, chunk_len, None)
+                        .await
                 } else {
-                    me.fetch_chunk(&mc, &bp, off, chunk_len).await
+                    me.fetch_chunk(&mc, &bp, off, chunk_len, None).await
                 };
                 match res {
                     Ok(_) => me.stats.prefetch_completed_ok.inc(),

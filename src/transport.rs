@@ -79,19 +79,31 @@ impl PeerService {
     }
 
     async fn handle(&self, req: Request<Incoming>) -> Response<Full<Bytes>> {
-        let path = req.uri().path().to_string();
-        match (req.method(), path.as_str()) {
-            (&Method::GET, "/health") => json_ok(serde_json::json!({
-                "ok": true,
-                "version": PROTO_VERSION,
-                "cluster": &self.cluster_hash_hex,
-            })),
-            (&Method::GET, p) if p.starts_with("/v1/chunk/") => {
-                self.stats.chunk_requests.inc();
-                self.handle_chunk(req).await
+        use tracing::Instrument;
+        let rid = req
+            .headers()
+            .get("x-blobcache-rid")
+            .and_then(|v| v.to_str().ok())
+            .and_then(crate::request_id::RequestId::from_header)
+            .unwrap_or_default();
+        let span = tracing::info_span!("peer_server", rid = %rid);
+        async move {
+            let path = req.uri().path().to_string();
+            match (req.method(), path.as_str()) {
+                (&Method::GET, "/health") => json_ok(serde_json::json!({
+                    "ok": true,
+                    "version": PROTO_VERSION,
+                    "cluster": &self.cluster_hash_hex,
+                })),
+                (&Method::GET, p) if p.starts_with("/v1/chunk/") => {
+                    self.stats.chunk_requests.inc();
+                    self.handle_chunk(req).await
+                }
+                _ => not_found(),
             }
-            _ => not_found(),
         }
+        .instrument(span)
+        .await
     }
 
     async fn handle_chunk(&self, req: Request<Incoming>) -> Response<Full<Bytes>> {
@@ -185,6 +197,7 @@ impl TcpPeerClient {
         key: &ChunkKey,
         expected_len: u32,
         wait_ms: u32,
+        rid: Option<&crate::request_id::RequestId>,
     ) -> Result<Bytes> {
         let url = format!(
             "{peer_url}/v1/chunk/{}?blob={}&offset={}&len={}&wait_ms={}",
@@ -194,7 +207,11 @@ impl TcpPeerClient {
             expected_len,
             wait_ms,
         );
-        let resp = self.http.get(&url).send().await?;
+        let mut req = self.http.get(&url);
+        if let Some(rid) = rid {
+            req = req.header("x-blobcache-rid", rid.as_str());
+        }
+        let resp = req.send().await?;
         let status = resp.status();
         if status == reqwest::StatusCode::NOT_FOUND {
             return Err(BcError::NotFound("peer miss".into()));
@@ -236,6 +253,7 @@ impl PeerClient {
         Self::Rdma(client)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn fetch_chunk(
         &self,
         #[cfg(feature = "ucx")] peer_id: &str,
@@ -246,15 +264,16 @@ impl PeerClient {
         key: &ChunkKey,
         length: u32,
         wait_ms: u32,
+        rid: Option<&crate::request_id::RequestId>,
     ) -> Result<Bytes> {
         match self {
-            Self::Tcp(c) => c.fetch_chunk(peer_url, key, length, wait_ms).await,
+            Self::Tcp(c) => c.fetch_chunk(peer_url, key, length, wait_ms, rid).await,
             #[cfg(feature = "ucx")]
             Self::Rdma(c) => {
                 let worker_addr = peer_worker_addr.ok_or_else(|| {
                     BcError::Peer(format!("missing ucx worker address for peer {peer_id}"))
                 })?;
-                c.fetch_chunk(peer_id, worker_addr, key, length, wait_ms)
+                c.fetch_chunk(peer_id, worker_addr, key, length, wait_ms, rid)
                     .await
             }
         }

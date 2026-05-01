@@ -19,6 +19,7 @@ mod hydrate;
 mod hydrate_jobs;
 mod nic;
 mod peerindex;
+mod request_id;
 mod stats;
 mod transport;
 #[cfg(feature = "ucx")]
