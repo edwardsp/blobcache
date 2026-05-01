@@ -596,6 +596,39 @@ pub async fn serve(
                                         .body(Full::new(Bytes::from(body)))
                                         .unwrap()
                                 }
+                                (&Method::GET, "/healthz") => Response::builder()
+                                    .status(200)
+                                    .header("content-type", "text/plain")
+                                    .body(Full::new(Bytes::from_static(b"ok\n")))
+                                    .unwrap(),
+                                (&Method::GET, "/readyz") => {
+                                    // Ready once we have at least one Alive
+                                    // member (which includes self after gossip
+                                    // boot). Pre-join we're up but should not
+                                    // receive peer traffic, so K8s can keep us
+                                    // out of any peer-facing Service until
+                                    // membership stabilises.
+                                    let alive = membership
+                                        .members_all()
+                                        .iter()
+                                        .filter(|n| {
+                                            matches!(n.state, crate::cluster::NodeState::Alive)
+                                        })
+                                        .count();
+                                    if alive >= 1 {
+                                        Response::builder()
+                                            .status(200)
+                                            .header("content-type", "text/plain")
+                                            .body(Full::new(Bytes::from_static(b"ready\n")))
+                                            .unwrap()
+                                    } else {
+                                        Response::builder()
+                                            .status(503)
+                                            .header("content-type", "text/plain")
+                                            .body(Full::new(Bytes::from_static(b"joining\n")))
+                                            .unwrap()
+                                    }
+                                }
                                 (&Method::POST, "/hydrate") => {
                                     let body = match req.into_body().collect().await {
                                         Ok(c) => c.to_bytes(),
