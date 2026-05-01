@@ -78,7 +78,7 @@ impl PeerService {
         }
     }
 
-    async fn handle(&self, req: Request<Incoming>) -> Response<Full<Bytes>> {
+    pub async fn handle(&self, req: Request<Incoming>) -> Response<Full<Bytes>> {
         use tracing::Instrument;
         let rid = req
             .headers()
