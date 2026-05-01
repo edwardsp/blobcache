@@ -13,6 +13,7 @@
 
 use std::path::PathBuf;
 
+use blobcache::cluster::{NodeInfo, NodeState};
 use blobcache::config::{
     AzureConfig, CacheConfig, ClusterConfig, Config, MountConfig, StatsConfig, TransportConfig,
 };
@@ -66,5 +67,22 @@ pub fn minimal_config(cache_dir: PathBuf) -> Config {
             prefix: String::new(),
             sas_token: None,
         }],
+    }
+}
+
+/// Build a minimal `NodeInfo` for tests. Only `id` is meaningful for HRW
+/// scoring and bloom routing; the URL fields are placeholders that the
+/// pure-logic tests never dial.
+pub fn node(id: &str) -> NodeInfo {
+    NodeInfo {
+        id: id.into(),
+        transport_url: format!("http://{id}:7772"),
+        gossip_url: format!("http://{id}:7771"),
+        cluster_hash: "x".into(),
+        ucx_worker_addr_b64: None,
+        last_seen_unix: 0,
+        state: NodeState::Alive,
+        incarnation: 1,
+        bloom_version: 0,
     }
 }
