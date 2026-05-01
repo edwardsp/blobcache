@@ -349,6 +349,17 @@ impl DiskCache {
             f.sync_data()?;
         }
         std::fs::rename(&tmp, &path)?;
+        // fsync the parent directory so the rename is durable across power
+        // loss. Without this the file contents are durable (sync_data above)
+        // but the directory entry binding name->inode may not be, leaving
+        // peers that already saw our bloom advertising chunks that vanish
+        // after a crash. Best-effort: a failure here doesn't undo the
+        // insert, but we log it.
+        if let Ok(dir) = std::fs::File::open(&self.root) {
+            if let Err(e) = dir.sync_all() {
+                tracing::warn!(error = %e, root = %self.root.display(), "cache dir fsync failed");
+            }
+        }
         let size = data.len() as u64;
         let mut g = self.inner.lock();
         g.seq += 1;

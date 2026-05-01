@@ -29,6 +29,9 @@ impl Bloom {
             return None;
         }
         let m_bits = u64::from_le_bytes(b[..8].try_into().ok()?) as usize;
+        if m_bits < 64 {
+            return None;
+        }
         let words = (m_bits + 63) / 64;
         let payload = &b[8..];
         if payload.len() != words * 8 {
