@@ -1364,3 +1364,97 @@ pub async fn run_ring_step(
         end_unix_ms: now_unix_ms(),
     }
 }
+
+#[cfg(test)]
+mod hydrate_mode_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_env<F: FnOnce()>(value: Option<&str>, f: F) {
+        let _g = ENV_LOCK.lock().unwrap();
+        let prev = std::env::var("HYDRATE_MODE").ok();
+        match value {
+            Some(v) => std::env::set_var("HYDRATE_MODE", v),
+            None => std::env::remove_var("HYDRATE_MODE"),
+        }
+        f();
+        match prev {
+            Some(v) => std::env::set_var("HYDRATE_MODE", v),
+            None => std::env::remove_var("HYDRATE_MODE"),
+        }
+    }
+
+    #[test]
+    fn default_when_no_env_and_no_request() {
+        with_env(None, || {
+            assert_eq!(hydrate_mode(None), HydrateMode::Default);
+        });
+    }
+
+    #[test]
+    fn request_mode_used_when_no_env() {
+        with_env(None, || {
+            assert_eq!(hydrate_mode(Some(HydrateMode::Broadcast)), HydrateMode::Broadcast);
+            assert_eq!(hydrate_mode(Some(HydrateMode::Ring)), HydrateMode::Ring);
+            assert_eq!(hydrate_mode(Some(HydrateMode::Default)), HydrateMode::Default);
+        });
+    }
+
+    #[test]
+    fn env_broadcast_overrides_request() {
+        with_env(Some("broadcast"), || {
+            assert_eq!(hydrate_mode(None), HydrateMode::Broadcast);
+            assert_eq!(hydrate_mode(Some(HydrateMode::Ring)), HydrateMode::Broadcast);
+            assert_eq!(hydrate_mode(Some(HydrateMode::Default)), HydrateMode::Broadcast);
+        });
+    }
+
+    #[test]
+    fn env_ring_overrides_request() {
+        with_env(Some("ring"), || {
+            assert_eq!(hydrate_mode(None), HydrateMode::Ring);
+            assert_eq!(hydrate_mode(Some(HydrateMode::Broadcast)), HydrateMode::Ring);
+        });
+    }
+
+    #[test]
+    fn env_is_case_insensitive() {
+        with_env(Some("BROADCAST"), || {
+            assert_eq!(hydrate_mode(None), HydrateMode::Broadcast);
+        });
+        with_env(Some("Ring"), || {
+            assert_eq!(hydrate_mode(None), HydrateMode::Ring);
+        });
+    }
+
+    #[test]
+    fn env_unknown_value_falls_back_to_request_mode() {
+        with_env(Some("nonsense"), || {
+            assert_eq!(hydrate_mode(None), HydrateMode::Default);
+            assert_eq!(hydrate_mode(Some(HydrateMode::Ring)), HydrateMode::Ring);
+        });
+    }
+
+    #[test]
+    fn env_empty_string_falls_back() {
+        with_env(Some(""), || {
+            assert_eq!(hydrate_mode(Some(HydrateMode::Broadcast)), HydrateMode::Broadcast);
+        });
+    }
+
+    #[test]
+    fn hydrate_mode_serde_lowercase_roundtrip() {
+        for (mode, json) in &[
+            (HydrateMode::Default, "\"default\""),
+            (HydrateMode::Broadcast, "\"broadcast\""),
+            (HydrateMode::Ring, "\"ring\""),
+        ] {
+            let s = serde_json::to_string(mode).unwrap();
+            assert_eq!(&s, json);
+            let back: HydrateMode = serde_json::from_str(json).unwrap();
+            assert_eq!(back, *mode);
+        }
+    }
+}
