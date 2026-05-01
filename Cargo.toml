@@ -47,6 +47,7 @@ clap = { version = "4", features = ["derive", "env"] }
 parking_lot = "0.12"
 dashmap = "6"
 lru = "0.12"
+uuid = { version = "1", features = ["v4"] }
 
 # Stats
 prometheus = { version = "0.13", default-features = false }

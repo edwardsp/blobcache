@@ -545,6 +545,8 @@ pub async fn serve(
         .build()
         .map_err(|e| crate::error::BcError::Other(format!("hydrate http build: {e}")))?;
 
+    let hydrate_jobs = crate::hydrate_jobs::HydrateJobs::new();
+
     let listener = TcpListener::bind(addr).await?;
     tracing::info!(%addr, "stats endpoint listening");
     loop {
@@ -558,6 +560,7 @@ pub async fn serve(
         let me_id = me_id.clone();
         let me_url = me_transport_url.clone();
         let hydrate_http = hydrate_http.clone();
+        let hydrate_jobs = hydrate_jobs.clone();
         tokio::spawn(async move {
             let io = TokioIo::new(stream);
             let _ = http1::Builder::new()
@@ -573,6 +576,7 @@ pub async fn serve(
                         let me_id = me_id.clone();
                         let me_url = me_url.clone();
                         let hydrate_http = hydrate_http.clone();
+                        let hydrate_jobs = hydrate_jobs.clone();
                         async move {
                             let resp = match (req.method(), req.uri().path()) {
                                 (&Method::GET, "/metrics") => {
@@ -679,6 +683,16 @@ pub async fn serve(
                                     }
                                 }
                                 (&Method::POST, "/hydrate") => {
+                                    let is_async = req
+                                        .uri()
+                                        .query()
+                                        .map(|q| {
+                                            url::form_urlencoded::parse(q.as_bytes()).any(|(k, v)| {
+                                                k == "async"
+                                                    && matches!(v.as_ref(), "1" | "true" | "yes")
+                                            })
+                                        })
+                                        .unwrap_or(false);
                                     let body = match req.into_body().collect().await {
                                         Ok(c) => c.to_bytes(),
                                         Err(e) => {
@@ -706,30 +720,108 @@ pub async fn serve(
                                                 );
                                             }
                                         };
-                                    match crate::hydrate::run_coordinator(
-                                        hreq,
-                                        chunk_size,
-                                        fetcher.clone(),
-                                        blobs.clone(),
-                                        mounts.clone(),
-                                        membership.clone(),
-                                        me_id.clone(),
-                                        me_url.clone(),
-                                        hydrate_http.clone(),
-                                    )
-                                    .await
-                                    {
-                                        Ok(r) => {
-                                            let body = serde_json::to_vec(&r).unwrap();
+                                    if is_async {
+                                        let (job_id, state) = hydrate_jobs.create();
+                                        let fetcher_c = fetcher.clone();
+                                        let blobs_c = blobs.clone();
+                                        let mounts_c = mounts.clone();
+                                        let membership_c = membership.clone();
+                                        let me_id_c = me_id.clone();
+                                        let me_url_c = me_url.clone();
+                                        let http_c = hydrate_http.clone();
+                                        let job_id_log = job_id.clone();
+                                        tokio::spawn(async move {
+                                            {
+                                                let mut g = state.lock();
+                                                g.status =
+                                                    crate::hydrate_jobs::JobStatus::Running;
+                                            }
+                                            let res = crate::hydrate::run_coordinator(
+                                                hreq,
+                                                chunk_size,
+                                                fetcher_c,
+                                                blobs_c,
+                                                mounts_c,
+                                                membership_c,
+                                                me_id_c,
+                                                me_url_c,
+                                                http_c,
+                                            )
+                                            .await;
+                                            let mut g = state.lock();
+                                            g.finished_at = Some(std::time::Instant::now());
+                                            match res {
+                                                Ok(r) => {
+                                                    g.status =
+                                                        crate::hydrate_jobs::JobStatus::Completed;
+                                                    g.result = Some(r);
+                                                }
+                                                Err(e) => {
+                                                    g.status =
+                                                        crate::hydrate_jobs::JobStatus::Failed;
+                                                    g.error = Some(format!("{e}"));
+                                                    tracing::warn!(
+                                                        job_id = %job_id_log,
+                                                        error = %e,
+                                                        "async hydrate job failed"
+                                                    );
+                                                }
+                                            }
+                                        });
+                                        let body = serde_json::to_vec(
+                                            &serde_json::json!({"job_id": job_id}),
+                                        )
+                                        .unwrap();
+                                        Response::builder()
+                                            .status(202)
+                                            .header("content-type", "application/json")
+                                            .body(Full::new(Bytes::from(body)))
+                                            .unwrap()
+                                    } else {
+                                        match crate::hydrate::run_coordinator(
+                                            hreq,
+                                            chunk_size,
+                                            fetcher.clone(),
+                                            blobs.clone(),
+                                            mounts.clone(),
+                                            membership.clone(),
+                                            me_id.clone(),
+                                            me_url.clone(),
+                                            hydrate_http.clone(),
+                                        )
+                                        .await
+                                        {
+                                            Ok(r) => {
+                                                let body = serde_json::to_vec(&r).unwrap();
+                                                Response::builder()
+                                                    .status(200)
+                                                    .header("content-type", "application/json")
+                                                    .body(Full::new(Bytes::from(body)))
+                                                    .unwrap()
+                                            }
+                                            Err(e) => Response::builder()
+                                                .status(500)
+                                                .body(Full::new(Bytes::from(format!("{e}"))))
+                                                .unwrap(),
+                                        }
+                                    }
+                                }
+                                (&Method::GET, p)
+                                    if p.starts_with("/hydrate/") && p.len() > 9 =>
+                                {
+                                    let id = &p[9..];
+                                    match hydrate_jobs.view(id) {
+                                        Some(v) => {
+                                            let body = serde_json::to_vec(&v).unwrap();
                                             Response::builder()
                                                 .status(200)
                                                 .header("content-type", "application/json")
                                                 .body(Full::new(Bytes::from(body)))
                                                 .unwrap()
                                         }
-                                        Err(e) => Response::builder()
-                                            .status(500)
-                                            .body(Full::new(Bytes::from(format!("{e}"))))
+                                        None => Response::builder()
+                                            .status(404)
+                                            .body(Full::new(Bytes::from("unknown job_id")))
                                             .unwrap(),
                                     }
                                 }

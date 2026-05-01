@@ -16,6 +16,7 @@ mod error;
 mod fetcher;
 mod fuse_fs;
 mod hydrate;
+mod hydrate_jobs;
 mod nic;
 mod peerindex;
 mod stats;
