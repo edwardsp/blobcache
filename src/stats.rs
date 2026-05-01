@@ -86,6 +86,7 @@ pub struct Stats {
     pub chunk_peer_fetch_seconds: Histogram,
     pub chunk_cache_insert_seconds: Histogram,
     pub fuse_read_seconds: Histogram,
+    pub bloom_rebuild_seconds: Histogram,
 }
 
 pub struct PeerStats {
@@ -350,6 +351,16 @@ impl Stats {
             "blobcache_peer_server_send_seconds",
             "wall time sending response bytes to peer",
         );
+        let bloom_rebuild_seconds = Histogram::with_opts(
+            HistogramOpts::new(
+                "blobcache_bloom_rebuild_seconds",
+                "wall time of one full bloom rebuild (reconcile + rehash); rebuild_secs cadence",
+            )
+            .buckets(vec![
+                0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 25.0, 60.0, 120.0,
+            ]),
+        )
+        .unwrap();
 
         for m in [
             &cache_hits,
@@ -423,6 +434,7 @@ impl Stats {
             &server_handler_seconds,
             &server_cache_get_seconds,
             &server_send_seconds,
+            &bloom_rebuild_seconds,
         ] {
             r.register(Box::new(h.clone())).unwrap();
         }
@@ -477,6 +489,7 @@ impl Stats {
             chunk_peer_fetch_seconds,
             chunk_cache_insert_seconds,
             fuse_read_seconds,
+            bloom_rebuild_seconds,
             peer_stats: Arc::new(PeerStats {
                 chunk_requests,
                 chunk_bytes_served,
