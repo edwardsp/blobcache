@@ -113,6 +113,7 @@ struct SeqState {
 // and broadcasts an error so followers don't hang forever.
 struct LeaderGuard {
     inflight: Arc<Mutex<HashMap<ChunkKey, InflightTx>>>,
+    stats: Arc<Stats>,
     key: ChunkKey,
     armed: bool,
 }
@@ -121,7 +122,11 @@ impl LeaderGuard {
     fn disarm(mut self) -> Option<InflightTx> {
         self.armed = false;
         let mut g = self.inflight.lock();
-        g.remove(&self.key)
+        let removed = g.remove(&self.key);
+        if removed.is_some() {
+            self.stats.singleflight_inflight.dec();
+        }
+        removed
     }
 }
 
@@ -132,8 +137,23 @@ impl Drop for LeaderGuard {
         }
         let mut g = self.inflight.lock();
         if let Some(tx) = g.remove(&self.key) {
+            self.stats.singleflight_inflight.dec();
             let _ = tx.send(Err("leader cancelled".into()));
         }
+    }
+}
+
+// RAII wrapper around an OwnedSemaphorePermit that increments
+// stats.chunk_permits_in_use on creation and decrements on drop, so the
+// gauge stays consistent across cancellation, panic, and normal completion.
+pub struct ChunkPermit {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    stats: Arc<Stats>,
+}
+
+impl Drop for ChunkPermit {
+    fn drop(&mut self) {
+        self.stats.chunk_permits_in_use.dec();
     }
 }
 
@@ -252,12 +272,18 @@ impl Fetcher {
     /// (`fetch_chunk_range`) and the prefetch worker acquire the same
     /// semaphore directly, so all three paths share the per-pod `chunk_sem`
     /// budget.
-    pub async fn acquire_chunk_permit(&self) -> Result<tokio::sync::OwnedSemaphorePermit> {
-        self.chunk_sem
+    pub async fn acquire_chunk_permit(&self) -> Result<ChunkPermit> {
+        let permit = self
+            .chunk_sem
             .clone()
             .acquire_owned()
             .await
-            .map_err(|e| BcError::Other(format!("chunk_sem closed: {e}")))
+            .map_err(|e| BcError::Other(format!("chunk_sem closed: {e}")))?;
+        self.stats.chunk_permits_in_use.inc();
+        Ok(ChunkPermit {
+            _permit: permit,
+            stats: self.stats.clone(),
+        })
     }
 
     pub fn chunk_concurrency_limit(&self) -> usize {
@@ -443,6 +469,7 @@ impl Fetcher {
             } else {
                 let (tx, _rx) = broadcast::channel::<std::result::Result<Bytes, String>>(1);
                 g.insert(key.clone(), tx);
+                self.stats.singleflight_inflight.inc();
                 (true, None)
             }
         };
@@ -487,6 +514,7 @@ impl Fetcher {
         // is cancelled.
         let guard = LeaderGuard {
             inflight: self.inflight.clone(),
+            stats: self.stats.clone(),
             key: key.clone(),
             armed: true,
         };
@@ -731,6 +759,7 @@ impl Fetcher {
             } else {
                 let (tx, _rx) = broadcast::channel::<std::result::Result<Bytes, String>>(1);
                 g.insert(key.clone(), tx);
+                self.stats.singleflight_inflight.inc();
                 (true, None)
             }
         };
@@ -749,6 +778,7 @@ impl Fetcher {
             None => {
                 let mut g = self.inflight.lock();
                 if let Some(tx) = g.remove(&key) {
+                    self.stats.singleflight_inflight.dec();
                     let _ = tx.send(Err("unknown mount".into()));
                 }
                 return None;
@@ -757,6 +787,7 @@ impl Fetcher {
 
         let guard = LeaderGuard {
             inflight: self.inflight.clone(),
+            stats: self.stats.clone(),
             key: key.clone(),
             armed: true,
         };
@@ -817,6 +848,7 @@ impl Fetcher {
 
     fn spawn_insert(&self, key: ChunkKey, data: Bytes) {
         self.inflight_writes.insert(key.clone(), data.clone());
+        self.stats.inflight_writes.inc();
         let cache = self.cache.clone();
         let stats = self.stats.clone();
         let inflight = self.inflight_writes.clone();
@@ -844,6 +876,7 @@ impl Fetcher {
                 }
             }
             inflight.remove(&key);
+            stats.inflight_writes.dec();
         });
     }
 
@@ -954,8 +987,13 @@ impl Fetcher {
     pub async fn clear_local_state(&self) -> Result<(u64, u64)> {
         self.await_inserts_drained().await;
         let (files, bytes) = self.cache.clear_all()?;
-        self.inflight.lock().clear();
+        {
+            let mut g = self.inflight.lock();
+            g.clear();
+            self.stats.singleflight_inflight.set(0);
+        }
         self.inflight_writes.clear();
+        self.stats.inflight_writes.set(0);
         self.seq_state.clear();
         if let Some(lru) = &self.peer_lru {
             lru.lock().clear();
@@ -1001,12 +1039,8 @@ impl Fetcher {
             let mc = mount.clone();
             let bp = blob_path.to_string();
             let me = self.clone_handles();
-            let sem = self.chunk_sem.clone();
             tasks.push(tokio::spawn(async move {
-                let _permit = sem
-                    .acquire_owned()
-                    .await
-                    .map_err(|e| BcError::Other(format!("sem closed: {e}")))?;
+                let _permit = me.acquire_chunk_permit().await?;
                 me.fetch_chunk_range(&mc, &bp, o, take_start, sub_len, chunk_len)
                     .await
                     .map(|b| (o, b))

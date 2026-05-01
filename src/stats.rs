@@ -70,6 +70,17 @@ pub struct Stats {
     pub cluster_stats: Arc<ClusterStats>,
     pub members_alive: IntGauge,
     pub members_dead: IntGauge,
+    // In-flight saturation gauges. Sustained nonzero values while throughput
+    // is low identify which subsystem is back-pressuring:
+    // - inflight_writes: cache.insert tasks queued/running (NVMe write drain)
+    // - singleflight_inflight: distinct chunks currently being fetched by a
+    //   leader (followers waiting on broadcast channel are NOT counted)
+    // - chunk_permits_in_use: chunk_concurrency permits held by fetch_range
+    //   and hydrate; saturation at chunk_concurrency means chunk_sem is the
+    //   bottleneck
+    pub inflight_writes: IntGauge,
+    pub singleflight_inflight: IntGauge,
+    pub chunk_permits_in_use: IntGauge,
     pub chunk_total_seconds: Histogram,
     pub chunk_cache_get_seconds: Histogram,
     pub chunk_peer_fetch_seconds: Histogram,
@@ -284,6 +295,21 @@ impl Stats {
         let members_alive =
             IntGauge::new("blobcache_cluster_members_alive", "alive members").unwrap();
         let members_dead = IntGauge::new("blobcache_cluster_members_dead", "dead members").unwrap();
+        let inflight_writes = IntGauge::new(
+            "blobcache_inflight_writes",
+            "cache.insert tasks queued or in flight",
+        )
+        .unwrap();
+        let singleflight_inflight = IntGauge::new(
+            "blobcache_singleflight_inflight",
+            "distinct chunks with an active singleflight leader (followers excluded)",
+        )
+        .unwrap();
+        let chunk_permits_in_use = IntGauge::new(
+            "blobcache_chunk_permits_in_use",
+            "chunk_concurrency semaphore permits currently held",
+        )
+        .unwrap();
 
         let mk_hist = |name: &str, help: &str| {
             Histogram::with_opts(HistogramOpts::new(name, help).buckets(vec![
@@ -378,7 +404,14 @@ impl Stats {
         r.register(Box::new(blob_request_seconds.clone())).unwrap();
         r.register(Box::new(blob_request_seconds_max.clone()))
             .unwrap();
-        for g in [&cache_bytes, &members_alive, &members_dead] {
+        for g in [
+            &cache_bytes,
+            &members_alive,
+            &members_dead,
+            &inflight_writes,
+            &singleflight_inflight,
+            &chunk_permits_in_use,
+        ] {
             r.register(Box::new(g.clone())).unwrap();
         }
         for h in [
@@ -436,6 +469,9 @@ impl Stats {
             peer_stampede_follower_timeout,
             members_alive,
             members_dead,
+            inflight_writes,
+            singleflight_inflight,
+            chunk_permits_in_use,
             chunk_total_seconds,
             chunk_cache_get_seconds,
             chunk_peer_fetch_seconds,
