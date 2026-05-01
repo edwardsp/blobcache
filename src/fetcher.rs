@@ -88,7 +88,7 @@ pub struct Fetcher {
     // reconstruct the blob path from a ChunkKey when no MountConfig is on
     // the call stack (the request arrived from a peer, not from FUSE).
     pub mounts: Arc<HashMap<String, MountConfig>>,
-    inflight: Arc<Mutex<HashMap<ChunkKey, InflightTx>>>,
+    inflight: Arc<DashMap<ChunkKey, InflightTx>>,
     chunk_sem: Arc<Semaphore>,
     chunk_concurrency: usize,
     inflight_writes: Arc<DashMap<ChunkKey, Bytes>>,
@@ -113,7 +113,7 @@ struct SeqState {
 // normal completion if `disarm` was not called) it removes the inflight entry
 // and broadcasts an error so followers don't hang forever.
 struct LeaderGuard {
-    inflight: Arc<Mutex<HashMap<ChunkKey, InflightTx>>>,
+    inflight: Arc<DashMap<ChunkKey, InflightTx>>,
     stats: Arc<Stats>,
     key: ChunkKey,
     armed: bool,
@@ -122,8 +122,7 @@ struct LeaderGuard {
 impl LeaderGuard {
     fn disarm(mut self) -> Option<InflightTx> {
         self.armed = false;
-        let mut g = self.inflight.lock();
-        let removed = g.remove(&self.key);
+        let removed = self.inflight.remove(&self.key).map(|(_, v)| v);
         if removed.is_some() {
             self.stats.singleflight_inflight.dec();
         }
@@ -136,8 +135,7 @@ impl Drop for LeaderGuard {
         if !self.armed {
             return;
         }
-        let mut g = self.inflight.lock();
-        if let Some(tx) = g.remove(&self.key) {
+        if let Some((_, tx)) = self.inflight.remove(&self.key) {
             self.stats.singleflight_inflight.dec();
             let _ = tx.send(Err("leader cancelled".into()));
         }
@@ -203,7 +201,7 @@ impl Fetcher {
             peer_max_maybe_attempts: peer_max_maybe_attempts.max(1),
             stampede_wait_ms,
             mounts,
-            inflight: Arc::new(Mutex::new(HashMap::new())),
+            inflight: Arc::new(DashMap::new()),
             chunk_sem: Arc::new(Semaphore::new(permits)),
             chunk_concurrency: permits,
             inflight_writes: Arc::new(DashMap::new()),
@@ -480,14 +478,15 @@ impl Fetcher {
         }
 
         let (leader, mut rx_opt) = {
-            let mut g = self.inflight.lock();
-            if let Some(tx) = g.get(&key) {
-                (false, Some(tx.subscribe()))
-            } else {
-                let (tx, _rx) = broadcast::channel::<std::result::Result<Bytes, String>>(1);
-                g.insert(key.clone(), tx);
-                self.stats.singleflight_inflight.inc();
-                (true, None)
+            use dashmap::mapref::entry::Entry;
+            match self.inflight.entry(key.clone()) {
+                Entry::Occupied(o) => (false, Some(o.get().subscribe())),
+                Entry::Vacant(v) => {
+                    let (tx, _rx) = broadcast::channel::<std::result::Result<Bytes, String>>(1);
+                    v.insert(tx);
+                    self.stats.singleflight_inflight.inc();
+                    (true, None)
+                }
             }
         };
 
@@ -780,14 +779,15 @@ impl Fetcher {
         }
 
         let (leader, mut rx_opt) = {
-            let mut g = self.inflight.lock();
-            if let Some(tx) = g.get(&key) {
-                (false, Some(tx.subscribe()))
-            } else {
-                let (tx, _rx) = broadcast::channel::<std::result::Result<Bytes, String>>(1);
-                g.insert(key.clone(), tx);
-                self.stats.singleflight_inflight.inc();
-                (true, None)
+            use dashmap::mapref::entry::Entry;
+            match self.inflight.entry(key.clone()) {
+                Entry::Occupied(o) => (false, Some(o.get().subscribe())),
+                Entry::Vacant(v) => {
+                    let (tx, _rx) = broadcast::channel::<std::result::Result<Bytes, String>>(1);
+                    v.insert(tx);
+                    self.stats.singleflight_inflight.inc();
+                    (true, None)
+                }
             }
         };
 
@@ -803,8 +803,7 @@ impl Fetcher {
         let mount_cfg = match self.mounts.get(&key.mount).cloned() {
             Some(m) => m,
             None => {
-                let mut g = self.inflight.lock();
-                if let Some(tx) = g.remove(&key) {
+                if let Some((_, tx)) = self.inflight.remove(&key) {
                     self.stats.singleflight_inflight.dec();
                     let _ = tx.send(Err("unknown mount".into()));
                 }
@@ -1053,11 +1052,8 @@ impl Fetcher {
     pub async fn clear_local_state(&self) -> Result<(u64, u64)> {
         self.await_inserts_drained().await;
         let (files, bytes) = self.cache.clear_all()?;
-        {
-            let mut g = self.inflight.lock();
-            g.clear();
-            self.stats.singleflight_inflight.set(0);
-        }
+        self.inflight.clear();
+        self.stats.singleflight_inflight.set(0);
         self.inflight_writes.clear();
         self.stats.inflight_writes.set(0);
         self.seq_state.clear();
@@ -1242,7 +1238,7 @@ impl Fetcher {
                 self.stats.prefetch_skipped_inflight.inc();
                 continue;
             }
-            if self.inflight.lock().contains_key(&ck) {
+            if self.inflight.contains_key(&ck) {
                 self.stats.prefetch_skipped_inflight.inc();
                 continue;
             }
