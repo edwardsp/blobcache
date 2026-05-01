@@ -468,10 +468,27 @@ impl DiskCache {
     }
 }
 
+/// Process-unique monotonic counter for temp-file name suffixes. Combined
+/// with the wall-clock nanos and process id, this guarantees no two
+/// `cache.insert` calls on the same process can ever collide on a temp
+/// path - even when two inserts land in the same nanosecond (which happens
+/// under hydrate Phase A burst-load where `chunk_concurrency` parallel
+/// inserts hammer the cache dir).
+///
+/// Pre-fix this was timestamp-only; under sufficient parallelism two
+/// `File::create(&tmp)` calls could open the same path, the second
+/// `write_all` could clobber the first, and the second `rename` would
+/// see ENOENT after the first one already moved the file. The result was
+/// a silent insert failure that was logged via `tracing::warn` but never
+/// propagated to `HydrateShardResponse.errors`, leaving the broadcast
+/// plan asking peers for a chunk the source claimed to own.
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
 fn rand_hex() -> String {
     let n = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
-    format!("{n:x}")
+    let s = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("{n:x}.{s:x}")
 }

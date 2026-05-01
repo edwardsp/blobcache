@@ -60,6 +60,10 @@ pub struct Stats {
     pub peer_bloom_no_holder: IntCounter,
     pub peer_bloom_false_positive: IntCounter,
     pub peer_bloom_stale_drops: IntCounter,
+    pub cache_insert_failures: IntCounter,
+    pub broadcast_peer_not_found: IntCounter,
+    pub broadcast_blob_fallback_ok: IntCounter,
+    pub broadcast_blob_fallback_err: IntCounter,
     pub peer_bloom_pulls_total: IntCounter,
     pub peer_bloom_pull_errors_total: IntCounter,
     pub peer_stampede_leader: IntCounter,
@@ -234,6 +238,25 @@ impl Stats {
         let peer_bloom_stale_drops = IntCounter::new(
             "blobcache_peer_bloom_stale_drops_total",
             "remote bloom views dropped after a was_yes NotFound (forces refetch on next bloom-pull tick)",
+        )        .unwrap();
+        let cache_insert_failures = IntCounter::new(
+            "blobcache_cache_insert_failures_total",
+            "cache.insert calls that failed to persist (tmp+fsync+rename); chunk is silently absent until refetched",
+        )
+        .unwrap();
+        let broadcast_peer_not_found = IntCounter::new(
+            "blobcache_broadcast_peer_not_found_total",
+            "hydrate Phase B requests where the planned source peer returned NotFound",
+        )
+        .unwrap();
+        let broadcast_blob_fallback_ok = IntCounter::new(
+            "blobcache_broadcast_blob_fallback_ok_total",
+            "hydrate Phase B chunks recovered by falling back to Azure Blob origin after planned-peer NotFound",
+        )
+        .unwrap();
+        let broadcast_blob_fallback_err = IntCounter::new(
+            "blobcache_broadcast_blob_fallback_err_total",
+            "hydrate Phase B chunks that failed both planned-peer pull and blob-fallback",
         )
         .unwrap();
         let peer_bloom_pulls_total = IntCounter::new(
@@ -389,6 +412,10 @@ impl Stats {
             &peer_bloom_no_holder,
             &peer_bloom_false_positive,
             &peer_bloom_stale_drops,
+            &cache_insert_failures,
+            &broadcast_peer_not_found,
+            &broadcast_blob_fallback_ok,
+            &broadcast_blob_fallback_err,
             &peer_bloom_pulls_total,
             &peer_bloom_pull_errors_total,
             &peer_stampede_leader,
@@ -473,6 +500,10 @@ impl Stats {
             peer_bloom_no_holder,
             peer_bloom_false_positive,
             peer_bloom_stale_drops,
+            cache_insert_failures,
+            broadcast_peer_not_found,
+            broadcast_blob_fallback_ok,
+            broadcast_blob_fallback_err,
             peer_bloom_pulls_total,
             peer_bloom_pull_errors_total,
             peer_stampede_leader,

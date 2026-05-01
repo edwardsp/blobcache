@@ -92,6 +92,7 @@ pub struct Fetcher {
     chunk_sem: Arc<Semaphore>,
     chunk_concurrency: usize,
     inflight_writes: Arc<DashMap<ChunkKey, Bytes>>,
+    insert_failures: Arc<Mutex<Vec<(ChunkKey, String)>>>,
     seq_state: Arc<DashMap<String, SeqState>>,
     prefetch_sem: Arc<Semaphore>,
     prefetch_depth: u32,
@@ -206,6 +207,7 @@ impl Fetcher {
             chunk_sem: Arc::new(Semaphore::new(permits)),
             chunk_concurrency: permits,
             inflight_writes: Arc::new(DashMap::new()),
+            insert_failures: Arc::new(Mutex::new(Vec::new())),
             seq_state: Arc::new(DashMap::new()),
             prefetch_sem: Arc::new(Semaphore::new(pf_permits)),
             prefetch_depth,
@@ -877,6 +879,7 @@ impl Fetcher {
         let cache = self.cache.clone();
         let stats = self.stats.clone();
         let inflight = self.inflight_writes.clone();
+        let insert_failures = self.insert_failures.clone();
         let peer_index = self.peer_index.clone();
         let k = key.clone();
         let digest = key_digest(&k);
@@ -886,18 +889,19 @@ impl Fetcher {
             stats
                 .chunk_cache_insert_seconds
                 .observe(t_ins.elapsed().as_secs_f64());
-            // Only advertise this chunk in our bloom if the cache write
-            // actually succeeded; otherwise peers would be told we own a
-            // chunk we cannot serve and waste a fetch round-trip.
             match insert_res {
                 Ok(Ok(())) => {
                     peer_index.note_local_insert(&digest);
                 }
                 Ok(Err(e)) => {
                     tracing::warn!(error = %e, "cache insert failed; skipping bloom advertise");
+                    record_insert_failure(&insert_failures, key.clone(), e.to_string());
+                    stats.cache_insert_failures.inc();
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "cache insert task panicked; skipping bloom advertise");
+                    record_insert_failure(&insert_failures, key.clone(), format!("panic: {e}"));
+                    stats.cache_insert_failures.inc();
                 }
             }
             inflight.remove(&key);
@@ -961,7 +965,7 @@ impl Fetcher {
             }
         }
         let t_peer = std::time::Instant::now();
-        let data = self
+        let peer_res = self
             .peers
             .fetch_chunk(
                 peer_id,
@@ -972,10 +976,38 @@ impl Fetcher {
                 wait_ms,
                 rid,
             )
-            .await?;
+            .await;
         self.stats
             .chunk_peer_fetch_seconds
             .observe(t_peer.elapsed().as_secs_f64());
+        let data = match peer_res {
+            Ok(d) => d,
+            Err(BcError::NotFound(_)) => {
+                self.stats.broadcast_peer_not_found.inc();
+                tracing::warn!(
+                    peer_id,
+                    blob = blob_path,
+                    offset,
+                    "broadcast peer returned NotFound; falling back to blob origin"
+                );
+                match self
+                    .fetch_chunk_origin_only(mount, blob_path, offset, expected_len, rid)
+                    .await
+                {
+                    Ok(d) => {
+                        self.stats.broadcast_blob_fallback_ok.inc();
+                        return Ok(d);
+                    }
+                    Err(e) => {
+                        self.stats.broadcast_blob_fallback_err.inc();
+                        return Err(BcError::Other(format!(
+                            "broadcast peer {peer_id} NotFound and blob fallback failed for {blob_path}@{offset}: {e}"
+                        )));
+                    }
+                }
+            }
+            Err(e) => return Err(e),
+        };
         if data.len() as u64 != expected_len {
             self.stats.peer_fetches_err.inc();
             return Err(BcError::Other(format!(
@@ -1001,6 +1033,11 @@ impl Fetcher {
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
+    }
+
+    pub fn take_insert_failures(&self) -> Vec<(ChunkKey, String)> {
+        let mut g = self.insert_failures.lock();
+        std::mem::take(&mut *g)
     }
 
     #[allow(dead_code)]
@@ -1127,6 +1164,7 @@ impl Fetcher {
             chunk_sem: self.chunk_sem.clone(),
             chunk_concurrency: self.chunk_concurrency,
             inflight_writes: self.inflight_writes.clone(),
+            insert_failures: self.insert_failures.clone(),
             seq_state: self.seq_state.clone(),
             prefetch_sem: self.prefetch_sem.clone(),
             prefetch_depth: self.prefetch_depth,
@@ -1230,5 +1268,14 @@ impl Fetcher {
                 }
             });
         }
+    }
+}
+
+const MAX_RECORDED_INSERT_FAILURES: usize = 256;
+
+fn record_insert_failure(sink: &Mutex<Vec<(ChunkKey, String)>>, key: ChunkKey, err: String) {
+    let mut g = sink.lock();
+    if g.len() < MAX_RECORDED_INSERT_FAILURES {
+        g.push((key, err));
     }
 }
