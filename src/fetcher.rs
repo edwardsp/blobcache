@@ -1279,3 +1279,108 @@ fn record_insert_failure(sink: &Mutex<Vec<(ChunkKey, String)>>, key: ChunkKey, e
         g.push((key, err));
     }
 }
+
+#[cfg(test)]
+mod peer_lru_tests {
+    use super::PeerLru;
+    use crate::cache::ChunkKey;
+    use bytes::Bytes;
+
+    fn k(off: u64) -> ChunkKey {
+        ChunkKey {
+            mount: "m".into(),
+            blob: "b".into(),
+            offset: off,
+        }
+    }
+
+    #[test]
+    fn put_then_get_returns_value() {
+        let mut lru = PeerLru::new(4096);
+        lru.put(k(0), Bytes::from(vec![0u8; 1024]));
+        let got = lru.get(&k(0)).expect("hit");
+        assert_eq!(got.len(), 1024);
+    }
+
+    #[test]
+    fn miss_returns_none() {
+        let mut lru = PeerLru::new(4096);
+        assert!(lru.get(&k(0)).is_none());
+    }
+
+    #[test]
+    fn put_evicts_lru_when_over_cap() {
+        let mut lru = PeerLru::new(3000);
+        lru.put(k(0), Bytes::from(vec![0u8; 1000]));
+        lru.put(k(1), Bytes::from(vec![1u8; 1000]));
+        lru.put(k(2), Bytes::from(vec![2u8; 1000]));
+        assert_eq!(lru.bytes, 3000);
+        lru.put(k(3), Bytes::from(vec![3u8; 1000]));
+        assert_eq!(lru.bytes, 3000, "byte accounting after eviction");
+        assert!(lru.get(&k(0)).is_none(), "oldest evicted");
+        assert!(lru.get(&k(3)).is_some(), "newest survives");
+    }
+
+    #[test]
+    fn put_rejects_oversized_entry_silently() {
+        let mut lru = PeerLru::new(1000);
+        lru.put(k(0), Bytes::from(vec![1u8; 100]));
+        lru.put(k(99), Bytes::from(vec![9u8; 5000]));
+        assert!(
+            lru.get(&k(99)).is_none(),
+            "oversized entry must not be inserted"
+        );
+        assert!(
+            lru.get(&k(0)).is_some(),
+            "pre-existing entry must not be evicted by oversized put"
+        );
+        assert_eq!(lru.bytes, 100);
+    }
+
+    #[test]
+    fn get_promotes_to_mru_position() {
+        let mut lru = PeerLru::new(3000);
+        lru.put(k(0), Bytes::from(vec![0u8; 1000]));
+        lru.put(k(1), Bytes::from(vec![1u8; 1000]));
+        lru.put(k(2), Bytes::from(vec![2u8; 1000]));
+        let _ = lru.get(&k(0));
+        lru.put(k(3), Bytes::from(vec![3u8; 1000]));
+        assert!(lru.get(&k(0)).is_some(), "k(0) was promoted, survives");
+        assert!(lru.get(&k(1)).is_none(), "k(1) was now-oldest, evicted");
+    }
+
+    #[test]
+    fn put_overwriting_same_key_does_not_double_count() {
+        let mut lru = PeerLru::new(10_000);
+        lru.put(k(0), Bytes::from(vec![1u8; 1000]));
+        lru.put(k(0), Bytes::from(vec![2u8; 2000]));
+        assert_eq!(
+            lru.bytes, 2000,
+            "must subtract previous size before adding new"
+        );
+        let got = lru.get(&k(0)).unwrap();
+        assert_eq!(got.len(), 2000);
+    }
+
+    #[test]
+    fn clear_resets_bytes_and_entries() {
+        let mut lru = PeerLru::new(10_000);
+        lru.put(k(0), Bytes::from(vec![0u8; 1000]));
+        lru.put(k(1), Bytes::from(vec![1u8; 1000]));
+        lru.clear();
+        assert_eq!(lru.bytes, 0);
+        assert!(lru.get(&k(0)).is_none());
+        assert!(lru.get(&k(1)).is_none());
+    }
+
+    #[test]
+    fn cap_zero_rejects_all_puts() {
+        let mut lru = PeerLru::new(0);
+        lru.put(k(0), Bytes::from(vec![0u8; 1]));
+        assert!(
+            lru.get(&k(0)).is_none(),
+            "cap 0 means any non-empty value is oversized"
+        );
+        assert_eq!(lru.bytes, 0);
+    }
+}
