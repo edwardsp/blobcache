@@ -410,7 +410,7 @@ pub async fn run_coordinator(
 
     let phase_a_t0 = Instant::now();
     let mut handles = Vec::with_capacity(n_targets);
-    for ((node_id, transport_url, _), chunks) in targets.into_iter().zip(buckets.into_iter()) {
+    for ((node_id, transport_url, _), chunks) in targets.into_iter().zip(buckets) {
         let assigned = chunks.len() as u64;
         let mount_name = req.mount.clone();
         let Some(url) = transport_url else {

@@ -256,7 +256,7 @@ impl PeerIndex {
             .iter()
             .map(|n| (hrw_score(&n.id, &digest), n))
             .collect();
-        scored.sort_by(|a, b| b.0.cmp(&a.0));
+        scored.sort_by_key(|b| std::cmp::Reverse(b.0));
         let mut yes = Vec::new();
         let mut maybe = Vec::new();
         for (_, n) in scored.iter() {
