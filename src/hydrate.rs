@@ -223,7 +223,7 @@ pub async fn run_shard(
                 Err(e) => return (c, Err(e)),
             };
             let res = f
-                .fetch_chunk_origin_only(&m, &c.blob, c.offset, c.len)
+                .fetch_chunk_origin_only(&m, &c.blob, c.offset, c.len, None)
                 .await;
             drop(permit);
             (c, res)
@@ -255,6 +255,11 @@ pub async fn run_shard(
     // (tmp+fsync+rename) so elapsed_ms reflects on-disk completion, matching
     // azcp's wall-clock semantics (azcp writes synchronously before returning).
     fetcher.await_inserts_drained().await;
+    for (k, e) in fetcher.take_insert_failures() {
+        if errors.len() < 32 {
+            errors.push(format!("insert: {}@{}: {e}", k.blob, k.offset));
+        }
+    }
     HydrateShardResponse {
         fetched,
         bytes,
@@ -946,6 +951,7 @@ pub async fn run_broadcast_shard(
                             &peer_id,
                             &transport_url,
                             wa.as_deref(),
+                            None,
                         )
                         .await;
                     drop(permit);
@@ -1312,6 +1318,7 @@ pub async fn run_ring_step(
                     &transport_url,
                     wa.as_deref(),
                     0,
+                    None,
                 )
                 .await;
             drop(permit);

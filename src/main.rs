@@ -16,8 +16,10 @@ mod error;
 mod fetcher;
 mod fuse_fs;
 mod hydrate;
+mod hydrate_jobs;
 mod nic;
 mod peerindex;
+mod request_id;
 mod stats;
 mod transport;
 #[cfg(feature = "ucx")]
@@ -330,6 +332,7 @@ fn main() -> anyhow::Result<()> {
         peer_index.clone(),
         cache.clone(),
         membership.clone(),
+        stats.clone(),
         cfg.transport.bloom_rebuild_secs,
     ));
     rt.spawn(run_bloom_pull_loop(
@@ -408,6 +411,7 @@ async fn run_bloom_rebuild_loop(
     peer_index: Arc<PeerIndex>,
     cache: Arc<DiskCache>,
     membership: Membership,
+    stats: Arc<stats::Stats>,
     period_secs: u64,
 ) {
     let period = std::time::Duration::from_secs(period_secs.max(1));
@@ -417,6 +421,7 @@ async fn run_bloom_rebuild_loop(
         tick.tick().await;
         let pi = peer_index.clone();
         let c = cache.clone();
+        let t_start = std::time::Instant::now();
         // Reconcile the in-memory entries map against the filesystem BEFORE
         // snapshotting live_keys() for the rebuild. Without this, files that
         // vanished externally (NVMe loss, manual rm, external wipe between
@@ -435,10 +440,16 @@ async fn run_bloom_rebuild_loop(
             pi.local_version()
         })
         .await;
+        let elapsed = t_start.elapsed();
+        stats.bloom_rebuild_seconds.observe(elapsed.as_secs_f64());
         match res {
             Ok(v) => {
                 membership.set_bloom_version(v);
-                tracing::debug!(version = v, "bloom rebuild complete");
+                tracing::debug!(
+                    version = v,
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    "bloom rebuild complete"
+                );
             }
             Err(e) => tracing::warn!(error = %e, "bloom rebuild task panicked"),
         }

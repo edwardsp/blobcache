@@ -1,0 +1,44 @@
+# Helm values overlay: cacheOnPeerFetch=false (used for C1 + C2 in the 6-run sweep).
+# Rendered by render-overlay.sh; see benchmarks/sweep/README.md for env vars.
+azure:
+  clientId: __CLIENT_ID__
+config:
+  azure:
+    blockSize: 4194304
+    workers: 8
+  cache:
+    cacheOnPeerFetch: false
+    chunkSize: 4194304
+    peerLruBytes: 1073741824
+  cluster:
+    seeds:
+    - http://__SEED_1__:7771
+    - http://__SEED_2__:7771
+    - http://__SEED_3__:7771
+  mounts:
+  - account: __ACCOUNT__
+    container: models
+    mountpoint: /mnt/nvme/blobcache-mnt/models
+    name: models
+    prefix: ""
+  transport:
+    chunkConcurrency: 32
+    kind: rdma
+    peerConcurrency: 8
+    prefetchDepth: 0
+    prefetchOriginOnly: false
+    stampedeWaitMs: 0
+    peerYesWaitMs: 0
+image:
+  blobcached:
+    pullPolicy: Always
+    repository: ghcr.io/edwardsp/blobcache
+    tag: __IMAGE_TAG__
+namespace:
+  create: false
+  name: blobcache
+nodeSelector:
+  agentPoolKey: kubernetes.azure.com/agentpool
+  agentPoolValue: gb300
+  testLabelKey: blobcache.test/enabled
+  testLabelValue: "true"

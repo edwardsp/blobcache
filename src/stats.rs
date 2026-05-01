@@ -60,6 +60,10 @@ pub struct Stats {
     pub peer_bloom_no_holder: IntCounter,
     pub peer_bloom_false_positive: IntCounter,
     pub peer_bloom_stale_drops: IntCounter,
+    pub cache_insert_failures: IntCounter,
+    pub broadcast_peer_not_found: IntCounter,
+    pub broadcast_blob_fallback_ok: IntCounter,
+    pub broadcast_blob_fallback_err: IntCounter,
     pub peer_bloom_pulls_total: IntCounter,
     pub peer_bloom_pull_errors_total: IntCounter,
     pub peer_stampede_leader: IntCounter,
@@ -70,11 +74,23 @@ pub struct Stats {
     pub cluster_stats: Arc<ClusterStats>,
     pub members_alive: IntGauge,
     pub members_dead: IntGauge,
+    // In-flight saturation gauges. Sustained nonzero values while throughput
+    // is low identify which subsystem is back-pressuring:
+    // - inflight_writes: cache.insert tasks queued/running (NVMe write drain)
+    // - singleflight_inflight: distinct chunks currently being fetched by a
+    //   leader (followers waiting on broadcast channel are NOT counted)
+    // - chunk_permits_in_use: chunk_concurrency permits held by fetch_range
+    //   and hydrate; saturation at chunk_concurrency means chunk_sem is the
+    //   bottleneck
+    pub inflight_writes: IntGauge,
+    pub singleflight_inflight: IntGauge,
+    pub chunk_permits_in_use: IntGauge,
     pub chunk_total_seconds: Histogram,
     pub chunk_cache_get_seconds: Histogram,
     pub chunk_peer_fetch_seconds: Histogram,
     pub chunk_cache_insert_seconds: Histogram,
     pub fuse_read_seconds: Histogram,
+    pub bloom_rebuild_seconds: Histogram,
 }
 
 pub struct PeerStats {
@@ -222,6 +238,25 @@ impl Stats {
         let peer_bloom_stale_drops = IntCounter::new(
             "blobcache_peer_bloom_stale_drops_total",
             "remote bloom views dropped after a was_yes NotFound (forces refetch on next bloom-pull tick)",
+        )        .unwrap();
+        let cache_insert_failures = IntCounter::new(
+            "blobcache_cache_insert_failures_total",
+            "cache.insert calls that failed to persist (tmp+fsync+rename); chunk is silently absent until refetched",
+        )
+        .unwrap();
+        let broadcast_peer_not_found = IntCounter::new(
+            "blobcache_broadcast_peer_not_found_total",
+            "hydrate Phase B requests where the planned source peer returned NotFound",
+        )
+        .unwrap();
+        let broadcast_blob_fallback_ok = IntCounter::new(
+            "blobcache_broadcast_blob_fallback_ok_total",
+            "hydrate Phase B chunks recovered by falling back to Azure Blob origin after planned-peer NotFound",
+        )
+        .unwrap();
+        let broadcast_blob_fallback_err = IntCounter::new(
+            "blobcache_broadcast_blob_fallback_err_total",
+            "hydrate Phase B chunks that failed both planned-peer pull and blob-fallback",
         )
         .unwrap();
         let peer_bloom_pulls_total = IntCounter::new(
@@ -284,6 +319,21 @@ impl Stats {
         let members_alive =
             IntGauge::new("blobcache_cluster_members_alive", "alive members").unwrap();
         let members_dead = IntGauge::new("blobcache_cluster_members_dead", "dead members").unwrap();
+        let inflight_writes = IntGauge::new(
+            "blobcache_inflight_writes",
+            "cache.insert tasks queued or in flight",
+        )
+        .unwrap();
+        let singleflight_inflight = IntGauge::new(
+            "blobcache_singleflight_inflight",
+            "distinct chunks with an active singleflight leader (followers excluded)",
+        )
+        .unwrap();
+        let chunk_permits_in_use = IntGauge::new(
+            "blobcache_chunk_permits_in_use",
+            "chunk_concurrency semaphore permits currently held",
+        )
+        .unwrap();
 
         let mk_hist = |name: &str, help: &str| {
             Histogram::with_opts(HistogramOpts::new(name, help).buckets(vec![
@@ -324,6 +374,16 @@ impl Stats {
             "blobcache_peer_server_send_seconds",
             "wall time sending response bytes to peer",
         );
+        let bloom_rebuild_seconds = Histogram::with_opts(
+            HistogramOpts::new(
+                "blobcache_bloom_rebuild_seconds",
+                "wall time of one full bloom rebuild (reconcile + rehash); rebuild_secs cadence",
+            )
+            .buckets(vec![
+                0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 25.0, 60.0, 120.0,
+            ]),
+        )
+        .unwrap();
 
         for m in [
             &cache_hits,
@@ -352,6 +412,10 @@ impl Stats {
             &peer_bloom_no_holder,
             &peer_bloom_false_positive,
             &peer_bloom_stale_drops,
+            &cache_insert_failures,
+            &broadcast_peer_not_found,
+            &broadcast_blob_fallback_ok,
+            &broadcast_blob_fallback_err,
             &peer_bloom_pulls_total,
             &peer_bloom_pull_errors_total,
             &peer_stampede_leader,
@@ -378,7 +442,14 @@ impl Stats {
         r.register(Box::new(blob_request_seconds.clone())).unwrap();
         r.register(Box::new(blob_request_seconds_max.clone()))
             .unwrap();
-        for g in [&cache_bytes, &members_alive, &members_dead] {
+        for g in [
+            &cache_bytes,
+            &members_alive,
+            &members_dead,
+            &inflight_writes,
+            &singleflight_inflight,
+            &chunk_permits_in_use,
+        ] {
             r.register(Box::new(g.clone())).unwrap();
         }
         for h in [
@@ -390,6 +461,7 @@ impl Stats {
             &server_handler_seconds,
             &server_cache_get_seconds,
             &server_send_seconds,
+            &bloom_rebuild_seconds,
         ] {
             r.register(Box::new(h.clone())).unwrap();
         }
@@ -428,6 +500,10 @@ impl Stats {
             peer_bloom_no_holder,
             peer_bloom_false_positive,
             peer_bloom_stale_drops,
+            cache_insert_failures,
+            broadcast_peer_not_found,
+            broadcast_blob_fallback_ok,
+            broadcast_blob_fallback_err,
             peer_bloom_pulls_total,
             peer_bloom_pull_errors_total,
             peer_stampede_leader,
@@ -436,11 +512,15 @@ impl Stats {
             peer_stampede_follower_timeout,
             members_alive,
             members_dead,
+            inflight_writes,
+            singleflight_inflight,
+            chunk_permits_in_use,
             chunk_total_seconds,
             chunk_cache_get_seconds,
             chunk_peer_fetch_seconds,
             chunk_cache_insert_seconds,
             fuse_read_seconds,
+            bloom_rebuild_seconds,
             peer_stats: Arc::new(PeerStats {
                 chunk_requests,
                 chunk_bytes_served,
@@ -496,6 +576,8 @@ pub async fn serve(
         .build()
         .map_err(|e| crate::error::BcError::Other(format!("hydrate http build: {e}")))?;
 
+    let hydrate_jobs = crate::hydrate_jobs::HydrateJobs::new();
+
     let listener = TcpListener::bind(addr).await?;
     tracing::info!(%addr, "stats endpoint listening");
     loop {
@@ -509,6 +591,7 @@ pub async fn serve(
         let me_id = me_id.clone();
         let me_url = me_transport_url.clone();
         let hydrate_http = hydrate_http.clone();
+        let hydrate_jobs = hydrate_jobs.clone();
         tokio::spawn(async move {
             let io = TokioIo::new(stream);
             let _ = http1::Builder::new()
@@ -524,6 +607,7 @@ pub async fn serve(
                         let me_id = me_id.clone();
                         let me_url = me_url.clone();
                         let hydrate_http = hydrate_http.clone();
+                        let hydrate_jobs = hydrate_jobs.clone();
                         async move {
                             let resp = match (req.method(), req.uri().path()) {
                                 (&Method::GET, "/metrics") => {
@@ -630,6 +714,16 @@ pub async fn serve(
                                     }
                                 }
                                 (&Method::POST, "/hydrate") => {
+                                    let is_async = req
+                                        .uri()
+                                        .query()
+                                        .map(|q| {
+                                            url::form_urlencoded::parse(q.as_bytes()).any(|(k, v)| {
+                                                k == "async"
+                                                    && matches!(v.as_ref(), "1" | "true" | "yes")
+                                            })
+                                        })
+                                        .unwrap_or(false);
                                     let body = match req.into_body().collect().await {
                                         Ok(c) => c.to_bytes(),
                                         Err(e) => {
@@ -657,30 +751,108 @@ pub async fn serve(
                                                 );
                                             }
                                         };
-                                    match crate::hydrate::run_coordinator(
-                                        hreq,
-                                        chunk_size,
-                                        fetcher.clone(),
-                                        blobs.clone(),
-                                        mounts.clone(),
-                                        membership.clone(),
-                                        me_id.clone(),
-                                        me_url.clone(),
-                                        hydrate_http.clone(),
-                                    )
-                                    .await
-                                    {
-                                        Ok(r) => {
-                                            let body = serde_json::to_vec(&r).unwrap();
+                                    if is_async {
+                                        let (job_id, state) = hydrate_jobs.create();
+                                        let fetcher_c = fetcher.clone();
+                                        let blobs_c = blobs.clone();
+                                        let mounts_c = mounts.clone();
+                                        let membership_c = membership.clone();
+                                        let me_id_c = me_id.clone();
+                                        let me_url_c = me_url.clone();
+                                        let http_c = hydrate_http.clone();
+                                        let job_id_log = job_id.clone();
+                                        tokio::spawn(async move {
+                                            {
+                                                let mut g = state.lock();
+                                                g.status =
+                                                    crate::hydrate_jobs::JobStatus::Running;
+                                            }
+                                            let res = crate::hydrate::run_coordinator(
+                                                hreq,
+                                                chunk_size,
+                                                fetcher_c,
+                                                blobs_c,
+                                                mounts_c,
+                                                membership_c,
+                                                me_id_c,
+                                                me_url_c,
+                                                http_c,
+                                            )
+                                            .await;
+                                            let mut g = state.lock();
+                                            g.finished_at = Some(std::time::Instant::now());
+                                            match res {
+                                                Ok(r) => {
+                                                    g.status =
+                                                        crate::hydrate_jobs::JobStatus::Completed;
+                                                    g.result = Some(r);
+                                                }
+                                                Err(e) => {
+                                                    g.status =
+                                                        crate::hydrate_jobs::JobStatus::Failed;
+                                                    g.error = Some(format!("{e}"));
+                                                    tracing::warn!(
+                                                        job_id = %job_id_log,
+                                                        error = %e,
+                                                        "async hydrate job failed"
+                                                    );
+                                                }
+                                            }
+                                        });
+                                        let body = serde_json::to_vec(
+                                            &serde_json::json!({"job_id": job_id}),
+                                        )
+                                        .unwrap();
+                                        Response::builder()
+                                            .status(202)
+                                            .header("content-type", "application/json")
+                                            .body(Full::new(Bytes::from(body)))
+                                            .unwrap()
+                                    } else {
+                                        match crate::hydrate::run_coordinator(
+                                            hreq,
+                                            chunk_size,
+                                            fetcher.clone(),
+                                            blobs.clone(),
+                                            mounts.clone(),
+                                            membership.clone(),
+                                            me_id.clone(),
+                                            me_url.clone(),
+                                            hydrate_http.clone(),
+                                        )
+                                        .await
+                                        {
+                                            Ok(r) => {
+                                                let body = serde_json::to_vec(&r).unwrap();
+                                                Response::builder()
+                                                    .status(200)
+                                                    .header("content-type", "application/json")
+                                                    .body(Full::new(Bytes::from(body)))
+                                                    .unwrap()
+                                            }
+                                            Err(e) => Response::builder()
+                                                .status(500)
+                                                .body(Full::new(Bytes::from(format!("{e}"))))
+                                                .unwrap(),
+                                        }
+                                    }
+                                }
+                                (&Method::GET, p)
+                                    if p.starts_with("/hydrate/") && p.len() > 9 =>
+                                {
+                                    let id = &p[9..];
+                                    match hydrate_jobs.view(id) {
+                                        Some(v) => {
+                                            let body = serde_json::to_vec(&v).unwrap();
                                             Response::builder()
                                                 .status(200)
                                                 .header("content-type", "application/json")
                                                 .body(Full::new(Bytes::from(body)))
                                                 .unwrap()
                                         }
-                                        Err(e) => Response::builder()
-                                            .status(500)
-                                            .body(Full::new(Bytes::from(format!("{e}"))))
+                                        None => Response::builder()
+                                            .status(404)
+                                            .body(Full::new(Bytes::from("unknown job_id")))
                                             .unwrap(),
                                     }
                                 }

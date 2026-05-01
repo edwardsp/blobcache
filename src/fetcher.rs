@@ -92,6 +92,7 @@ pub struct Fetcher {
     chunk_sem: Arc<Semaphore>,
     chunk_concurrency: usize,
     inflight_writes: Arc<DashMap<ChunkKey, Bytes>>,
+    insert_failures: Arc<Mutex<Vec<(ChunkKey, String)>>>,
     seq_state: Arc<DashMap<String, SeqState>>,
     prefetch_sem: Arc<Semaphore>,
     prefetch_depth: u32,
@@ -113,6 +114,7 @@ struct SeqState {
 // and broadcasts an error so followers don't hang forever.
 struct LeaderGuard {
     inflight: Arc<Mutex<HashMap<ChunkKey, InflightTx>>>,
+    stats: Arc<Stats>,
     key: ChunkKey,
     armed: bool,
 }
@@ -121,7 +123,11 @@ impl LeaderGuard {
     fn disarm(mut self) -> Option<InflightTx> {
         self.armed = false;
         let mut g = self.inflight.lock();
-        g.remove(&self.key)
+        let removed = g.remove(&self.key);
+        if removed.is_some() {
+            self.stats.singleflight_inflight.dec();
+        }
+        removed
     }
 }
 
@@ -132,8 +138,23 @@ impl Drop for LeaderGuard {
         }
         let mut g = self.inflight.lock();
         if let Some(tx) = g.remove(&self.key) {
+            self.stats.singleflight_inflight.dec();
             let _ = tx.send(Err("leader cancelled".into()));
         }
+    }
+}
+
+// RAII wrapper around an OwnedSemaphorePermit that increments
+// stats.chunk_permits_in_use on creation and decrements on drop, so the
+// gauge stays consistent across cancellation, panic, and normal completion.
+pub struct ChunkPermit {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    stats: Arc<Stats>,
+}
+
+impl Drop for ChunkPermit {
+    fn drop(&mut self) {
+        self.stats.chunk_permits_in_use.dec();
     }
 }
 
@@ -186,6 +207,7 @@ impl Fetcher {
             chunk_sem: Arc::new(Semaphore::new(permits)),
             chunk_concurrency: permits,
             inflight_writes: Arc::new(DashMap::new()),
+            insert_failures: Arc::new(Mutex::new(Vec::new())),
             seq_state: Arc::new(DashMap::new()),
             prefetch_sem: Arc::new(Semaphore::new(pf_permits)),
             prefetch_depth,
@@ -206,10 +228,11 @@ impl Fetcher {
         blob_path: &str,
         offset: u64,
         expected_len: u64,
+        rid: Option<&crate::request_id::RequestId>,
     ) -> Result<Bytes> {
         let t_total = std::time::Instant::now();
         let res = self
-            .fetch_chunk_inner(mount, blob_path, offset, expected_len, false)
+            .fetch_chunk_inner(mount, blob_path, offset, expected_len, false, rid)
             .await;
         self.stats
             .chunk_total_seconds
@@ -234,10 +257,11 @@ impl Fetcher {
         blob_path: &str,
         offset: u64,
         expected_len: u64,
+        rid: Option<&crate::request_id::RequestId>,
     ) -> Result<Bytes> {
         let t_total = std::time::Instant::now();
         let res = self
-            .fetch_chunk_inner(mount, blob_path, offset, expected_len, true)
+            .fetch_chunk_inner(mount, blob_path, offset, expected_len, true, rid)
             .await;
         self.stats
             .chunk_total_seconds
@@ -252,12 +276,18 @@ impl Fetcher {
     /// (`fetch_chunk_range`) and the prefetch worker acquire the same
     /// semaphore directly, so all three paths share the per-pod `chunk_sem`
     /// budget.
-    pub async fn acquire_chunk_permit(&self) -> Result<tokio::sync::OwnedSemaphorePermit> {
-        self.chunk_sem
+    pub async fn acquire_chunk_permit(&self) -> Result<ChunkPermit> {
+        let permit = self
+            .chunk_sem
             .clone()
             .acquire_owned()
             .await
-            .map_err(|e| BcError::Other(format!("chunk_sem closed: {e}")))
+            .map_err(|e| BcError::Other(format!("chunk_sem closed: {e}")))?;
+        self.stats.chunk_permits_in_use.inc();
+        Ok(ChunkPermit {
+            _permit: permit,
+            stats: self.stats.clone(),
+        })
     }
 
     pub fn chunk_concurrency_limit(&self) -> usize {
@@ -269,6 +299,7 @@ impl Fetcher {
     /// requested slice, avoiding the 32x read amplification when FUSE splits
     /// a 4 MiB read into 32 x 128 KiB sub-reads (each previously caused a
     /// full 4 MiB cache read).
+    #[allow(clippy::too_many_arguments)]
     pub async fn fetch_chunk_range(
         &self,
         mount: &MountConfig,
@@ -277,6 +308,7 @@ impl Fetcher {
         sub_offset: u64,
         sub_len: u64,
         expected_chunk_len: u64,
+        rid: Option<&crate::request_id::RequestId>,
     ) -> Result<Bytes> {
         let t_total = std::time::Instant::now();
         let res = self
@@ -287,6 +319,7 @@ impl Fetcher {
                 sub_offset,
                 sub_len,
                 expected_chunk_len,
+                rid,
             )
             .await;
         self.stats
@@ -295,6 +328,7 @@ impl Fetcher {
         res
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn fetch_chunk_range_inner(
         &self,
         mount: &MountConfig,
@@ -303,6 +337,7 @@ impl Fetcher {
         sub_offset: u64,
         sub_len: u64,
         expected_chunk_len: u64,
+        rid: Option<&crate::request_id::RequestId>,
     ) -> Result<Bytes> {
         if sub_len == 0 {
             return Ok(Bytes::new());
@@ -352,7 +387,14 @@ impl Fetcher {
         // Slice miss: full-chunk fetch (will populate cache for subsequent
         // sub-reads), then slice.
         let full = self
-            .fetch_chunk_inner(mount, blob_path, chunk_offset, expected_chunk_len, false)
+            .fetch_chunk_inner(
+                mount,
+                blob_path,
+                chunk_offset,
+                expected_chunk_len,
+                false,
+                rid,
+            )
             .await?;
         let end = (sub_offset + sub_len) as usize;
         if end > full.len() {
@@ -386,6 +428,7 @@ impl Fetcher {
         offset: u64,
         expected_len: u64,
         bypass_peers: bool,
+        rid: Option<&crate::request_id::RequestId>,
     ) -> Result<Bytes> {
         let key = ChunkKey {
             mount: mount.name.clone(),
@@ -443,6 +486,7 @@ impl Fetcher {
             } else {
                 let (tx, _rx) = broadcast::channel::<std::result::Result<Bytes, String>>(1);
                 g.insert(key.clone(), tx);
+                self.stats.singleflight_inflight.inc();
                 (true, None)
             }
         };
@@ -487,11 +531,12 @@ impl Fetcher {
         // is cancelled.
         let guard = LeaderGuard {
             inflight: self.inflight.clone(),
+            stats: self.stats.clone(),
             key: key.clone(),
             armed: true,
         };
         let result = self
-            .do_fetch(mount, blob_path, &key, expected_len, bypass_peers)
+            .do_fetch(mount, blob_path, &key, expected_len, bypass_peers, rid)
             .await;
         if let Some(tx) = guard.disarm() {
             let msg = match &result {
@@ -510,6 +555,7 @@ impl Fetcher {
         key: &ChunkKey,
         expected_len: u64,
         bypass_peers: bool,
+        rid: Option<&crate::request_id::RequestId>,
     ) -> Result<Bytes> {
         if !bypass_peers {
             let alive = self.membership.members_alive();
@@ -540,7 +586,7 @@ impl Fetcher {
             for (idx, peer) in ordered.iter() {
                 let was_yes = *idx < yes_len;
                 if let Some(data) = self
-                    .try_peer_fetch(peer, key, expected_len, was_yes, 0)
+                    .try_peer_fetch(peer, key, expected_len, was_yes, 0, rid)
                     .await?
                 {
                     return Ok(data);
@@ -560,7 +606,14 @@ impl Fetcher {
                     if let Some(peer) = alive.iter().find(|n| n.id == hrw_top_id) {
                         self.stats.peer_stampede_follower.inc();
                         if let Some(data) = self
-                            .try_peer_fetch(peer, key, expected_len, false, self.stampede_wait_ms)
+                            .try_peer_fetch(
+                                peer,
+                                key,
+                                expected_len,
+                                false,
+                                self.stampede_wait_ms,
+                                rid,
+                            )
                             .await?
                         {
                             self.stats.peer_stampede_follower_ok.inc();
@@ -613,6 +666,7 @@ impl Fetcher {
         expected_len: u64,
         was_yes: bool,
         wait_ms: u32,
+        rid: Option<&crate::request_id::RequestId>,
     ) -> Result<Option<Bytes>> {
         let worker_addr = match &peer.ucx_worker_addr_b64 {
             Some(encoded) => match BASE64_STANDARD.decode(encoded) {
@@ -650,6 +704,7 @@ impl Fetcher {
                 key,
                 expected_len as u32,
                 wait_ms,
+                rid,
             )
             .await;
         self.stats
@@ -731,6 +786,7 @@ impl Fetcher {
             } else {
                 let (tx, _rx) = broadcast::channel::<std::result::Result<Bytes, String>>(1);
                 g.insert(key.clone(), tx);
+                self.stats.singleflight_inflight.inc();
                 (true, None)
             }
         };
@@ -749,6 +805,7 @@ impl Fetcher {
             None => {
                 let mut g = self.inflight.lock();
                 if let Some(tx) = g.remove(&key) {
+                    self.stats.singleflight_inflight.dec();
                     let _ = tx.send(Err("unknown mount".into()));
                 }
                 return None;
@@ -757,6 +814,7 @@ impl Fetcher {
 
         let guard = LeaderGuard {
             inflight: self.inflight.clone(),
+            stats: self.stats.clone(),
             key: key.clone(),
             armed: true,
         };
@@ -817,9 +875,11 @@ impl Fetcher {
 
     fn spawn_insert(&self, key: ChunkKey, data: Bytes) {
         self.inflight_writes.insert(key.clone(), data.clone());
+        self.stats.inflight_writes.inc();
         let cache = self.cache.clone();
         let stats = self.stats.clone();
         let inflight = self.inflight_writes.clone();
+        let insert_failures = self.insert_failures.clone();
         let peer_index = self.peer_index.clone();
         let k = key.clone();
         let digest = key_digest(&k);
@@ -829,21 +889,23 @@ impl Fetcher {
             stats
                 .chunk_cache_insert_seconds
                 .observe(t_ins.elapsed().as_secs_f64());
-            // Only advertise this chunk in our bloom if the cache write
-            // actually succeeded; otherwise peers would be told we own a
-            // chunk we cannot serve and waste a fetch round-trip.
             match insert_res {
                 Ok(Ok(())) => {
                     peer_index.note_local_insert(&digest);
                 }
                 Ok(Err(e)) => {
                     tracing::warn!(error = %e, "cache insert failed; skipping bloom advertise");
+                    record_insert_failure(&insert_failures, key.clone(), e.to_string());
+                    stats.cache_insert_failures.inc();
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "cache insert task panicked; skipping bloom advertise");
+                    record_insert_failure(&insert_failures, key.clone(), format!("panic: {e}"));
+                    stats.cache_insert_failures.inc();
                 }
             }
             inflight.remove(&key);
+            stats.inflight_writes.dec();
         });
     }
 
@@ -863,6 +925,7 @@ impl Fetcher {
         peer_id: &str,
         transport_url: &str,
         ucx_worker_addr: Option<&[u8]>,
+        rid: Option<&crate::request_id::RequestId>,
     ) -> Result<Bytes> {
         self.pull_chunk_from_peer_wait(
             mount,
@@ -873,6 +936,7 @@ impl Fetcher {
             transport_url,
             ucx_worker_addr,
             0,
+            rid,
         )
         .await
     }
@@ -888,6 +952,7 @@ impl Fetcher {
         transport_url: &str,
         ucx_worker_addr: Option<&[u8]>,
         wait_ms: u32,
+        rid: Option<&crate::request_id::RequestId>,
     ) -> Result<Bytes> {
         let key = ChunkKey {
             mount: mount.name.clone(),
@@ -900,7 +965,7 @@ impl Fetcher {
             }
         }
         let t_peer = std::time::Instant::now();
-        let data = self
+        let peer_res = self
             .peers
             .fetch_chunk(
                 peer_id,
@@ -909,11 +974,40 @@ impl Fetcher {
                 &key,
                 expected_len as u32,
                 wait_ms,
+                rid,
             )
-            .await?;
+            .await;
         self.stats
             .chunk_peer_fetch_seconds
             .observe(t_peer.elapsed().as_secs_f64());
+        let data = match peer_res {
+            Ok(d) => d,
+            Err(BcError::NotFound(_)) => {
+                self.stats.broadcast_peer_not_found.inc();
+                tracing::warn!(
+                    peer_id,
+                    blob = blob_path,
+                    offset,
+                    "broadcast peer returned NotFound; falling back to blob origin"
+                );
+                match self
+                    .fetch_chunk_origin_only(mount, blob_path, offset, expected_len, rid)
+                    .await
+                {
+                    Ok(d) => {
+                        self.stats.broadcast_blob_fallback_ok.inc();
+                        return Ok(d);
+                    }
+                    Err(e) => {
+                        self.stats.broadcast_blob_fallback_err.inc();
+                        return Err(BcError::Other(format!(
+                            "broadcast peer {peer_id} NotFound and blob fallback failed for {blob_path}@{offset}: {e}"
+                        )));
+                    }
+                }
+            }
+            Err(e) => return Err(e),
+        };
         if data.len() as u64 != expected_len {
             self.stats.peer_fetches_err.inc();
             return Err(BcError::Other(format!(
@@ -941,6 +1035,11 @@ impl Fetcher {
         }
     }
 
+    pub fn take_insert_failures(&self) -> Vec<(ChunkKey, String)> {
+        let mut g = self.insert_failures.lock();
+        std::mem::take(&mut *g)
+    }
+
     #[allow(dead_code)]
     pub fn insert_received_chunk(self: &Arc<Self>, key: ChunkKey, data: Bytes) {
         self.spawn_insert(key, data);
@@ -954,8 +1053,13 @@ impl Fetcher {
     pub async fn clear_local_state(&self) -> Result<(u64, u64)> {
         self.await_inserts_drained().await;
         let (files, bytes) = self.cache.clear_all()?;
-        self.inflight.lock().clear();
+        {
+            let mut g = self.inflight.lock();
+            g.clear();
+            self.stats.singleflight_inflight.set(0);
+        }
         self.inflight_writes.clear();
+        self.stats.inflight_writes.set(0);
         self.seq_state.clear();
         if let Some(lru) = &self.peer_lru {
             lru.lock().clear();
@@ -971,6 +1075,7 @@ impl Fetcher {
         offset: u64,
         length: u64,
         file_size: u64,
+        rid: Option<&crate::request_id::RequestId>,
     ) -> Result<Bytes> {
         if length == 0 {
             return Ok(Bytes::new());
@@ -1001,15 +1106,20 @@ impl Fetcher {
             let mc = mount.clone();
             let bp = blob_path.to_string();
             let me = self.clone_handles();
-            let sem = self.chunk_sem.clone();
+            let rid_owned = rid.cloned();
             tasks.push(tokio::spawn(async move {
-                let _permit = sem
-                    .acquire_owned()
-                    .await
-                    .map_err(|e| BcError::Other(format!("sem closed: {e}")))?;
-                me.fetch_chunk_range(&mc, &bp, o, take_start, sub_len, chunk_len)
-                    .await
-                    .map(|b| (o, b))
+                let _permit = me.acquire_chunk_permit().await?;
+                me.fetch_chunk_range(
+                    &mc,
+                    &bp,
+                    o,
+                    take_start,
+                    sub_len,
+                    chunk_len,
+                    rid_owned.as_ref(),
+                )
+                .await
+                .map(|b| (o, b))
             }));
             o = match o.checked_add(cs) {
                 Some(n) => n,
@@ -1054,6 +1164,7 @@ impl Fetcher {
             chunk_sem: self.chunk_sem.clone(),
             chunk_concurrency: self.chunk_concurrency,
             inflight_writes: self.inflight_writes.clone(),
+            insert_failures: self.insert_failures.clone(),
             seq_state: self.seq_state.clone(),
             prefetch_sem: self.prefetch_sem.clone(),
             prefetch_depth: self.prefetch_depth,
@@ -1146,9 +1257,10 @@ impl Fetcher {
                     return;
                 };
                 let res = if origin_only {
-                    me.fetch_chunk_origin_only(&mc, &bp, off, chunk_len).await
+                    me.fetch_chunk_origin_only(&mc, &bp, off, chunk_len, None)
+                        .await
                 } else {
-                    me.fetch_chunk(&mc, &bp, off, chunk_len).await
+                    me.fetch_chunk(&mc, &bp, off, chunk_len, None).await
                 };
                 match res {
                     Ok(_) => me.stats.prefetch_completed_ok.inc(),
@@ -1156,5 +1268,14 @@ impl Fetcher {
                 }
             });
         }
+    }
+}
+
+const MAX_RECORDED_INSERT_FAILURES: usize = 256;
+
+fn record_insert_failure(sink: &Mutex<Vec<(ChunkKey, String)>>, key: ChunkKey, err: String) {
+    let mut g = sink.lock();
+    if g.len() < MAX_RECORDED_INSERT_FAILURES {
+        g.push((key, err));
     }
 }

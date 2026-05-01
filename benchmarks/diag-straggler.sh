@@ -33,6 +33,12 @@ METRIC_NAMES=(
   blobcache_fuse_reads_total
   blobcache_fuse_read_bytes_total
   blobcache_singleflight_waits_total
+  blobcache_peer_bloom_stale_drops_total
+  blobcache_peer_bloom_false_positive_total
+  blobcache_cache_insert_failures_total
+  blobcache_broadcast_peer_not_found_total
+  blobcache_broadcast_blob_fallback_ok_total
+  blobcache_broadcast_blob_fallback_err_total
 )
 
 snapshot() {

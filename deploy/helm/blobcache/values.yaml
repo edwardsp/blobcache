@@ -114,12 +114,22 @@ monitoring:
     namespace: ""               # blank = chart namespace    folder: blobcache
     datasourceName: Prometheus  # must match your Grafana datasource name
 
-# Liveness / readiness probes for the blobcached container. Both hit the
-# stats HTTP server on port 7773. /healthz is a constant 200 (catches a
-# fully wedged daemon: hung tokio runtime, lost NVMe). /readyz returns 200
-# only once gossip has at least one Alive member, so peers don't hammer
-# a node that's still joining.
+# Startup / liveness / readiness probes for the blobcached container.
+# All hit the stats HTTP server on port 7773. /healthz is a constant 200
+# (catches a fully wedged daemon: hung tokio runtime, lost NVMe). /readyz
+# returns 200 only once gossip has at least one Alive member, so peers
+# don't hammer a node that's still joining. The startupProbe gates
+# liveness/readiness during cold start so DiskCache::open's full-cache
+# scan (~1 s per 1k chunks; ~80 s on a populated 100k-chunk node) cannot
+# be killed mid-scan. Default failureThreshold=30 * periodSeconds=10 = 5
+# minutes of grace, which covers the largest realistic cache (~300k
+# chunks) with margin.
 probes:
+  startup:
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 30
   liveness:
     initialDelaySeconds: 15
     periodSeconds: 20

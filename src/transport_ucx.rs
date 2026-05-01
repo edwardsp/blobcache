@@ -235,6 +235,7 @@ enum RdmaCmd {
         key: ChunkKey,
         length: u32,
         wait_ms: u32,
+        request_id: String,
         reply: oneshot::Sender<Result<Bytes>>,
     },
     Health {
@@ -346,6 +347,7 @@ impl RdmaPeerClient {
         key: &ChunkKey,
         length: u32,
         wait_ms: u32,
+        rid: Option<&crate::request_id::RequestId>,
     ) -> Result<Bytes> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
@@ -355,6 +357,7 @@ impl RdmaPeerClient {
                 key: key.clone(),
                 length,
                 wait_ms,
+                request_id: rid.map(|r| r.as_str().to_string()).unwrap_or_default(),
                 reply: tx,
             })
             .map_err(|_| BcError::Peer("ucx runtime thread gone".into()))?;
@@ -486,6 +489,7 @@ fn dispatch_cmd(state: SharedRuntimeState, cmd: RdmaCmd) {
                 key,
                 length,
                 wait_ms,
+                request_id,
                 reply,
             } => {
                 let result = client_fetch(
@@ -495,6 +499,7 @@ fn dispatch_cmd(state: SharedRuntimeState, cmd: RdmaCmd) {
                     &key,
                     length,
                     wait_ms,
+                    &request_id,
                 )
                 .await;
                 let _ = reply.send(result);
@@ -588,6 +593,16 @@ async fn handle_inbound_request(
     buf.truncate(actual);
 
     let request = decode_request(&buf)?;
+    if !request.request_id.is_empty() {
+        tracing::debug!(
+            rid = %request.request_id,
+            peer = %request.requester_peer_id,
+            mount = %request.key.mount,
+            offset = request.key.offset,
+            length = request.length,
+            "ucx peer request received"
+        );
+    }
     let resp_tag = TAG_RESP_BASE | (sender_tag & TAG_ID_MASK);
 
     if request.length == 0 || request.length > MAX_RESPONSE_BYTES {
@@ -732,6 +747,11 @@ struct ChunkRequest {
     // >0 invites the server to subscribe to its own singleflight (or become
     // leader and fetch from blob) for up to `wait_ms` ms before replying MISS.
     wait_ms: u32,
+    // Tier 2 observability: optional request-id propagated from the originating
+    // FUSE read or hydrate handler. Empty means caller did not supply one
+    // (older clients, prefetch, etc). Validated against the same alphanumeric+dash
+    // rules as the TCP `x-blobcache-rid` header at decode time.
+    request_id: String,
 }
 
 struct RuntimeState {
@@ -918,6 +938,7 @@ async fn client_fetch(
     key: &ChunkKey,
     length: u32,
     wait_ms: u32,
+    request_id: &str,
 ) -> Result<Bytes> {
     if length == 0 || length > MAX_RESPONSE_BYTES {
         return Err(BcError::Peer(format!("bad chunk length {length}")));
@@ -946,6 +967,7 @@ async fn client_fetch(
         length,
         wait_ms,
         &requester_peer_id,
+        request_id,
         &slab,
     )
     .await;
@@ -966,6 +988,7 @@ async fn client_fetch_inner(
     length: u32,
     wait_ms: u32,
     requester_peer_id: &str,
+    request_id: &str,
     slab: &Rc<RecvSlab>,
 ) -> Result<Bytes> {
     let id = REQ_ID.fetch_add(1, Ordering::Relaxed);
@@ -978,7 +1001,7 @@ async fn client_fetch_inner(
     // (Box<[u8]> backing via MaybeUninit); only [..resp_len] is read.
     let total = 8 + length as usize;
     let mut slot = slab.checkout().await?;
-    let req = encode_request(key, length, requester_peer_id, wait_ms)?;
+    let req = encode_request(key, length, requester_peer_id, wait_ms, request_id)?;
     // Post recv FIRST (so server's reply isn't dropped if it races our send),
     // post send, then await both concurrently. Sequential .await on recv would
     // deadlock: server can't reply until we send the request.
@@ -1100,10 +1123,12 @@ fn encode_request(
     length: u32,
     requester_peer_id: &str,
     wait_ms: u32,
+    request_id: &str,
 ) -> Result<Vec<u8>> {
     let mount = key.mount.as_bytes();
     let blob = key.blob.as_bytes();
     let requester = requester_peer_id.as_bytes();
+    let rid = request_id.as_bytes();
     if mount.len() > u8::MAX as usize {
         return Err(BcError::Peer("mount name too long".into()));
     }
@@ -1113,9 +1138,13 @@ fn encode_request(
     if requester.len() > u16::MAX as usize {
         return Err(BcError::Peer("requester peer id too long".into()));
     }
+    if rid.len() > 128 {
+        return Err(BcError::Peer("request id too long".into()));
+    }
 
-    let mut req =
-        Vec::with_capacity(4 + 1 + mount.len() + 2 + blob.len() + 8 + 4 + 2 + requester.len() + 4);
+    let mut req = Vec::with_capacity(
+        4 + 1 + mount.len() + 2 + blob.len() + 8 + 4 + 2 + requester.len() + 4 + 2 + rid.len(),
+    );
     req.extend_from_slice(&MAGIC.to_be_bytes());
     req.push(mount.len() as u8);
     req.extend_from_slice(mount);
@@ -1126,6 +1155,8 @@ fn encode_request(
     req.extend_from_slice(&(requester.len() as u16).to_be_bytes());
     req.extend_from_slice(requester);
     req.extend_from_slice(&wait_ms.to_be_bytes());
+    req.extend_from_slice(&(rid.len() as u16).to_be_bytes());
+    req.extend_from_slice(rid);
     Ok(req)
 }
 
@@ -1149,15 +1180,24 @@ fn decode_request(data: &[u8]) -> Result<ChunkRequest> {
     let requester_len = read_be_u16(data, &mut idx)? as usize;
     let requester_peer_id = read_utf8(data, &mut idx, requester_len, "requester_peer_id")?;
 
-    // v2.6.0: backward-compatible decode. Old peers (v2.5.0) send no
-    // trailing bytes; new peers append wait_ms as a u32 BE. Treat absent
-    // trailer as wait_ms=0 so a v2.6.0 server keeps serving v2.5.0 clients
-    // during a rolling restart.
     let wait_ms = if idx + 4 <= data.len() {
-        let v = read_be_u32(data, &mut idx)?;
-        v
+        read_be_u32(data, &mut idx)?
     } else {
         0
+    };
+
+    let request_id = if idx + 2 <= data.len() {
+        let n = read_be_u16(data, &mut idx)? as usize;
+        if n > 128 {
+            return Err(BcError::Peer("request id too long".into()));
+        }
+        let s = read_utf8(data, &mut idx, n, "request_id")?;
+        if !s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+            return Err(BcError::Peer("request id has invalid chars".into()));
+        }
+        s
+    } else {
+        String::new()
     };
 
     if idx != data.len() {
@@ -1173,6 +1213,7 @@ fn decode_request(data: &[u8]) -> Result<ChunkRequest> {
         length,
         requester_peer_id,
         wait_ms,
+        request_id,
     })
 }
 
