@@ -111,9 +111,25 @@ monitoring:
     releaseLabel: kube-prometheus
   grafanaDashboard:
     enabled: true
-    namespace: ""               # blank = chart namespace
-    folder: blobcache
+    namespace: ""               # blank = chart namespace    folder: blobcache
     datasourceName: Prometheus  # must match your Grafana datasource name
+
+# Liveness / readiness probes for the blobcached container. Both hit the
+# stats HTTP server on port 7773. /healthz is a constant 200 (catches a
+# fully wedged daemon: hung tokio runtime, lost NVMe). /readyz returns 200
+# only once gossip has at least one Alive member, so peers don't hammer
+# a node that's still joining.
+probes:
+  liveness:
+    initialDelaySeconds: 15
+    periodSeconds: 20
+    timeoutSeconds: 5
+    failureThreshold: 3
+  readiness:
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 3
 
 # -- blobcached.toml contents, rendered into a ConfigMap and mounted at
 # /etc/blobcached.toml. `node_id` is intentionally omitted: the daemon
