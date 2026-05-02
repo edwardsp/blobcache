@@ -367,7 +367,7 @@ impl BlobClient {
         }
         match &self.credential {
             Credential::SharedKey { account, key } => {
-                let auth = shared_key::sign_request(account, key, method, url, &h, content_length);
+                let auth = shared_key::sign_request(account, key, method, url, &h, content_length)?;
                 h.insert("Authorization", HeaderValue::from_str(&auth).unwrap());
             }
             Credential::Bearer(_) => {
