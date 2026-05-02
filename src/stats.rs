@@ -2,6 +2,7 @@ use prometheus::{
     Encoder, Histogram, HistogramOpts, IntCounter, IntCounterVec, IntGauge, Opts, Registry,
     TextEncoder,
 };
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 pub struct Stats {
@@ -12,6 +13,16 @@ pub struct Stats {
     pub cache_inserts: IntCounter,
     pub cache_reconcile_drops: IntCounter,
     pub cache_bytes: IntGauge,
+    /// Baselines for delta-publishing cache counters to Prometheus.
+    /// Each stores the last value of the corresponding AtomicU64 source that
+    /// was forwarded to the IntCounter, so we can `inc_by(cur - prev)` instead
+    /// of `reset() + inc_by(cur)`.  This preserves Prometheus counter
+    /// monotonicity: a scrape racing mid-update can never observe a decrease.
+    pub last_pub_hits: AtomicU64,
+    pub last_pub_misses: AtomicU64,
+    pub last_pub_evictions: AtomicU64,
+    pub last_pub_inserts: AtomicU64,
+    pub last_pub_reconcile_drops: AtomicU64,
     pub blob_fetches: IntCounter,
     pub blob_fetch_bytes: IntCounter,
     // Throttling visibility: when Azure egress saturates the storage account
@@ -474,6 +485,11 @@ impl Stats {
             cache_inserts,
             cache_reconcile_drops,
             cache_bytes,
+            last_pub_hits: AtomicU64::new(0),
+            last_pub_misses: AtomicU64::new(0),
+            last_pub_evictions: AtomicU64::new(0),
+            last_pub_inserts: AtomicU64::new(0),
+            last_pub_reconcile_drops: AtomicU64::new(0),
             blob_fetches,
             blob_fetch_bytes,
             blob_request_status_total,
@@ -544,6 +560,27 @@ impl Stats {
         let mut buf = Vec::new();
         TextEncoder::new().encode(&mfs, &mut buf).unwrap();
         buf
+    }
+
+    /// Advance `metric` by the delta between `source` and `last_published`.
+    ///
+    /// Prometheus counters must be monotonically non-decreasing.  The old
+    /// `reset() + inc_by(N)` pattern violates this: a scrape that races
+    /// between the reset and the inc_by sees a value of 0, which is smaller
+    /// than the previous scrape.  By computing `delta = cur - prev` and only
+    /// calling `inc_by(delta)` we never decrease the counter, so any scrape
+    /// at any point in time sees a value ≥ the previous scrape.
+    ///
+    /// If `source` went backwards (e.g. process restart with a shared
+    /// AtomicU64 that was reset externally), we silently update the baseline
+    /// without touching the Prometheus counter, preserving monotonicity.
+    pub fn publish_delta(metric: &IntCounter, source: &AtomicU64, last_published: &AtomicU64) {
+        use std::sync::atomic::Ordering;
+        let cur = source.load(Ordering::Relaxed);
+        let prev = last_published.swap(cur, Ordering::Relaxed);
+        if cur >= prev {
+            metric.inc_by(cur - prev);
+        }
     }
 }
 
@@ -618,18 +655,31 @@ pub async fn serve(
                             let resp = match (req.method(), req.uri().path()) {
                                 (&Method::GET, "/metrics") => {
                                     let cs = &cache.stats;
-                                    s.cache_hits.reset();
-                                    s.cache_hits.inc_by(cs.hits.load(Ordering::Relaxed));
-                                    s.cache_misses.reset();
-                                    s.cache_misses.inc_by(cs.misses.load(Ordering::Relaxed));
-                                    s.cache_evictions.reset();
-                                    s.cache_evictions
-                                        .inc_by(cs.evictions.load(Ordering::Relaxed));
-                                    s.cache_inserts.reset();
-                                    s.cache_inserts.inc_by(cs.inserts.load(Ordering::Relaxed));
-                                    s.cache_reconcile_drops.reset();
-                                    s.cache_reconcile_drops
-                                        .inc_by(cs.reconcile_drops.load(Ordering::Relaxed));
+                                    Stats::publish_delta(
+                                        &s.cache_hits,
+                                        &cs.hits,
+                                        &s.last_pub_hits,
+                                    );
+                                    Stats::publish_delta(
+                                        &s.cache_misses,
+                                        &cs.misses,
+                                        &s.last_pub_misses,
+                                    );
+                                    Stats::publish_delta(
+                                        &s.cache_evictions,
+                                        &cs.evictions,
+                                        &s.last_pub_evictions,
+                                    );
+                                    Stats::publish_delta(
+                                        &s.cache_inserts,
+                                        &cs.inserts,
+                                        &s.last_pub_inserts,
+                                    );
+                                    Stats::publish_delta(
+                                        &s.cache_reconcile_drops,
+                                        &cs.reconcile_drops,
+                                        &s.last_pub_reconcile_drops,
+                                    );
                                     s.cache_bytes
                                         .set(cs.bytes_in_use.load(Ordering::Relaxed) as i64);
                                     let all = membership.members_all();
