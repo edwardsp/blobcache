@@ -27,3 +27,8 @@ benchmarks/out
 docs/INTEGRATION_PLAN.md
 
 night-progress.md
+
+# Local-only review artifacts. opus_code_eval.md is the input review document
+# (kept local, never committed). overview.md is local Marp slide content.
+opus_code_eval.md
+overview.md
