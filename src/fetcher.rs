@@ -101,6 +101,8 @@ pub struct Fetcher {
     prefetch_origin_only: bool,
     cache_on_peer_fetch: bool,
     peer_lru: Option<Arc<Mutex<PeerLru>>>,
+    peer_sems: Arc<DashMap<String, Arc<Semaphore>>>,
+    peer_concurrency: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -180,6 +182,7 @@ impl Fetcher {
         peer_max_maybe_attempts: usize,
         stampede_wait_ms: u32,
         mounts: Arc<HashMap<String, MountConfig>>,
+        peer_concurrency: usize,
     ) -> Self {
         let permits = chunk_concurrency.max(1);
         let pf_permits = prefetch_concurrency.max(1);
@@ -219,6 +222,8 @@ impl Fetcher {
             } else {
                 None
             },
+            peer_sems: Arc::new(DashMap::new()),
+            peer_concurrency: peer_concurrency.max(1),
         }
     }
 
@@ -679,6 +684,23 @@ impl Fetcher {
         wait_ms: u32,
         rid: Option<&crate::request_id::RequestId>,
     ) -> Result<Option<Bytes>> {
+        // Per-peer concurrency cap (Action 2 from opus_code_eval): without this,
+        // a hot peer can be flooded by parallel fetches from this node, causing
+        // HoL blocking on the peer's own chunk_sem.  peer_concurrency (default 8)
+        // gates how many in-flight requests we issue to any single peer.
+        let peer_id = peer.id.clone();
+        let sem = self
+            .peer_sems
+            .entry(peer_id)
+            .or_insert_with(|| Arc::new(Semaphore::new(self.peer_concurrency)))
+            .clone();
+        // Semaphores are only closed by explicit Semaphore::close(), which we
+        // never call, so acquire_owned() cannot return Err in practice.
+        let _permit = sem
+            .acquire_owned()
+            .await
+            .expect("peer semaphore never closed");
+
         let worker_addr = match &peer.ucx_worker_addr_b64 {
             Some(encoded) => match BASE64_STANDARD.decode(encoded) {
                 Ok(decoded) => Some(decoded),
@@ -1186,6 +1208,8 @@ impl Fetcher {
             prefetch_origin_only: self.prefetch_origin_only,
             cache_on_peer_fetch: self.cache_on_peer_fetch,
             peer_lru: self.peer_lru.clone(),
+            peer_sems: self.peer_sems.clone(),
+            peer_concurrency: self.peer_concurrency,
         }
     }
 

@@ -264,6 +264,7 @@ fn main() -> anyhow::Result<()> {
         cfg.transport.peer_max_maybe_attempts,
         cfg.transport.stampede_wait_ms,
         mounts.clone(),
+        cfg.transport.peer_concurrency,
     ));
 
     // ChunkProvider wraps Fetcher::serve_peer_chunk so the peer-service
