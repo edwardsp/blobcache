@@ -37,6 +37,11 @@ fn now_unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Safety margin subtracted from the coordinator timeout to derive the
+/// per-shard request timeout (Action 20 from opus_code_eval).  Fixed at 2 s
+/// because the dominant overhead is per-request HTTP roundtrip latency, not
+/// chunk-count-proportional work.
+const COORD_TO_SHARD_SAFETY_MARGIN: std::time::Duration = std::time::Duration::from_secs(2);
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChunkSpec {
     pub blob: String,
@@ -440,6 +445,21 @@ pub async fn run_coordinator(
         )
         .collect();
 
+    // Action 20 from opus_code_eval: per-shard request timeout is derived from
+    // the coordinator timeout minus a 2s safety margin so a shard that runs
+    // to its full timeout still leaves the coordinator time to collect its
+    // error and respond cleanly, rather than aborting mid-collection.  The
+    // margin is fixed (not percentage-based) because the dominant cost is
+    // per-request HTTP roundtrip overhead, not chunk-count-proportional work.
+    let global_timeout_secs: u64 = std::env::var("BLOBCACHE_HYDRATE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3700);
+    let global_timeout = std::time::Duration::from_secs(global_timeout_secs);
+    let shard_timeout = global_timeout
+        .checked_sub(COORD_TO_SHARD_SAFETY_MARGIN)
+        .unwrap_or(global_timeout / 2);
+
     let phase_a_t0 = Instant::now();
     let mut handles = Vec::with_capacity(n_targets);
     for ((node_id, transport_url, _), chunks) in targets.into_iter().zip(buckets) {
@@ -490,7 +510,7 @@ pub async fn run_coordinator(
                 let resp = http
                     .post(&endpoint)
                     .json(&body)
-                    .timeout(std::time::Duration::from_secs(3600))
+                    .timeout(shard_timeout)
                     .send()
                     .await;
                 match resp {
@@ -532,11 +552,6 @@ pub async fn run_coordinator(
     }
 
     let mut peers = Vec::with_capacity(n_targets);
-    let global_timeout_secs: u64 = std::env::var("BLOBCACHE_HYDRATE_TIMEOUT_SECS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(3700);
-    let global_timeout = std::time::Duration::from_secs(global_timeout_secs);
     let abort_handles: Vec<_> = handles.iter().map(|h| h.abort_handle()).collect();
     let join_all = async {
         let mut out = Vec::with_capacity(n_targets);
@@ -569,7 +584,8 @@ pub async fn run_coordinator(
                 fetched: 0,
                 bytes: 0,
                 errors: vec![format!(
-                    "coordinator timeout after {global_timeout_secs}s; aborted outstanding shards"
+                    "coordinator timeout after {}s; aborted outstanding shards",
+                    global_timeout.as_secs()
                 )],
                 elapsed_ms: global_timeout.as_millis() as u64,
                 start_unix_ms: 0,
@@ -721,6 +737,9 @@ async fn run_broadcast_phase(
     http: reqwest::Client,
     global_timeout: std::time::Duration,
 ) -> Vec<PerPeerStats> {
+    let shard_timeout = global_timeout
+        .checked_sub(COORD_TO_SHARD_SAFETY_MARGIN)
+        .unwrap_or(global_timeout / 2);
     let n_targets = plan.len();
     let mut handles = Vec::with_capacity(n_targets);
     for receiver in plan.iter() {
@@ -767,7 +786,7 @@ async fn run_broadcast_phase(
                 let resp = http
                     .post(&endpoint)
                     .json(&body)
-                    .timeout(std::time::Duration::from_secs(3600))
+                    .timeout(shard_timeout)
                     .send()
                     .await;
                 match resp {
@@ -1067,6 +1086,9 @@ async fn run_ring_phase(
     global_timeout: std::time::Duration,
 ) -> (Vec<PerPeerStats>, Vec<RingStepStat>) {
     let _ = me_transport_url;
+    let shard_timeout = global_timeout
+        .checked_sub(COORD_TO_SHARD_SAFETY_MARGIN)
+        .unwrap_or(global_timeout / 2);
     let mut sorted_plan: Vec<BroadcastSource> = plan.to_vec();
     sorted_plan.sort_by(|a, b| a.node_id.cmp(&b.node_id));
     let world = sorted_plan.len();
@@ -1144,7 +1166,7 @@ async fn run_ring_phase(
                     let resp = http
                         .post(&endpoint)
                         .json(&body)
-                        .timeout(std::time::Duration::from_secs(1800))
+                        .timeout(shard_timeout)
                         .send()
                         .await;
                     let r = match resp {

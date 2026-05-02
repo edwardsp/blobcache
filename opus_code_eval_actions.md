@@ -38,7 +38,7 @@ Status legend:
 | 17 | `BlobClient` double retry loop | **Fix**: collapse body-drain retry into the existing `send` retry path (single budget). | ✅ |
 | 18 | Giant `serve()` lambdas | 📝 Document as known refactor target (split tracked in this file). Not landed: high churn risk for behavioural change-free split, ~600 LOC across 2 files; better as a follow-up PR. | 📝 |
 | 19 | Prometheus `reset()+inc_by` anti-pattern | **Fix**: switch to a `Collector` impl reading the underlying `AtomicU64`s directly so monotonicity is structurally guaranteed. | ✅ |
-| 20 | Hydrate/clear timeout misalignment | **Fix**: derive per-request from coordinator timeout minus a documented safety margin. | 🚧 |
+| 20 | Hydrate/clear timeout misalignment | **Fix**: derive per-shard HTTP timeout from coordinator timeout minus a 2 s safety margin so a shard cannot legally outlive the coordinator's collect window.  Ring per-step phase budget unchanged (still bounded by `global_timeout` via the elapsed check). | ✅ |
 
 ## Low-severity / hygiene (21–29)
 

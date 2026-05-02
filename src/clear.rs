@@ -80,6 +80,14 @@ pub async fn run_coordinator(
     }
     let n_targets = targets.len();
 
+    // Action 20 from opus_code_eval: derive shard timeout from coordinator
+    // timeout minus a fixed safety margin (see hydrate.rs for full rationale).
+    const COORD_TO_SHARD_SAFETY_MARGIN: std::time::Duration = std::time::Duration::from_secs(2);
+    let global_timeout = std::time::Duration::from_secs(360);
+    let shard_timeout = global_timeout
+        .checked_sub(COORD_TO_SHARD_SAFETY_MARGIN)
+        .unwrap_or(global_timeout / 2);
+
     let mut handles = Vec::with_capacity(n_targets);
     for (node_id, transport_url) in targets.into_iter() {
         let Some(url) = transport_url else {
@@ -113,7 +121,7 @@ pub async fn run_coordinator(
                 let resp = http
                     .post(&endpoint)
                     .json(&ClearRequest::default())
-                    .timeout(std::time::Duration::from_secs(300))
+                    .timeout(shard_timeout)
                     .send()
                     .await;
                 match resp {
@@ -151,7 +159,6 @@ pub async fn run_coordinator(
         }
     }
 
-    let global_timeout = std::time::Duration::from_secs(360);
     let abort_handles: Vec<_> = handles.iter().map(|h| h.abort_handle()).collect();
     let join_all = async {
         let mut out = Vec::with_capacity(n_targets);
