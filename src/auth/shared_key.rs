@@ -1,9 +1,9 @@
+use crate::error::{BcError, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use hmac::{Hmac, Mac};
 use reqwest::header::HeaderMap;
 use sha2::Sha256;
 use url::Url;
-use crate::error::{BcError, Result};
 
 type HmacSha256 = Hmac<Sha256>;
 

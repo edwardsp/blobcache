@@ -23,10 +23,12 @@ fn sign_request_known_input_regression() {
     let key_b64 =
         "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
-    let sig = sign_request("acct", key_b64, "GET", &url, &headers, None).expect("sign_request failed");
+    let sig =
+        sign_request("acct", key_b64, "GET", &url, &headers, None).expect("sign_request failed");
 
     assert!(sig.starts_with("SharedKey acct:"), "header prefix");
-    let s1 = sign_request("acct", key_b64, "GET", &url, &headers, None).expect("sign_request failed");
+    let s1 =
+        sign_request("acct", key_b64, "GET", &url, &headers, None).expect("sign_request failed");
     assert_eq!(sig, s1, "deterministic for identical inputs");
 }
 

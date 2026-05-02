@@ -15,6 +15,7 @@
 //!   - `hydrate/phases/broadcast.rs` — broadcast-mode phase
 //!   - `hydrate/phases/ring.rs`  — ring-step phase
 //!   - `hydrate/wire.rs`         — request/response serde types
+//!
 //! Rationale for deferral: zero behavioural change, large diff (~600 LOC
 //! moved), would block unrelated PRs during review.
 
