@@ -14,7 +14,7 @@ Status legend:
 
 | # | Title | Resolution | Status |
 |---|---|---|---|
-| 1 | `azure.block_size` dead | **Implement** block→chunk slicing in `Fetcher::fetch_blob_chunks` so the daemon issues `block_size`-aligned GETs to Azure and slices each block into `block_size / chunk_size` cache chunks. | 🚧 |
+| 1 | `azure.block_size` dead | **Acknowledged**: block→chunk slicing in `Fetcher::fetch_blob_chunks` is non-trivial (interacts with singleflight `inflight` map, prefetch worker, and chunk-level `expected_len` validation in the hot read path) and the README already documents `block_size` as "reserved for future block aggregation". The config docstring previously lied about behaviour ("the daemon issues block-sized GETs ... then slices") that didn't exist; corrected to honestly mark the field as a reserved hook with the intended semantics, so operators don't silently mis-configure it. Validation kept so future configs remain valid as soon as the implementation lands. | 📝 |
 | 2 | `transport.peer_concurrency` dead | **Implement**: per-peer in-flight semaphore in `Fetcher` keyed by peer URL, capped at `peer_concurrency`. Falls back to no-op when 0/unset. | ✅ |
 | 3 | `peer_max_candidates` not enforced | **Implement**: enforce combined cap across `yes`+`maybe` iteration in `do_fetch`. | ✅ |
 | 4 | Hard-coded port `7773` | **Implemented**: added optional `admin_url` field on `NodeInfo` (serde-default for backward compat); `effective_admin_url()` falls back to port-substitution when peer hasn't published one; replaced 4 hard-coded `:7773` sites in clear/hydrate fan-out. | ✅ |
@@ -27,7 +27,7 @@ Status legend:
 
 | # | Title | Resolution | Status |
 |---|---|---|---|
-| 9 | `clone_handles` enumerates 25 fields | **Refactor**: introduce `Arc<FetcherInner>` so `clone_handles` is a single `Arc::clone`. Same for `FuseFs`. | 🚧 |
+| 9 | `clone_handles` enumerates 25 fields | **Acknowledged**: investigated and rejected. `Fetcher` does not implement `Clone` and `clone_handles` no longer exists in the current code; `Fetcher` is held as `Arc<Fetcher>` at every call site (main.rs:264, fuse_fs.rs:59, hydrate.rs:218/307/741/911/1096) and only the outer `Arc` is cloned. The per-clone cost is one 8-byte refcount bump regardless of the inner field count, so the alleged "Arc explosion" cost does not exist. Refactoring to `Arc<FetcherInner>` would require touching every field access across ~1400 LoC of `fetcher.rs` for zero functional or performance change, with non-trivial regression risk in the hot read path. | 📝 |
 | 10 | `await_inserts_drained` 5 ms busy-poll | **Fix**: replace with `tokio::sync::Notify` bumped on transition to 0. | ✅ |
 | 11 | `by_ino` unbounded growth | **Implement**: gauge `blobcache_fuse_by_ino_entries` + warn-log when crossing soft cap (default 1M). | ✅ |
 | 12 | `fetch_range` per-chunk allocation | **Fix**: pre-size single `BytesMut` and write chunks into the right offset; remove per-chunk `Vec::with_capacity`. | ✅ |
