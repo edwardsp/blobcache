@@ -572,22 +572,32 @@ impl Fetcher {
             } else if !alive.is_empty() {
                 self.stats.peer_bloom_no_holder.inc();
             }
+            // peer_max_candidates is a HARD ceiling on combined yes+maybe attempts;
+            // peer_max_yes_attempts and peer_max_maybe_attempts are SOFT caps within
+            // their respective pools.  Without the combined cap, pathological alive
+            // sets could exceed the operator's budget (Action 3 from opus_code_eval).
+            //
             // Try yes-set first (peers whose advertised bloom contains this
             // chunk), then maybe-set (peers with no bloom yet, e.g. just joined).
             // Each set has its own budget so a flood of false-positives in yes
             // can't starve the maybe-set.
-            let mut ordered: Vec<(usize, &crate::cluster::NodeInfo)> = Vec::new();
-            for (i, p) in candidates.yes.iter().enumerate() {
-                ordered.push((i, p));
-            }
-            let yes_len = candidates.yes.len();
-            for (i, p) in candidates.maybe.iter().enumerate() {
-                ordered.push((yes_len + i, p));
-            }
-            for (idx, peer) in ordered.iter() {
-                let was_yes = *idx < yes_len;
+            let yes_cap = self.peer_max_yes_attempts.min(self.peer_max_candidates);
+            let mut yes_used = 0usize;
+            for peer in candidates.yes.iter().take(yes_cap) {
+                yes_used += 1;
                 if let Some(data) = self
-                    .try_peer_fetch(peer, key, expected_len, was_yes, 0, rid)
+                    .try_peer_fetch(peer, key, expected_len, true, 0, rid)
+                    .await?
+                {
+                    return Ok(data);
+                }
+            }
+            let maybe_cap = self
+                .peer_max_maybe_attempts
+                .min(self.peer_max_candidates.saturating_sub(yes_used));
+            for peer in candidates.maybe.iter().take(maybe_cap) {
+                if let Some(data) = self
+                    .try_peer_fetch(peer, key, expected_len, false, 0, rid)
                     .await?
                 {
                     return Ok(data);
