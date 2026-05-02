@@ -23,6 +23,7 @@ const ROOT_INO: u64 = 1;
 // stop accepting new entries from listings; direct lookup() (HEAD) still works
 // for callers that know the exact path.
 const MAX_CHILDREN_PER_DIR: usize = 100_000;
+const BY_INO_SOFT_CAP: usize = 1_000_000;
 
 #[derive(Clone, Debug)]
 struct Node {
@@ -302,6 +303,15 @@ impl BlobFs {
         g.by_parent_name.insert((parent, name.to_string()), ino);
         g.children.entry(parent).or_default().push(ino);
         g.children.entry(ino).or_default();
+        let n = g.by_ino.len();
+        self.fetcher.stats.fuse_by_ino_entries.set(n as i64);
+        if n.is_power_of_two() && n >= BY_INO_SOFT_CAP {
+            tracing::warn!(
+                count = n,
+                cap = BY_INO_SOFT_CAP,
+                "fuse_by_ino over soft cap; long-running workload churning blobs?"
+            );
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -351,6 +361,15 @@ impl BlobFs {
         g.by_ino.insert(ino, node);
         g.by_parent_name.insert((parent, name.to_string()), ino);
         g.children.entry(parent).or_default().push(ino);
+        let n = g.by_ino.len();
+        self.fetcher.stats.fuse_by_ino_entries.set(n as i64);
+        if n.is_power_of_two() && n >= BY_INO_SOFT_CAP {
+            tracing::warn!(
+                count = n,
+                cap = BY_INO_SOFT_CAP,
+                "fuse_by_ino over soft cap; long-running workload churning blobs?"
+            );
+        }
     }
 }
 

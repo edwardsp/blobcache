@@ -96,6 +96,7 @@ pub struct Stats {
     pub inflight_writes: IntGauge,
     pub singleflight_inflight: IntGauge,
     pub chunk_permits_in_use: IntGauge,
+    pub fuse_by_ino_entries: IntGauge,
     pub chunk_total_seconds: Histogram,
     pub chunk_cache_get_seconds: Histogram,
     pub chunk_peer_fetch_seconds: Histogram,
@@ -345,6 +346,11 @@ impl Stats {
             "chunk_concurrency semaphore permits currently held",
         )
         .unwrap();
+        let fuse_by_ino_entries = IntGauge::new(
+            "blobcache_fuse_by_ino_entries",
+            "entries currently tracked in the FUSE by_ino inode map",
+        )
+        .unwrap();
 
         let mk_hist = |name: &str, help: &str| {
             Histogram::with_opts(HistogramOpts::new(name, help).buckets(vec![
@@ -460,6 +466,7 @@ impl Stats {
             &inflight_writes,
             &singleflight_inflight,
             &chunk_permits_in_use,
+            &fuse_by_ino_entries,
         ] {
             r.register(Box::new(g.clone())).unwrap();
         }
@@ -531,6 +538,7 @@ impl Stats {
             inflight_writes,
             singleflight_inflight,
             chunk_permits_in_use,
+            fuse_by_ino_entries,
             chunk_total_seconds,
             chunk_cache_get_seconds,
             chunk_peer_fetch_seconds,
