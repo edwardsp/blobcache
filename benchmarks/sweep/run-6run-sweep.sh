@@ -40,7 +40,7 @@ mkdir -p "$OUT_DIR"
 "$SCRIPT_DIR/render-overlay.sh" "$SCRIPT_DIR/values-cache-peer-on.yaml.tmpl"  > "$OUT_DIR/values-on.yaml"
 
 SUMMARY="$OUT_DIR/sweep-summary.tsv"
-printf 'tag\tstart_utc\tend_utc\thydrate_s\tgather_s\tpass1_s\tpass2_s\thyd_status\n' > "$SUMMARY"
+printf 'tag\tstart_utc\tend_utc\thydrate_s\tgather_s\tpass1_s\tpass2_s\tpass3_s\twiped_pod\thyd_status\n' > "$SUMMARY"
 
 reinstall() {
   local values="$1"
@@ -143,6 +143,8 @@ trial() {
     POST_HYDRATE_SLEEP_S=30 \
     RUN_GATHER="$run_gather" POST_GATHER_SLEEP_S=30 \
     RUN_PASS2=1 POST_PASS1_SLEEP_S=10 \
+    RUN_PASS3=1 POST_PASS2_SLEEP_S=10 \
+    WIPE_POD_INDEX="${WIPE_POD_INDEX:-1}" \
     RUN_TAG="$tag" \
     benchmarks/diag-run.sh ) || echo "==[ TRIAL $tag: diag-run.sh exited non-zero ]=="
 
@@ -157,14 +159,16 @@ trial() {
 
   # Extract durations from the run log.
   local log="$OUT_DIR/${tag}-run.log"
-  local hyd gat p1 p2
+  local hyd gat p1 p2 p3 wiped
   hyd="$(grep -oE 'HYDRATE_END=[^ ]+ rc=0 wall=[0-9.]+s' "$log" 2>/dev/null | grep -oE 'wall=[0-9.]+' | head -1 | cut -d= -f2 || echo '')"
   gat="$(grep -oE 'GATHER_END=[^ ]+ rc=0 wall=[0-9.]+s'  "$log" 2>/dev/null | grep -oE 'wall=[0-9.]+' | head -1 | cut -d= -f2 || echo '')"
   p1="$(grep -oE 'READ_PASS1_END=[^ ]+ wall=[0-9.]+s'    "$log" 2>/dev/null | grep -oE 'wall=[0-9.]+' | head -1 | cut -d= -f2 || echo '')"
   p2="$(grep -oE 'READ_PASS2_END=[^ ]+ wall=[0-9.]+s'    "$log" 2>/dev/null | grep -oE 'wall=[0-9.]+' | head -1 | cut -d= -f2 || echo '')"
+  p3="$(grep -oE 'READ_PASS3_END=[^ ]+ wall=[0-9.]+s'    "$log" 2>/dev/null | grep -oE 'wall=[0-9.]+' | head -1 | cut -d= -f2 || echo '')"
+  wiped="$(grep -oE 'WIPE_START=[^ ]+ pod=[^ ]+'         "$log" 2>/dev/null | grep -oE 'pod=[^ ]+' | head -1 | cut -d= -f2 || echo '')"
 
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-    "$tag" "$start_utc" "$end_utc" "${hyd:--}" "${gat:--}" "${p1:--}" "${p2:--}" "$hyd_status" \
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$tag" "$start_utc" "$end_utc" "${hyd:--}" "${gat:--}" "${p1:--}" "${p2:--}" "${p3:--}" "${wiped:--}" "$hyd_status" \
     | tee -a "$SUMMARY"
   echo "==[ TRIAL $tag end=$end_utc ]=="
 }

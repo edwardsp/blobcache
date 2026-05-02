@@ -1,0 +1,106 @@
+==[ SWEEP_START=2026-05-02T06:54:33Z image=sha-7785a86-arm64 out=/tmp/sweep-pass3-20260502T065433Z ]==
+==[ helm uninstall + install with values-off.yaml ]==
+I0502 07:54:38.893023 3058046 warnings.go:110] "Warning: [azurepolicy-k8sazurev2customcontainerallow-db27d7bfaf0671f6e28a] Container image ghcr.io/edwardsp/blobcache:sha-7785a86-arm64 for container blobcached has not been allowed."
+NAME: blobcache
+LAST DEPLOYED: Sat May  2 07:54:37 2026
+NAMESPACE: blobcache
+STATUS: deployed
+REVISION: 1
+TEST SUITE: None
+Waiting for daemon set "blobcache-blobcached" rollout to finish: 16 of 17 updated pods are available...
+daemon set "blobcache-blobcached" successfully rolled out
+==[ wait_http_ready: polling :7773/metrics on 17 pods, timeout 120s ]==
+==[ wait_http_ready: 17/17 pods healthy at 2026-05-02T06:56:12Z ]==
+==[ TRIAL c1-cacheoff-gather-t1 start=2026-05-02T06:57:12Z ]==
+verify_hydrate c1-cacheoff-gather-t1: 17 peers, 0 unhealthy
+c1-cacheoff-gather-t1	2026-05-02T06:57:12Z	2026-05-02T07:13:18Z	164.442773	16.912042	212.562716	234.730395	228.148271	node-00	ok
+==[ TRIAL c1-cacheoff-gather-t1 end=2026-05-02T07:13:18Z ]==
+==[ helm uninstall + install with values-off.yaml ]==
+I0502 08:13:24.519053 3062816 warnings.go:110] "Warning: [azurepolicy-k8sazurev2customcontainerallow-db27d7bfaf0671f6e28a] Container image ghcr.io/edwardsp/blobcache:sha-7785a86-arm64 for container blobcached has not been allowed."
+NAME: blobcache
+LAST DEPLOYED: Sat May  2 08:13:22 2026
+NAMESPACE: blobcache
+STATUS: deployed
+REVISION: 1
+TEST SUITE: None
+Waiting for daemon set "blobcache-blobcached" rollout to finish: 16 of 17 updated pods are available...
+daemon set "blobcache-blobcached" successfully rolled out
+==[ wait_http_ready: polling :7773/metrics on 17 pods, timeout 120s ]==
+==[ wait_http_ready: 17/17 pods healthy at 2026-05-02T07:14:38Z ]==
+==[ TRIAL c1-cacheoff-gather-t2 start=2026-05-02T07:15:38Z ]==
+verify_hydrate c1-cacheoff-gather-t2: 17 peers, 0 unhealthy
+c1-cacheoff-gather-t2	2026-05-02T07:15:38Z	2026-05-02T07:32:01Z	163.595653	16.257228	215.912014	231.841290	250.225161	node-17	ok
+==[ TRIAL c1-cacheoff-gather-t2 end=2026-05-02T07:32:01Z ]==
+==[ helm uninstall + install with values-off.yaml ]==
+I0502 08:32:07.921059 3067303 warnings.go:110] "Warning: [azurepolicy-k8sazurev2customcontainerallow-db27d7bfaf0671f6e28a] Container image ghcr.io/edwardsp/blobcache:sha-7785a86-arm64 for container blobcached has not been allowed."
+NAME: blobcache
+LAST DEPLOYED: Sat May  2 08:32:06 2026
+NAMESPACE: blobcache
+STATUS: deployed
+REVISION: 1
+TEST SUITE: None
+Waiting for daemon set "blobcache-blobcached" rollout to finish: 16 of 17 updated pods are available...
+daemon set "blobcache-blobcached" successfully rolled out
+==[ wait_http_ready: polling :7773/metrics on 17 pods, timeout 120s ]==
+==[ wait_http_ready: 17/17 pods healthy at 2026-05-02T07:33:21Z ]==
+==[ TRIAL c2-cacheoff-shard-t1 start=2026-05-02T07:34:21Z ]==
+verify_hydrate c2-cacheoff-shard-t1: 17 peers, 0 unhealthy
+c2-cacheoff-shard-t1	2026-05-02T07:34:21Z	2026-05-02T07:56:22Z	17.217893	-	306.484222	315.388963	614.330988	node-44	ok
+==[ TRIAL c2-cacheoff-shard-t1 end=2026-05-02T07:56:22Z ]==
+==[ helm uninstall + install with values-off.yaml ]==
+I0502 08:56:28.634776 3072287 warnings.go:110] "Warning: [azurepolicy-k8sazurev2customcontainerallow-db27d7bfaf0671f6e28a] Container image ghcr.io/edwardsp/blobcache:sha-7785a86-arm64 for container blobcached has not been allowed."
+NAME: blobcache
+LAST DEPLOYED: Sat May  2 08:56:26 2026
+NAMESPACE: blobcache
+STATUS: deployed
+REVISION: 1
+TEST SUITE: None
+Waiting for daemon set "blobcache-blobcached" rollout to finish: 16 of 17 updated pods are available...
+daemon set "blobcache-blobcached" successfully rolled out
+==[ wait_http_ready: polling :7773/metrics on 17 pods, timeout 120s ]==
+==[ wait_http_ready: 17/17 pods healthy at 2026-05-02T07:56:51Z ]==
+==[ TRIAL c2-cacheoff-shard-t2 start=2026-05-02T07:57:51Z ]==
+verify_hydrate c2-cacheoff-shard-t2: 17 peers, 0 unhealthy
+c2-cacheoff-shard-t2	2026-05-02T07:57:51Z	2026-05-02T08:20:18Z	17.745471	-	332.633296	311.149389	616.948145	node-56	ok
+==[ TRIAL c2-cacheoff-shard-t2 end=2026-05-02T08:20:18Z ]==
+==[ helm uninstall + install with values-on.yaml ]==
+I0502 09:20:24.405130 3077538 warnings.go:110] "Warning: [azurepolicy-k8sazurev2customcontainerallow-db27d7bfaf0671f6e28a] Container image ghcr.io/edwardsp/blobcache:sha-7785a86-arm64 for container blobcached has not been allowed."
+NAME: blobcache
+LAST DEPLOYED: Sat May  2 09:20:22 2026
+NAMESPACE: blobcache
+STATUS: deployed
+REVISION: 1
+TEST SUITE: None
+Waiting for daemon set "blobcache-blobcached" rollout to finish: 16 of 17 updated pods are available...
+daemon set "blobcache-blobcached" successfully rolled out
+==[ wait_http_ready: polling :7773/metrics on 17 pods, timeout 120s ]==
+==[ wait_http_ready: 17/17 pods healthy at 2026-05-02T08:20:47Z ]==
+==[ TRIAL c3-cacheon-shard-t1 start=2026-05-02T08:21:47Z ]==
+verify_hydrate c3-cacheon-shard-t1: 17 peers, 0 unhealthy
+c3-cacheon-shard-t1	2026-05-02T08:21:47Z	2026-05-02T08:37:28Z	16.765347	-	318.627325	218.815188	281.169845	node-68	ok
+==[ TRIAL c3-cacheon-shard-t1 end=2026-05-02T08:37:28Z ]==
+==[ helm uninstall + install with values-on.yaml ]==
+I0502 09:37:34.348967 3081944 warnings.go:110] "Warning: [azurepolicy-k8sazurev2customcontainerallow-db27d7bfaf0671f6e28a] Container image ghcr.io/edwardsp/blobcache:sha-7785a86-arm64 for container blobcached has not been allowed."
+NAME: blobcache
+LAST DEPLOYED: Sat May  2 09:37:32 2026
+NAMESPACE: blobcache
+STATUS: deployed
+REVISION: 1
+TEST SUITE: None
+Waiting for daemon set "blobcache-blobcached" rollout to finish: 16 of 17 updated pods are available...
+daemon set "blobcache-blobcached" successfully rolled out
+==[ wait_http_ready: polling :7773/metrics on 17 pods, timeout 120s ]==
+==[ wait_http_ready: 17/17 pods healthy at 2026-05-02T08:39:07Z ]==
+==[ TRIAL c3-cacheon-shard-t2 start=2026-05-02T08:40:07Z ]==
+verify_hydrate c3-cacheon-shard-t2: 17 peers, 0 unhealthy
+c3-cacheon-shard-t2	2026-05-02T08:40:07Z	2026-05-02T08:56:16Z	17.363127	-	326.399220	223.345128	298.189880	node-90	ok
+==[ TRIAL c3-cacheon-shard-t2 end=2026-05-02T08:56:16Z ]==
+==[ SWEEP_END=2026-05-02T08:56:16Z summary=/tmp/sweep-pass3-20260502T065433Z/sweep-summary.tsv ]==
+
+tag                    start_utc             end_utc               hydrate_s   gather_s   pass1_s     pass2_s     pass3_s     wiped_pod                   hyd_status
+c1-cacheoff-gather-t1  2026-05-02T06:57:12Z  2026-05-02T07:13:18Z  164.442773  16.912042  212.562716  234.730395  228.148271  node-00  ok
+c1-cacheoff-gather-t2  2026-05-02T07:15:38Z  2026-05-02T07:32:01Z  163.595653  16.257228  215.912014  231.841290  250.225161  node-17  ok
+c2-cacheoff-shard-t1   2026-05-02T07:34:21Z  2026-05-02T07:56:22Z  17.217893   -          306.484222  315.388963  614.330988  node-44  ok
+c2-cacheoff-shard-t2   2026-05-02T07:57:51Z  2026-05-02T08:20:18Z  17.745471   -          332.633296  311.149389  616.948145  node-56  ok
+c3-cacheon-shard-t1    2026-05-02T08:21:47Z  2026-05-02T08:37:28Z  16.765347   -          318.627325  218.815188  281.169845  node-68  ok
+c3-cacheon-shard-t2    2026-05-02T08:40:07Z  2026-05-02T08:56:16Z  17.363127   -          326.399220  223.345128  298.189880  node-90  ok

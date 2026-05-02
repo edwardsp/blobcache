@@ -59,6 +59,16 @@ RUN_PASS2=${RUN_PASS2:-0}
 # barrier between the gather and PASS1.
 RUN_GATHER=${RUN_GATHER:-0}
 POST_GATHER_SLEEP_S=${POST_GATHER_SLEEP_S:-0}
+# Pass 3: simulate single-node failure-and-replacement.
+# After PASS2 completes, wipe ONE pod's local cache via the in-tree
+# /clear-cache-shard admin endpoint (drains inflight, removes chunk files,
+# resets singleflight/peer-LRU/inflight maps, rebuilds bloom). Then re-run
+# the read pass: the wiped pod must peer-fetch its full share back from
+# the surviving N-1 pods while the cluster continues serving.
+RUN_PASS3=${RUN_PASS3:-0}
+WIPE_POD_INDEX=${WIPE_POD_INDEX:-1}
+WIPE_TIMEOUT_S=${WIPE_TIMEOUT_S:-180}
+POST_PASS2_SLEEP_S=${POST_PASS2_SLEEP_S:-0}
 
 mkdir -p "$OUT_DIR"
 LOG="$OUT_DIR/${RUN_TAG}-run.log"
@@ -254,9 +264,87 @@ echo \"files=\$COUNT bytes=\$TOTAL wall_s=\$WALL\"
   echo "snap-after2 lines=$(wc -l <"$SNAP_AFTER2")"
 fi
 
+P3_WALL=""
+WIPED_POD=""
+if [ "$RUN_PASS3" = "1" ]; then
+  if [ "$POST_PASS2_SLEEP_S" -gt 0 ] 2>/dev/null; then
+    echo
+    echo "=== POST_PASS2_SLEEP_START=$(date -u +%FT%T.%NZ) duration=${POST_PASS2_SLEEP_S}s ==="
+    sleep "$POST_PASS2_SLEEP_S"
+    echo "=== POST_PASS2_SLEEP_END=$(date -u +%FT%T.%NZ) ==="
+  fi
+
+  WIPED_POD=$(awk -v idx="$WIPE_POD_INDEX" 'NR==idx+1 {print $1; exit}' "$PODS_FILE")
+  WIPED_NODE=$(awk -v idx="$WIPE_POD_INDEX" 'NR==idx+1 {print $2; exit}' "$PODS_FILE")
+  if [ -z "$WIPED_POD" ]; then
+    echo "=== PASS3: ERROR: no pod at index $WIPE_POD_INDEX, skipping ===" >&2
+  else
+    echo
+    echo "=== WIPE_START=$(date -u +%FT%TZ) pod=$WIPED_POD node=$WIPED_NODE index=$WIPE_POD_INDEX ==="
+    WIPE_T0=$(date +%s.%N)
+    kubectl --request-timeout="${WIPE_TIMEOUT_S}s" -n "$NS" exec "$WIPED_POD" -- \
+      curl -sS --max-time "$WIPE_TIMEOUT_S" -X POST "http://127.0.0.1:7773/clear-cache-shard" \
+      >"$OUT_DIR/${RUN_TAG}-wipe.json" 2>"$OUT_DIR/${RUN_TAG}-wipe.err"
+    WIPE_RC=$?
+    WIPE_T1=$(date +%s.%N)
+    echo "=== WIPE_END=$(date -u +%FT%TZ) rc=$WIPE_RC wall=$(fdiff "$WIPE_T1" "$WIPE_T0")s ==="
+    cat "$OUT_DIR/${RUN_TAG}-wipe.json"; echo
+
+    POST_WIPE_BYTES=$(kubectl --request-timeout=10s -n "$NS" exec "$WIPED_POD" -- \
+      curl -sS --max-time 5 http://127.0.0.1:7773/metrics 2>/dev/null \
+      | awk '$1=="blobcache_cache_bytes"{print $2; exit}')
+    echo "=== POST_WIPE_VERIFY pod=$WIPED_POD blobcache_cache_bytes=${POST_WIPE_BYTES:-unknown} ==="
+
+    SNAP_BEFORE3="$OUT_DIR/${RUN_TAG}-snap-before3.tsv"
+    SNAP_AFTER3="$OUT_DIR/${RUN_TAG}-snap-after3.tsv"
+    echo
+    echo "=== SNAP_BEFORE3=$(date -u +%FT%T.%NZ) ==="
+    "$SCRIPT_DIR/diag-straggler.sh" snapshot "$SNAP_BEFORE3"
+    echo "snap-before3 lines=$(wc -l <"$SNAP_BEFORE3")"
+
+    PASS3_TSV="$OUT_DIR/${RUN_TAG}-pass3.tsv"
+    echo
+    echo "=== READ_PASS3_START=$(date -u +%FT%T.%NZ) order=$READ_ORDER wiped=$WIPED_POD ==="
+    P3_T0=$(date +%s.%N)
+    : >"$PASS3_TSV"
+    while read -r pod node; do
+      [ -z "$pod" ] && continue
+      (
+        OUT=$(kubectl --request-timeout="${READ_TIMEOUT_S}s" -n "$NS" exec "$pod" -- bash -c "
+$ORDER_SCRIPT
+START=\$(date +%s.%N)
+TOTAL=0
+COUNT=0
+for f in \"\${FILES[@]}\"; do
+  [ -e \"\$f\" ] || continue
+  S=\$(stat -c %s \"\$f\")
+  cat \"\$f\" >/dev/null 2>&1 || true
+  TOTAL=\$((TOTAL+S))
+  COUNT=\$((COUNT+1))
+done
+END=\$(date +%s.%N)
+WALL=\$(awk -v a=\"\$END\" -v b=\"\$START\" 'BEGIN{printf \"%.3f\", a-b}')
+echo \"files=\$COUNT bytes=\$TOTAL wall_s=\$WALL\"
+" 2>&1)
+        printf '%s\t%s\t%s\n' "$pod" "$node" "$OUT" >>"$PASS3_TSV"
+      ) &
+    done <"$PODS_FILE"
+    wait
+    P3_T1=$(date +%s.%N)
+    P3_WALL=$(fdiff "$P3_T1" "$P3_T0")
+    echo "=== READ_PASS3_END=$(date -u +%FT%T.%NZ) wall=${P3_WALL}s wiped=$WIPED_POD ==="
+    sort -t $'\t' -k1 "$PASS3_TSV" | head
+    echo
+
+    echo "=== SNAP_AFTER3=$(date -u +%FT%T.%NZ) ==="
+    "$SCRIPT_DIR/diag-straggler.sh" snapshot "$SNAP_AFTER3"
+    echo "snap-after3 lines=$(wc -l <"$SNAP_AFTER3")"
+  fi
+fi
+
 echo
 echo "=========================================="
-echo "DIAG_RUN_END=$(date -u +%FT%T.%NZ) wall_pass1=${P1_WALL}s${P2_WALL:+ wall_pass2=${P2_WALL}s}"
+echo "DIAG_RUN_END=$(date -u +%FT%T.%NZ) wall_pass1=${P1_WALL}s${P2_WALL:+ wall_pass2=${P2_WALL}s}${P3_WALL:+ wall_pass3=${P3_WALL}s wiped=$WIPED_POD}"
 echo "=========================================="
 echo "tag=$RUN_TAG"
 echo "out_dir=$OUT_DIR"
