@@ -92,6 +92,7 @@ pub struct Fetcher {
     chunk_sem: Arc<Semaphore>,
     chunk_concurrency: usize,
     inflight_writes: Arc<DashMap<ChunkKey, Bytes>>,
+    inflight_writes_drained: Arc<tokio::sync::Notify>,
     insert_failures: Arc<Mutex<Vec<(ChunkKey, String)>>>,
     seq_state: Arc<DashMap<String, SeqState>>,
     prefetch_sem: Arc<Semaphore>,
@@ -205,6 +206,7 @@ impl Fetcher {
             chunk_sem: Arc::new(Semaphore::new(permits)),
             chunk_concurrency: permits,
             inflight_writes: Arc::new(DashMap::new()),
+            inflight_writes_drained: Arc::new(tokio::sync::Notify::new()),
             insert_failures: Arc::new(Mutex::new(Vec::new())),
             seq_state: Arc::new(DashMap::new()),
             prefetch_sem: Arc::new(Semaphore::new(pf_permits)),
@@ -878,6 +880,7 @@ impl Fetcher {
         let cache = self.cache.clone();
         let stats = self.stats.clone();
         let inflight = self.inflight_writes.clone();
+        let inflight_writes_drained = self.inflight_writes_drained.clone();
         let insert_failures = self.insert_failures.clone();
         let peer_index = self.peer_index.clone();
         let k = key.clone();
@@ -905,6 +908,9 @@ impl Fetcher {
             }
             inflight.remove(&key);
             stats.inflight_writes.dec();
+            if inflight.is_empty() {
+                inflight_writes_drained.notify_waiters();
+            }
         });
     }
 
@@ -1030,7 +1036,13 @@ impl Fetcher {
             if self.inflight_writes.is_empty() {
                 return;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            // CRITICAL: create notified() future BEFORE the empty check, so we
+            // cannot miss a notify_waiters() that fires between check and await.
+            let notified = self.inflight_writes_drained.notified();
+            if self.inflight_writes.is_empty() {
+                return;
+            }
+            notified.await;
         }
     }
 
@@ -1155,6 +1167,7 @@ impl Fetcher {
             chunk_sem: self.chunk_sem.clone(),
             chunk_concurrency: self.chunk_concurrency,
             inflight_writes: self.inflight_writes.clone(),
+            inflight_writes_drained: self.inflight_writes_drained.clone(),
             insert_failures: self.insert_failures.clone(),
             seq_state: self.seq_state.clone(),
             prefetch_sem: self.prefetch_sem.clone(),
