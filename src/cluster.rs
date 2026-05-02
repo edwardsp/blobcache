@@ -52,6 +52,52 @@ pub struct NodeInfo {
     pub incarnation: u64,
     #[serde(default)]
     pub bloom_version: u64,
+    /// Admin/stats endpoint URL.  Nodes published before this field existed
+    /// advertise `None`; consumers fall back to port substitution from
+    /// `transport_url`.  Action 4 from opus_code_eval.
+    #[serde(default)]
+    pub admin_url: Option<String>,
+}
+
+impl NodeInfo {
+    /// Returns the admin (stats) URL for this node.
+    ///
+    /// If the node has published an explicit `admin_url` (Action 4), that is
+    /// returned directly.  Otherwise we fall back to the pre-Action-4
+    /// behaviour: substitute port 7773 into `transport_url` so that older
+    /// peers (which don't publish `admin_url`) still work.
+    pub fn effective_admin_url(&self) -> String {
+        if let Some(url) = &self.admin_url {
+            return url.clone();
+        }
+        port_substitute(&self.transport_url, 7773)
+    }
+}
+
+/// Replace the port in `url` with `new_port`.
+///
+/// Handles `http://host:port/path` and bare `host:port` forms.  If the URL
+/// cannot be parsed the original string is returned unchanged.
+pub fn port_substitute(url: &str, new_port: u16) -> String {
+    // Strip scheme if present.
+    let (scheme, rest) = if let Some(s) = url.strip_prefix("http://") {
+        ("http://", s)
+    } else if let Some(s) = url.strip_prefix("https://") {
+        ("https://", s)
+    } else {
+        ("", url)
+    };
+    // Split off any path component.
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, ""),
+    };
+    // Replace the port in the authority (host:port).
+    let host = match authority.rfind(':') {
+        Some(i) => &authority[..i],
+        None => authority,
+    };
+    format!("{scheme}{host}:{new_port}{path}")
 }
 
 #[derive(Serialize, Deserialize)]
@@ -495,6 +541,7 @@ mod tests {
             state,
             incarnation: 1,
             bloom_version: 0,
+            admin_url: None,
         }
     }
 
@@ -518,5 +565,25 @@ mod tests {
             "members_alive_same_cluster returns same-cluster only"
         );
         assert_eq!(m.members_alive_same_cluster()[0].id, "peer-same");
+    }
+
+    #[test]
+    fn effective_admin_url_falls_back_to_port_substitution() {
+        let n_no_admin = NodeInfo {
+            admin_url: None,
+            transport_url: "http://10.0.0.5:7772".into(),
+            ..node("n1", "h", NodeState::Alive)
+        };
+        assert_eq!(n_no_admin.effective_admin_url(), "http://10.0.0.5:7773");
+
+        let n_with_admin = NodeInfo {
+            admin_url: Some("http://admin.example:9999".into()),
+            transport_url: "http://10.0.0.5:7772".into(),
+            ..node("n2", "h", NodeState::Alive)
+        };
+        assert_eq!(
+            n_with_admin.effective_admin_url(),
+            "http://admin.example:9999"
+        );
     }
 }

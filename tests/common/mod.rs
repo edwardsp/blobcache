@@ -86,5 +86,6 @@ pub fn node(id: &str) -> NodeInfo {
         state: NodeState::Alive,
         incarnation: 1,
         bloom_version: 0,
+        admin_url: None,
     }
 }

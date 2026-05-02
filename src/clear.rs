@@ -75,9 +75,14 @@ pub async fn run_coordinator(
     admin_token: Option<String>,
 ) -> Result<ClearResponse> {
     let t0 = Instant::now();
-    let mut targets: Vec<(String, Option<String>)> = vec![(me_id.clone(), None)];
+    let mut targets: Vec<(String, Option<String>, Option<String>)> =
+        vec![(me_id.clone(), None, None)];
     for n in membership.members_alive_same_cluster() {
-        targets.push((n.id.clone(), Some(n.transport_url.clone())));
+        targets.push((
+            n.id.clone(),
+            Some(n.transport_url.clone()),
+            Some(n.effective_admin_url()),
+        ));
     }
     let n_targets = targets.len();
 
@@ -90,8 +95,8 @@ pub async fn run_coordinator(
         .unwrap_or(global_timeout / 2);
 
     let mut handles = Vec::with_capacity(n_targets);
-    for (node_id, transport_url) in targets.into_iter() {
-        let Some(url) = transport_url else {
+    for (node_id, transport_url, admin_url) in targets.into_iter() {
+        let Some(_transport_url) = transport_url else {
             let f = fetcher.clone();
             handles.push(tokio::spawn(async move {
                 let r = run_shard(f).await;
@@ -108,13 +113,10 @@ pub async fn run_coordinator(
             continue;
         };
         {
-            let host = url
-                .trim_start_matches("http://")
-                .split(':')
-                .next()
-                .unwrap_or("")
-                .to_string();
-            let endpoint = format!("http://{host}:7773/clear-cache-shard");
+            let endpoint = format!(
+                "{}/clear-cache-shard",
+                admin_url.unwrap_or_default().trim_end_matches('/')
+            );
             let http = http.clone();
             let admin_token = admin_token.clone();
             handles.push(tokio::spawn(async move {

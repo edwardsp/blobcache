@@ -93,6 +93,9 @@ pub struct BroadcastSource {
     #[serde(default)]
     pub ucx_worker_addr_b64: Option<String>,
     pub chunks: Vec<ChunkSpec>,
+    /// Admin URL for coordinator→shard HTTP calls; `None` on older peers.
+    #[serde(default)]
+    pub admin_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -414,13 +417,14 @@ pub async fn run_coordinator(
     // and crossed cluster boundaries when multiple clusters shared gossip).
     let alive_members = membership.members_alive_same_cluster();
     let me_worker_b64 = membership.me_template.ucx_worker_addr_b64.clone();
-    let mut targets: Vec<(String, Option<String>, Option<String>)> =
-        vec![(me_id.clone(), None, me_worker_b64.clone())];
+    let mut targets: Vec<(String, Option<String>, Option<String>, Option<String>)> =
+        vec![(me_id.clone(), None, me_worker_b64.clone(), None)];
     for n in &alive_members {
         targets.push((
             n.id.clone(),
             Some(n.transport_url.clone()),
             n.ucx_worker_addr_b64.clone(),
+            Some(n.effective_admin_url()),
         ));
     }
     let n_targets = targets.len();
@@ -435,13 +439,14 @@ pub async fn run_coordinator(
         .iter()
         .zip(buckets.iter())
         .map(
-            |((node_id, transport_url, worker_b64), chunks)| BroadcastSource {
+            |((node_id, transport_url, worker_b64, admin_url), chunks)| BroadcastSource {
                 node_id: node_id.clone(),
                 transport_url: transport_url
                     .clone()
                     .unwrap_or_else(|| me_transport_url.clone()),
                 ucx_worker_addr_b64: worker_b64.clone(),
                 chunks: chunks.clone(),
+                admin_url: admin_url.clone(),
             },
         )
         .collect();
@@ -463,10 +468,10 @@ pub async fn run_coordinator(
 
     let phase_a_t0 = Instant::now();
     let mut handles = Vec::with_capacity(n_targets);
-    for ((node_id, transport_url, _), chunks) in targets.into_iter().zip(buckets) {
+    for ((node_id, transport_url, _, admin_url), chunks) in targets.into_iter().zip(buckets) {
         let assigned = chunks.len() as u64;
         let mount_name = req.mount.clone();
-        let Some(url) = transport_url else {
+        let Some(_transport_url) = transport_url else {
             let f = fetcher.clone();
             let m = mounts.clone();
             handles.push(tokio::spawn(async move {
@@ -493,13 +498,10 @@ pub async fn run_coordinator(
             continue;
         };
         {
-            let host = url
-                .trim_start_matches("http://")
-                .split(':')
-                .next()
-                .unwrap_or("")
-                .to_string();
-            let endpoint = format!("http://{host}:7773/hydrate-shard");
+            let endpoint = format!(
+                "{}/hydrate-shard",
+                admin_url.unwrap_or_default().trim_end_matches('/')
+            );
             let http = http.clone();
             let admin_token = admin_token.clone();
             handles.push(tokio::spawn(async move {
@@ -749,7 +751,10 @@ async fn run_broadcast_phase(
     let mut handles = Vec::with_capacity(n_targets);
     for receiver in plan.iter() {
         let receiver_id = receiver.node_id.clone();
-        let receiver_url = receiver.transport_url.clone();
+        let receiver_admin_url = receiver
+            .admin_url
+            .clone()
+            .unwrap_or_else(|| crate::cluster::port_substitute(&receiver.transport_url, 7773));
         let sources: Vec<BroadcastSource> = plan
             .iter()
             .filter(|s| s.node_id != receiver_id)
@@ -777,13 +782,10 @@ async fn run_broadcast_phase(
                 }
             }));
         } else {
-            let host = receiver_url
-                .trim_start_matches("http://")
-                .split(':')
-                .next()
-                .unwrap_or("")
-                .to_string();
-            let endpoint = format!("http://{host}:7773/hydrate-broadcast-shard");
+            let endpoint = format!(
+                "{}/hydrate-broadcast-shard",
+                receiver_admin_url.trim_end_matches('/')
+            );
             let http = http.clone();
             let admin_token = admin_token.clone();
             handles.push(tokio::spawn(async move {
@@ -1156,7 +1158,10 @@ async fn run_ring_phase(
                 chunks: source.chunks.clone(),
             };
             let receiver_id = receiver.node_id.clone();
-            let receiver_url = receiver.transport_url.clone();
+            let receiver_admin_url = receiver
+                .admin_url
+                .clone()
+                .unwrap_or_else(|| crate::cluster::port_substitute(&receiver.transport_url, 7773));
             if receiver_id == me_id {
                 let f = fetcher.clone();
                 let m = mounts.clone();
@@ -1165,13 +1170,10 @@ async fn run_ring_phase(
                     (receiver_id, r)
                 }));
             } else {
-                let host = receiver_url
-                    .trim_start_matches("http://")
-                    .split(':')
-                    .next()
-                    .unwrap_or("")
-                    .to_string();
-                let endpoint = format!("http://{host}:7773/hydrate-ring-step");
+                let endpoint = format!(
+                    "{}/hydrate-ring-step",
+                    receiver_admin_url.trim_end_matches('/')
+                );
                 let http = http.clone();
                 let admin_token = admin_token.clone();
                 handles.push(tokio::spawn(async move {

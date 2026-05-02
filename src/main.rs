@@ -175,6 +175,24 @@ fn main() -> anyhow::Result<()> {
         state: NodeState::Alive,
         incarnation: 1,
         bloom_version: 0,
+        admin_url: Some({
+            let bind = &cfg.stats.bind;
+            if let Some((host, port)) = bind.rsplit_once(':') {
+                if host == "0.0.0.0" || host.is_empty() {
+                    let local = nic::enumerate(true)
+                        .into_iter()
+                        .find(|a| matches!(a.ip, std::net::IpAddr::V4(_)));
+                    match local {
+                        Some(a) => format!("http://{}:{}", a.ip, port),
+                        None => format!("http://127.0.0.1:{port}"),
+                    }
+                } else {
+                    format!("http://{bind}")
+                }
+            } else {
+                format!("http://{bind}")
+            }
+        }),
     };
     #[allow(unused_mut)]
     let mut membership = Membership::new(me, stats.cluster_stats.clone());
