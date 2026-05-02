@@ -547,6 +547,11 @@ impl Stats {
     }
 }
 
+// NOTE(opus-eval-18): Known refactor target. This function is a single
+// ~490-line nested closure handling every stats/admin route inline.  It
+// should be split into per-route handler functions to improve testability
+// and allow middleware insertion.  Deferred: zero behavioural change but
+// high churn; tracked in opus_code_eval_actions.md row 18.
 #[allow(clippy::too_many_arguments)]
 pub async fn serve(
     stats: Arc<Stats>,

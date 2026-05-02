@@ -6,6 +6,17 @@
 // and updates its bloom). The result: aggregate bandwidth scales ~linearly
 // with cluster size, since every node pulls a different ~1/N of the data
 // in parallel from Azure.
+//
+//! NOTE(opus-eval-27): Planned split (deferred to a follow-up PR).
+//! This file (1478 LOC) mixes coordinator logic, per-phase orchestration,
+//! and wire types.  Proposed layout:
+//!   - `hydrate/coordinator.rs`  — top-level fan-out and result aggregation
+//!   - `hydrate/phases/shard.rs` — shard-mode phase
+//!   - `hydrate/phases/broadcast.rs` — broadcast-mode phase
+//!   - `hydrate/phases/ring.rs`  — ring-step phase
+//!   - `hydrate/wire.rs`         — request/response serde types
+//! Rationale for deferral: zero behavioural change, large diff (~600 LOC
+//! moved), would block unrelated PRs during review.
 
 use crate::azure::BlobClient;
 use crate::cluster::{Membership, NodeState};

@@ -1,3 +1,13 @@
+//! Gossip-based cluster membership for blobcache.
+//!
+//! NOTE(opus-eval-15): The gossip protocol is push-pull: each round one node
+//! POSTs its full member list to a random peer and receives the peer's full
+//! list in response.  Payload size is O(N) per round (each `NodeInfo` entry
+//! is ~1–2 KiB once UCX worker addresses are base64-encoded).  The 1 MiB
+//! `MAX_GOSSIP_BODY_BYTES` cap puts a hard ceiling around N ≈ 300 nodes.
+//! Beyond that, switch to a delta or SWIM-style protocol that only exchanges
+//! changed entries.
+
 use parking_lot::RwLock;
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
@@ -285,6 +295,11 @@ impl GossipServer {
         self
     }
 
+    // NOTE(opus-eval-18): Known refactor target. This function is a single
+    // ~120-line nested closure handling every gossip route inline.  It should
+    // be split into per-route handler functions to improve testability and
+    // allow middleware insertion.  Deferred: zero behavioural change but high
+    // churn; tracked in opus_code_eval_actions.md row 18.
     pub async fn serve(self, addr: SocketAddr) -> Result<()> {
         use http_body_util::{BodyExt, Full};
         use hyper::body::{Bytes as HBytes, Incoming};

@@ -4,6 +4,16 @@
 // async-ucx wrapper. The public API and wire protocol stay identical to the
 // previous implementation, except the peer data-plane now uses the UCX tag
 // API rather than the stream API.
+//
+//! NOTE(opus-eval-27): Planned split (deferred to a follow-up PR).
+//! This file (1967 LOC) mixes wire protocol, FFI runtime, and server/client
+//! logic.  Proposed layout:
+//!   - `transport_ucx/wire.rs`    — encode/decode + tests (no UCX deps)
+//!   - `transport_ucx/runtime.rs` — FFI, RuntimeState, EndpointSlot, UcxRuntime
+//!   - `transport_ucx/server.rs`  — drain_inbound, handle_inbound_request
+//!   - `transport_ucx/client.rs`  — client_fetch, client_health
+//! Rationale for deferral: zero behavioural change, large diff (~800 LOC
+//! moved), would block unrelated PRs during review.
 
 #![cfg(feature = "ucx")]
 
@@ -1180,7 +1190,31 @@ fn decode_request(data: &[u8]) -> Result<ChunkRequest> {
     let requester_len = read_be_u16(data, &mut idx)? as usize;
     let requester_peer_id = read_utf8(data, &mut idx, requester_len, "requester_peer_id")?;
 
+    // NOTE(opus-eval-7): Back-compat decode for pre-v2.6 peers that did not
+    // send wait_ms or request_id.  The ideal fix would be an exact-length
+    // check (legacy frames have a fixed size determined by the variable-length
+    // fields above), but computing that exact size here requires threading the
+    // field lengths through, which is a behavioural change deferred to a
+    // follow-up.  For now we accept any frame that has ≥4 trailing bytes as
+    // having a wait_ms field, which means a v2.6 frame truncated after wait_ms
+    // (missing the rid length prefix) silently parses with request_id="".
+    // TODO(opus-eval-7): tighten to exact-length check so truncated v2.6
+    // frames are decode errors rather than silent re-interpretations.
     let wait_ms = if idx + 4 <= data.len() {
+        // Warn once if the frame ends exactly here (no rid prefix follows),
+        // which is the ambiguous case: could be a true legacy peer or a
+        // truncated v2.6 frame.
+        static LEGACY_WARN: std::sync::Once = std::sync::Once::new();
+        if idx + 4 == data.len() {
+            LEGACY_WARN.call_once(|| {
+                tracing::warn!(
+                    "UCX decode: received frame that ends immediately after \
+                     wait_ms with no request_id prefix; this is either a \
+                     pre-v2.6 peer or a truncated v2.6 frame. \
+                     See TODO(opus-eval-7)."
+                );
+            });
+        }
         read_be_u32(data, &mut idx)?
     } else {
         0

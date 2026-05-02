@@ -159,6 +159,12 @@ impl PeerIndex {
         let new_version = {
             let mut g = self.local.write();
             g.bloom.insert(digest);
+            // NOTE(opus-eval-23): saturating_add is intentional. At realistic
+            // insert rates (1 M inserts/sec sustained) u64::MAX is reached in
+            // ~600 k years, so overflow is impossible in practice. Saturating
+            // semantics ensure version 0 (the "unknown" sentinel used by peers
+            // that have never seen a bloom) is never accidentally produced via
+            // wrap-around.
             g.version = g.version.saturating_add(1);
             g.version
         };

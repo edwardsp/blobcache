@@ -19,7 +19,7 @@ Status legend:
 | 4 | Hard-coded port `7773` | **Fix**: parse host with `url::Url`, build admin URLs from a new `admin_url` field on `NodeInfo` propagated via gossip. Backward-compatible: falls back to port-substitution when peer hasn't published one. | ✅ |
 | 5 | Admin endpoints no auth | **Implement**: optional `admin.token` in config; when set, all destructive POSTs (`/clear-cache*`, `/hydrate*`) require `Authorization: Bearer <token>`; inter-node calls auto-include it. | ✅ |
 | 6 | `shared_key.rs` `expect` panics | **Fix**: return `BcError::Auth` on bad base64 / HMAC init. | ✅ |
-| 7 | UCX wire decoder back-compat ambiguity | **Fix**: tighten back-compat path to require *exactly* the legacy frame length; mismatches are now decode errors instead of silent re-interpretations. | ✅ |
+| 7 | UCX wire decoder back-compat ambiguity | The decoder already enforces `idx == data.len()` at end of decode, so the only true ambiguity is a v2.6 frame truncated *exactly* after `wait_ms`. Added a `Once`-gated `tracing::warn!` that fires the first time such a frame is decoded so real-world hits are visible, plus a `TODO(opus-eval-7)` marking exact-length tightening as a follow-up (requires threading variable-length field sizes through the decoder). | 📝 |
 | 8 | RecvSlab semaphore desync uses `expect` | **Fix**: `try_borrow_mut` + structural error path (no panic on borrow contention); add `debug_assert_eq!` linking semaphore permits to free-list length on every checkout/return. | ✅ |
 
 ## Medium-severity (9–20)
