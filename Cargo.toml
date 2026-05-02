@@ -66,6 +66,11 @@ default = []
 # libucx0 + libibverbs1 + librdmacm1t64 at runtime.
 ucx = ["dep:ucx1-sys"]
 
+[dev-dependencies]
+tempfile = "3"
+proptest = { version = "1", default-features = false, features = ["std"] }
+rand_chacha = "0.3"
+
 [profile.release]
 debug = 1
 lto = "thin"

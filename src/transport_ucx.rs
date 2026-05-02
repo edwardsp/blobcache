@@ -1758,3 +1758,210 @@ impl AsRawFd for WorkerEventFd {
         self.0
     }
 }
+
+#[cfg(test)]
+mod wire_protocol_tests {
+    //! Wire-protocol unit tests for the UCX peer transport. These test
+    //! the pure-bytes encode/decode helpers and never touch UCX itself,
+    //! so they run inside the standard `cargo test --features ucx` suite
+    //! without requiring an HCA, libucx, or root privileges.
+
+    use super::*;
+    use crate::cache::ChunkKey;
+
+    fn key(mount: &str, blob: &str, offset: u64) -> ChunkKey {
+        ChunkKey {
+            mount: mount.into(),
+            blob: blob.into(),
+            offset,
+        }
+    }
+
+    #[test]
+    fn request_roundtrip_preserves_all_fields() {
+        let k = key("models", "weights/0.bin", 4096);
+        let bytes = encode_request(&k, 1024, "node-a", 250, "abc-123").unwrap();
+        let decoded = decode_request(&bytes).unwrap();
+        assert_eq!(decoded.key.mount, "models");
+        assert_eq!(decoded.key.blob, "weights/0.bin");
+        assert_eq!(decoded.key.offset, 4096);
+        assert_eq!(decoded.length, 1024);
+        assert_eq!(decoded.requester_peer_id, "node-a");
+        assert_eq!(decoded.wait_ms, 250);
+        assert_eq!(decoded.request_id, "abc-123");
+    }
+
+    #[test]
+    fn request_starts_with_magic_in_big_endian() {
+        let k = key("m", "b", 0);
+        let bytes = encode_request(&k, 1, "x", 0, "").unwrap();
+        assert_eq!(&bytes[..4], &MAGIC.to_be_bytes());
+    }
+
+    #[test]
+    fn request_decode_rejects_bad_magic() {
+        let k = key("m", "b", 0);
+        let mut bytes = encode_request(&k, 1, "x", 0, "").unwrap();
+        bytes[0] ^= 0xFF;
+        let err = decode_request(&bytes).unwrap_err();
+        assert!(format!("{err}").to_lowercase().contains("magic"));
+    }
+
+    #[test]
+    fn request_decode_rejects_trailing_bytes() {
+        let k = key("m", "b", 0);
+        let mut bytes = encode_request(&k, 1, "x", 0, "").unwrap();
+        bytes.push(0xAA);
+        let err = decode_request(&bytes).unwrap_err();
+        assert!(format!("{err}").to_lowercase().contains("trailing"));
+    }
+
+    #[test]
+    fn request_decode_rejects_truncation() {
+        let k = key("models", "weights/0.bin", 4096);
+        let bytes = encode_request(&k, 1024, "node-a", 250, "abc").unwrap();
+        for cut in 0..bytes.len() {
+            assert!(
+                decode_request(&bytes[..cut]).is_err(),
+                "truncation at {cut} should fail"
+            );
+        }
+    }
+
+    #[test]
+    fn request_encode_rejects_oversized_mount_name() {
+        let big = "x".repeat(256);
+        let k = key(&big, "b", 0);
+        let err = encode_request(&k, 1, "n", 0, "").unwrap_err();
+        assert!(format!("{err}").to_lowercase().contains("mount"));
+    }
+
+    #[test]
+    fn request_encode_rejects_oversized_request_id() {
+        let k = key("m", "b", 0);
+        let big_rid = "a".repeat(129);
+        let err = encode_request(&k, 1, "n", 0, &big_rid).unwrap_err();
+        assert!(format!("{err}").to_lowercase().contains("request id"));
+    }
+
+    #[test]
+    fn request_decode_rejects_invalid_rid_chars() {
+        // Build a valid wire frame, then handcraft an rid containing a
+        // disallowed character (only ASCII alnum + '-' are accepted).
+        let k = key("m", "b", 0);
+        let bytes = encode_request(&k, 1, "n", 0, "valid-rid").unwrap();
+        let mut tampered = bytes.clone();
+        // Replace the rid payload's first byte (last byte of the frame
+        // when rid len is 9) with a space.
+        let last = tampered.len() - 1;
+        tampered[last - 8] = b' ';
+        let err = decode_request(&tampered).unwrap_err();
+        assert!(format!("{err}").to_lowercase().contains("invalid chars"));
+    }
+
+    #[test]
+    fn request_backcompat_no_wait_ms_no_rid_decodes() {
+        // Pre-rid wire frames omit the wait_ms+rid suffix entirely;
+        // decoder must accept them with defaults.
+        let k = key("models", "0.bin", 0);
+        let mount = b"models";
+        let blob = b"0.bin";
+        let mut req = Vec::new();
+        req.extend_from_slice(&MAGIC.to_be_bytes());
+        req.push(mount.len() as u8);
+        req.extend_from_slice(mount);
+        req.extend_from_slice(&(blob.len() as u16).to_be_bytes());
+        req.extend_from_slice(blob);
+        req.extend_from_slice(&0u64.to_be_bytes()); // offset
+        req.extend_from_slice(&1024u32.to_be_bytes()); // length
+        req.extend_from_slice(&1u16.to_be_bytes()); // requester len
+        req.extend_from_slice(b"x"); // requester id
+        let decoded = decode_request(&req).unwrap();
+        assert_eq!(decoded.key, k);
+        assert_eq!(decoded.length, 1024);
+        assert_eq!(decoded.wait_ms, 0);
+        assert_eq!(decoded.request_id, "");
+    }
+
+    #[test]
+    fn response_ok_roundtrip() {
+        let payload = vec![0xABu8; 4096];
+        let bytes = encode_response(STATUS_OK, &payload).unwrap();
+        let decoded = decode_response(&bytes, payload.len() as u32).unwrap();
+        assert_eq!(&decoded[..], &payload[..]);
+    }
+
+    #[test]
+    fn response_uses_little_endian_header() {
+        // Wire format for the response header is documented as LE; lock it.
+        let bytes = encode_response(STATUS_OK, b"hi").unwrap();
+        assert_eq!(&bytes[0..4], &STATUS_OK.to_le_bytes());
+        assert_eq!(&bytes[4..8], &2u32.to_le_bytes());
+        assert_eq!(&bytes[8..], b"hi");
+    }
+
+    #[test]
+    fn response_miss_decodes_to_not_found() {
+        let bytes = encode_response(STATUS_MISS, &[]).unwrap();
+        let err = decode_response(&bytes, 4096).unwrap_err();
+        let msg = format!("{err}").to_lowercase();
+        assert!(
+            msg.contains("not found") || msg.contains("miss"),
+            "expected NotFound, got {msg:?}"
+        );
+    }
+
+    #[test]
+    fn response_err_decodes_to_peer_error() {
+        let bytes = encode_response(STATUS_ERR, &[]).unwrap();
+        let err = decode_response(&bytes, 4096).unwrap_err();
+        let msg = format!("{err}").to_lowercase();
+        assert!(msg.contains("error") || msg.contains("peer"));
+    }
+
+    #[test]
+    fn response_unknown_status_decodes_to_peer_error() {
+        let bytes = encode_response(0xDEAD_BEEFu32, &[]).unwrap();
+        let err = decode_response(&bytes, 4096).unwrap_err();
+        assert!(format!("{err}").contains("status"));
+    }
+
+    #[test]
+    fn response_decode_rejects_short_header() {
+        let err = decode_response(&[0u8; 7], 4096).unwrap_err();
+        assert!(format!("{err}").to_lowercase().contains("short"));
+    }
+
+    #[test]
+    fn response_decode_rejects_header_body_length_mismatch() {
+        let mut bytes = encode_response(STATUS_OK, &[1, 2, 3, 4]).unwrap();
+        bytes.pop(); // body now 3 bytes, header still says 4
+        let err = decode_response(&bytes, 16).unwrap_err();
+        assert!(format!("{err}").to_lowercase().contains("length mismatch"));
+    }
+
+    #[test]
+    fn response_decode_rejects_payload_larger_than_requested() {
+        let bytes = encode_response(STATUS_OK, &vec![0u8; 8]).unwrap();
+        let err = decode_response(&bytes, 4).unwrap_err();
+        assert!(format!("{err}")
+            .to_lowercase()
+            .contains("larger than requested"));
+    }
+
+    #[test]
+    fn response_encode_rejects_oversized_payload() {
+        let too_big = vec![0u8; (MAX_RESPONSE_BYTES as usize) + 1];
+        let err = encode_response(STATUS_OK, &too_big).unwrap_err();
+        assert!(format!("{err}").to_lowercase().contains("too large"));
+    }
+
+    #[test]
+    fn status_codes_are_stable() {
+        // Wire-protocol constants must not drift silently.
+        assert_eq!(STATUS_OK, 0);
+        assert_eq!(STATUS_MISS, 1);
+        assert_eq!(STATUS_ERR, 2);
+        assert_eq!(MAGIC, 0xBC10_C001);
+    }
+}
