@@ -30,7 +30,7 @@ Status legend:
 | 9 | `clone_handles` enumerates 25 fields | **Refactor**: introduce `Arc<FetcherInner>` so `clone_handles` is a single `Arc::clone`. Same for `FuseFs`. | 🚧 |
 | 10 | `await_inserts_drained` 5 ms busy-poll | **Fix**: replace with `tokio::sync::Notify` bumped on transition to 0. | ✅ |
 | 11 | `by_ino` unbounded growth | **Implement**: gauge `blobcache_fuse_by_ino_entries` + warn-log when crossing soft cap (default 1M). | ✅ |
-| 12 | `fetch_range` per-chunk allocation | **Fix**: pre-size single `BytesMut` and write chunks into the right offset; remove per-chunk `Vec::with_capacity`. | 🚧 |
+| 12 | `fetch_range` per-chunk allocation | **Fix**: pre-size single `BytesMut` and write chunks into the right offset; remove per-chunk `Vec::with_capacity`. | ✅ |
 | 13 | Bloom version publish race | **Fix**: invoke `on_version_change` *inside* the write lock (advertised version can no longer trail published bytes). | ✅ |
 | 14 | `members_all()` no `cluster_hash` filter | **Fix**: add `members_alive_same_cluster()` (a documenting alias for `members_alive`, which already filters); route `clear` and `hydrate` fan-out (which were using `members_all()` + manual Alive filter, missing the cluster check) and the fetcher peer-candidate site through it. | ✅ |
 | 15 | Gossip O(N²) | 📝 Document hard ceiling (~300 nodes) in `cluster.rs` module doc. | 📝 |
