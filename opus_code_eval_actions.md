@@ -32,7 +32,7 @@ Status legend:
 | 11 | `by_ino` unbounded growth | **Implement**: gauge `blobcache_fuse_by_ino_entries` + warn-log when crossing soft cap (default 1M). | ✅ |
 | 12 | `fetch_range` per-chunk allocation | **Fix**: pre-size single `BytesMut` and write chunks into the right offset; remove per-chunk `Vec::with_capacity`. | 🚧 |
 | 13 | Bloom version publish race | **Fix**: invoke `on_version_change` *inside* the write lock (advertised version can no longer trail published bytes). | ✅ |
-| 14 | `members_all()` no `cluster_hash` filter | **Fix**: add `members_alive_same_cluster()` and use everywhere fan-out happens. | 🚧 |
+| 14 | `members_all()` no `cluster_hash` filter | **Fix**: add `members_alive_same_cluster()` (a documenting alias for `members_alive`, which already filters); route `clear` and `hydrate` fan-out (which were using `members_all()` + manual Alive filter, missing the cluster check) and the fetcher peer-candidate site through it. | ✅ |
 | 15 | Gossip O(N²) | 📝 Document hard ceiling (~300 nodes) in `cluster.rs` module doc. | 📝 |
 | 16 | `HydrateJobs::gc()` per-call | **Fix**: gate behind 5 s throttle (`AtomicU64` last-gc timestamp). | ✅ |
 | 17 | `BlobClient` double retry loop | **Fix**: collapse body-drain retry into the existing `send` retry path (single budget). | 🚧 |

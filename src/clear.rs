@@ -1,4 +1,4 @@
-use crate::cluster::{Membership, NodeState};
+use crate::cluster::Membership;
 use crate::error::Result;
 use crate::fetcher::Fetcher;
 use serde::{Deserialize, Serialize};
@@ -75,10 +75,8 @@ pub async fn run_coordinator(
 ) -> Result<ClearResponse> {
     let t0 = Instant::now();
     let mut targets: Vec<(String, Option<String>)> = vec![(me_id.clone(), None)];
-    for n in membership.members_all() {
-        if matches!(n.state, NodeState::Alive) && n.id != me_id {
-            targets.push((n.id.clone(), Some(n.transport_url.clone())));
-        }
+    for n in membership.members_alive_same_cluster() {
+        targets.push((n.id.clone(), Some(n.transport_url.clone())));
     }
     let n_targets = targets.len();
 

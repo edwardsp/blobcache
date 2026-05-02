@@ -564,7 +564,7 @@ impl Fetcher {
         rid: Option<&crate::request_id::RequestId>,
     ) -> Result<Bytes> {
         if !bypass_peers {
-            let alive = self.membership.members_alive();
+            let alive = self.membership.members_alive_same_cluster();
             let candidates = self.peer_index.rank_candidates(
                 key,
                 &alive,

@@ -20,7 +20,7 @@
 //! moved), would block unrelated PRs during review.
 
 use crate::azure::BlobClient;
-use crate::cluster::{Membership, NodeState};
+use crate::cluster::Membership;
 use crate::config::MountConfig;
 use crate::error::{BcError, Result};
 use crate::fetcher::Fetcher;
@@ -386,21 +386,21 @@ pub async fn run_coordinator(
     // Each target is (node_id, Option<transport_url> -- None means self,
     // Option<ucx_worker_addr_b64>). Self goes first so chunk 0 lands locally
     // and uneven N-distribution is deterministic for benchmarking.
-    let alive_members = membership.members_all();
-    let me_worker_b64 = alive_members
-        .iter()
-        .find(|n| n.id == me_id)
-        .and_then(|n| n.ucx_worker_addr_b64.clone());
+    //
+    // members_alive_same_cluster() excludes self, so we read the local UCX
+    // worker addr directly from me_template (Action 14 from opus_code_eval:
+    // the previous code used members_all() which included self by accident,
+    // and crossed cluster boundaries when multiple clusters shared gossip).
+    let alive_members = membership.members_alive_same_cluster();
+    let me_worker_b64 = membership.me_template.ucx_worker_addr_b64.clone();
     let mut targets: Vec<(String, Option<String>, Option<String>)> =
         vec![(me_id.clone(), None, me_worker_b64.clone())];
     for n in &alive_members {
-        if matches!(n.state, NodeState::Alive) && n.id != me_id {
-            targets.push((
-                n.id.clone(),
-                Some(n.transport_url.clone()),
-                n.ucx_worker_addr_b64.clone(),
-            ));
-        }
+        targets.push((
+            n.id.clone(),
+            Some(n.transport_url.clone()),
+            n.ucx_worker_addr_b64.clone(),
+        ));
     }
     let n_targets = targets.len();
     let mut buckets: Vec<Vec<ChunkSpec>> = (0..n_targets).map(|_| Vec::new()).collect();

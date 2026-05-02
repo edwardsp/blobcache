@@ -141,6 +141,19 @@ impl Membership {
             .collect()
     }
 
+    /// Like [`members_alive`] but makes the cluster-boundary filter explicit
+    /// for fan-out call sites (hydrate, clear, peer fetch candidates) so that
+    /// requests never cross cluster boundaries when multiple logical clusters
+    /// share the same gossip topology.  Action 14 from opus_code_eval.
+    ///
+    /// Semantically identical to [`members_alive`] — both already filter on
+    /// `cluster_hash` — but the distinct name documents intent at each call
+    /// site and guards against future refactors that might relax the filter in
+    /// [`members_alive`] for observability purposes.
+    pub fn members_alive_same_cluster(&self) -> Vec<NodeInfo> {
+        self.members_alive()
+    }
+
     pub fn members_all(&self) -> Vec<NodeInfo> {
         self.inner.read().members.values().cloned().collect()
     }
@@ -448,4 +461,62 @@ async fn gossip_with(client: &reqwest::Client, m: &Membership, peer_url: &str) -
     m.touch_peer(&from_id);
     m.stats.gossip_rounds.inc();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use prometheus::{IntCounter, Registry};
+    use std::sync::Arc;
+
+    fn make_stats() -> Arc<crate::stats::ClusterStats> {
+        let r = Registry::new();
+        let make = |name: &str| {
+            let c = IntCounter::new(name, name).unwrap();
+            r.register(Box::new(c.clone())).unwrap();
+            c
+        };
+        Arc::new(crate::stats::ClusterStats {
+            gossip_rounds: make("t_gossip_rounds"),
+            joins: make("t_joins"),
+            failures: make("t_failures"),
+            config_mismatches: make("t_config_mismatches"),
+        })
+    }
+
+    fn node(id: &str, hash: &str, state: NodeState) -> NodeInfo {
+        NodeInfo {
+            id: id.to_string(),
+            transport_url: format!("http://{id}:7772"),
+            gossip_url: format!("http://{id}:7771"),
+            cluster_hash: hash.to_string(),
+            ucx_worker_addr_b64: None,
+            last_seen_unix: unix_now(),
+            state,
+            incarnation: 1,
+            bloom_version: 0,
+        }
+    }
+
+    #[test]
+    fn members_alive_same_cluster_filters_by_hash() {
+        let me = node("me", "hash-a", NodeState::Alive);
+        let m = Membership::new(me, make_stats());
+
+        let peer_same = node("peer-same", "hash-a", NodeState::Alive);
+        let peer_other = node("peer-other", "hash-b", NodeState::Alive);
+        m.merge(&[peer_same, peer_other]);
+
+        assert_eq!(
+            m.members_alive().len(),
+            1,
+            "members_alive returns same-cluster only"
+        );
+        assert_eq!(
+            m.members_alive_same_cluster().len(),
+            1,
+            "members_alive_same_cluster returns same-cluster only"
+        );
+        assert_eq!(m.members_alive_same_cluster()[0].id, "peer-same");
+    }
 }
