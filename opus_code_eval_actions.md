@@ -35,7 +35,7 @@ Status legend:
 | 14 | `members_all()` no `cluster_hash` filter | **Fix**: add `members_alive_same_cluster()` (a documenting alias for `members_alive`, which already filters); route `clear` and `hydrate` fan-out (which were using `members_all()` + manual Alive filter, missing the cluster check) and the fetcher peer-candidate site through it. | ✅ |
 | 15 | Gossip O(N²) | 📝 Document hard ceiling (~300 nodes) in `cluster.rs` module doc. | 📝 |
 | 16 | `HydrateJobs::gc()` per-call | **Fix**: gate behind 5 s throttle (`AtomicU64` last-gc timestamp). | ✅ |
-| 17 | `BlobClient` double retry loop | **Fix**: collapse body-drain retry into the existing `send` retry path (single budget). | 🚧 |
+| 17 | `BlobClient` double retry loop | **Fix**: collapse body-drain retry into the existing `send` retry path (single budget). | ✅ |
 | 18 | Giant `serve()` lambdas | 📝 Document as known refactor target (split tracked in this file). Not landed: high churn risk for behavioural change-free split, ~600 LOC across 2 files; better as a follow-up PR. | 📝 |
 | 19 | Prometheus `reset()+inc_by` anti-pattern | **Fix**: switch to a `Collector` impl reading the underlying `AtomicU64`s directly so monotonicity is structurally guaranteed. | ✅ |
 | 20 | Hydrate/clear timeout misalignment | **Fix**: derive per-request from coordinator timeout minus a documented safety margin. | 🚧 |
