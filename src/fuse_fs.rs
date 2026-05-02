@@ -390,74 +390,95 @@ impl Filesystem for BlobFs {
         let me = self.clone_handles();
         let uid = req.uid();
         let gid = req.gid();
-        self.rt.spawn(async move {
-            if let Err(e) = me.ensure_dir_listed(parent).await {
-                reply.error(e);
-                return;
-            }
-            let g = me.inner.read().await;
-            if let Some(&ino) = g.by_parent_name.get(&(parent, name.clone())) {
-                if let Some(n) = g.by_ino.get(&ino) {
-                    let attr = BlobFs::attr_for(n, uid, gid);
-                    reply.entry(&TTL, &attr, 0);
+        let rid = crate::request_id::RequestId::new();
+        let span = tracing::debug_span!(
+            "fuse_lookup",
+            rid = %rid,
+            mount = %me.mount.name,
+            parent = parent,
+            name = %name,
+        );
+        self.rt.spawn(tracing::Instrument::instrument(
+            async move {
+                if let Err(e) = me.ensure_dir_listed(parent).await {
+                    reply.error(e);
                     return;
                 }
-            }
-            if let Some(p) = g.by_ino.get(&parent) {
-                let prefix = if me.mount.prefix.is_empty() {
-                    String::new()
-                } else {
-                    format!("{}/", me.mount.prefix.trim_matches('/'))
-                };
-                let candidate = if p.full_path.is_empty() {
-                    format!("{prefix}{name}")
-                } else {
-                    format!("{prefix}{}/{name}", p.full_path)
-                };
-                drop(g);
-                match me
-                    .blob
-                    .get_blob_properties(&me.mount.account, &me.mount.container, &candidate)
-                    .await
-                {
-                    Ok(info) => {
-                        let mut g = me.inner.write().await;
-                        me.upsert_file(
-                            &mut g,
-                            parent,
-                            &name,
-                            &candidate,
-                            info.content_length,
-                            info.etag,
-                            SystemTime::now(),
-                        );
-                        let ino = g.by_parent_name[&(parent, name.clone())];
-                        let n = g.by_ino[&ino].clone();
-                        let attr = BlobFs::attr_for(&n, uid, gid);
+                let g = me.inner.read().await;
+                if let Some(&ino) = g.by_parent_name.get(&(parent, name.clone())) {
+                    if let Some(n) = g.by_ino.get(&ino) {
+                        let attr = BlobFs::attr_for(n, uid, gid);
                         reply.entry(&TTL, &attr, 0);
+                        return;
                     }
-                    Err(_) => reply.error(ENOENT),
                 }
-            } else {
-                reply.error(ENOENT);
-            }
-        });
+                if let Some(p) = g.by_ino.get(&parent) {
+                    let prefix = if me.mount.prefix.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{}/", me.mount.prefix.trim_matches('/'))
+                    };
+                    let candidate = if p.full_path.is_empty() {
+                        format!("{prefix}{name}")
+                    } else {
+                        format!("{prefix}{}/{name}", p.full_path)
+                    };
+                    drop(g);
+                    match me
+                        .blob
+                        .get_blob_properties(&me.mount.account, &me.mount.container, &candidate)
+                        .await
+                    {
+                        Ok(info) => {
+                            let mut g = me.inner.write().await;
+                            me.upsert_file(
+                                &mut g,
+                                parent,
+                                &name,
+                                &candidate,
+                                info.content_length,
+                                info.etag,
+                                SystemTime::now(),
+                            );
+                            let ino = g.by_parent_name[&(parent, name.clone())];
+                            let n = g.by_ino[&ino].clone();
+                            let attr = BlobFs::attr_for(&n, uid, gid);
+                            reply.entry(&TTL, &attr, 0);
+                        }
+                        Err(_) => reply.error(ENOENT),
+                    }
+                } else {
+                    reply.error(ENOENT);
+                }
+            },
+            span,
+        ));
     }
 
     fn getattr(&mut self, req: &Request, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
         let me = self.clone_handles();
         let uid = req.uid();
         let gid = req.gid();
-        self.rt.spawn(async move {
-            let g = me.inner.read().await;
-            match g.by_ino.get(&ino) {
-                Some(n) => {
-                    let attr = BlobFs::attr_for(n, uid, gid);
-                    reply.attr(&TTL, &attr);
+        let rid = crate::request_id::RequestId::new();
+        let span = tracing::debug_span!(
+            "fuse_getattr",
+            rid = %rid,
+            mount = %me.mount.name,
+            ino = ino,
+        );
+        self.rt.spawn(tracing::Instrument::instrument(
+            async move {
+                let g = me.inner.read().await;
+                match g.by_ino.get(&ino) {
+                    Some(n) => {
+                        let attr = BlobFs::attr_for(n, uid, gid);
+                        reply.attr(&TTL, &attr);
+                    }
+                    None => reply.error(ENOENT),
                 }
-                None => reply.error(ENOENT),
-            }
-        });
+            },
+            span,
+        ));
     }
 
     fn read(
@@ -553,34 +574,47 @@ impl Filesystem for BlobFs {
         mut reply: ReplyDirectory,
     ) {
         let me = self.clone_handles();
-        self.rt.spawn(async move {
-            if let Err(e) = me.ensure_dir_listed(ino).await {
-                reply.error(e);
-                return;
-            }
-            let g = me.inner.read().await;
-            let mut entries: Vec<(u64, FileType, String)> = Vec::new();
-            entries.push((ino, FileType::Directory, ".".into()));
-            let parent_ino = g.by_ino.get(&ino).map(|n| n.parent).unwrap_or(ROOT_INO);
-            entries.push((parent_ino, FileType::Directory, "..".into()));
-            if let Some(kids) = g.children.get(&ino) {
-                for &k in kids {
-                    if let Some(n) = g.by_ino.get(&k) {
-                        let kind = match n.kind {
-                            NodeKind::Dir { .. } => FileType::Directory,
-                            NodeKind::File { .. } => FileType::RegularFile,
-                        };
-                        entries.push((k, kind, n.name.clone()));
+        let rid = crate::request_id::RequestId::new();
+        let span = tracing::debug_span!(
+            "fuse_readdir",
+            rid = %rid,
+            mount = %me.mount.name,
+            ino = ino,
+            offset = offset,
+        );
+        self.rt.spawn(tracing::Instrument::instrument(
+            async move {
+                if let Err(e) = me.ensure_dir_listed(ino).await {
+                    reply.error(e);
+                    return;
+                }
+                let g = me.inner.read().await;
+                let mut entries: Vec<(u64, FileType, String)> = Vec::new();
+                entries.push((ino, FileType::Directory, ".".into()));
+                let parent_ino = g.by_ino.get(&ino).map(|n| n.parent).unwrap_or(ROOT_INO);
+                entries.push((parent_ino, FileType::Directory, "..".into()));
+                if let Some(kids) = g.children.get(&ino) {
+                    for &k in kids {
+                        if let Some(n) = g.by_ino.get(&k) {
+                            let kind = match n.kind {
+                                NodeKind::Dir { .. } => FileType::Directory,
+                                NodeKind::File { .. } => FileType::RegularFile,
+                            };
+                            entries.push((k, kind, n.name.clone()));
+                        }
                     }
                 }
-            }
-            for (i, (e_ino, kind, name)) in entries.into_iter().enumerate().skip(offset as usize) {
-                if reply.add(e_ino, (i + 1) as i64, kind, &name) {
-                    break;
+                for (i, (e_ino, kind, name)) in
+                    entries.into_iter().enumerate().skip(offset as usize)
+                {
+                    if reply.add(e_ino, (i + 1) as i64, kind, &name) {
+                        break;
+                    }
                 }
-            }
-            reply.ok();
-        });
+                reply.ok();
+            },
+            span,
+        ));
     }
 }
 

@@ -210,6 +210,13 @@ pub async fn run_shard(
     fetcher: Arc<Fetcher>,
     mounts: Arc<HashMap<String, MountConfig>>,
 ) -> HydrateShardResponse {
+    let rid = crate::request_id::RequestId::new();
+    let span = tracing::info_span!(
+        "hydrate_shard",
+        rid = %rid,
+        mount = %req.mount,
+    );
+    let _g = span.enter();
     let t0 = Instant::now();
     let start_unix_ms = now_unix_ms();
     let mount = match mounts.get(&req.mount) {
@@ -297,6 +304,14 @@ pub async fn run_coordinator(
     me_transport_url: String,
     http: reqwest::Client,
 ) -> Result<HydrateResponse> {
+    let rid = crate::request_id::RequestId::new();
+    let span = tracing::info_span!(
+        "hydrate_coordinator",
+        rid = %rid,
+        mount = %req.mount,
+        path = %req.path,
+    );
+    let _g = span.enter();
     let t0 = Instant::now();
     let mode = hydrate_mode(req.mode);
     tracing::info!(
@@ -864,6 +879,13 @@ pub async fn run_broadcast_shard(
     fetcher: Arc<Fetcher>,
     mounts: Arc<HashMap<String, MountConfig>>,
 ) -> HydrateBroadcastShardResponse {
+    let rid = crate::request_id::RequestId::new();
+    let span = tracing::info_span!(
+        "hydrate_broadcast_shard",
+        rid = %rid,
+        mount = %req.mount,
+    );
+    let _g = span.enter();
     let t0 = Instant::now();
     let start_unix_ms = now_unix_ms();
     let mount = match mounts.get(&req.mount) {
@@ -1261,6 +1283,14 @@ pub async fn run_ring_step(
     fetcher: Arc<Fetcher>,
     mounts: Arc<HashMap<String, MountConfig>>,
 ) -> HydrateRingStepResponse {
+    let rid = crate::request_id::RequestId::new();
+    let span = tracing::info_span!(
+        "hydrate_ring_step",
+        rid = %rid,
+        mount = %req.mount,
+        step = req.step,
+    );
+    let _g = span.enter();
     let start_unix_ms = now_unix_ms();
     let pulls_t0 = Instant::now();
     let mount = match mounts.get(&req.mount) {
