@@ -1039,11 +1039,6 @@ impl Fetcher {
         std::mem::take(&mut *g)
     }
 
-    #[allow(dead_code)]
-    pub fn insert_received_chunk(self: &Arc<Self>, key: ChunkKey, data: Bytes) {
-        self.spawn_insert(key, data);
-    }
-
     /// Drain any in-flight insert tasks, drop the on-disk cache, and reset
     /// the in-memory fetcher state (singleflight inflight map, prefetch
     /// sequential-read tracker) so subsequent reads start cold. Bumps the

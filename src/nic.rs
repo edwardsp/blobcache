@@ -1,7 +1,6 @@
 use pnet_datalink as nic;
 use std::net::IpAddr;
 
-#[allow(dead_code)]
 pub struct LocalAddr {
     pub iface: String,
     pub ip: IpAddr,
@@ -33,7 +32,6 @@ pub fn enumerate(filter_loopback: bool) -> Vec<LocalAddr> {
     out
 }
 
-#[allow(dead_code)]
 pub fn is_likely_infiniband(name: &str) -> bool {
     name.starts_with("ib") || name.starts_with("ibp") || name.starts_with("ibs")
 }

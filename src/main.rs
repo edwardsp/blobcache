@@ -50,6 +50,15 @@ fn main() -> anyhow::Result<()> {
     let cfg = Config::from_path(&args.config).context("load config")?;
     tracing::info!(?cfg.cache.dir, "starting blobcached");
 
+    for d in crate::nic::enumerate(false) {
+        tracing::info!(
+            iface = %d.iface,
+            ip = %d.ip,
+            is_likely_infiniband = crate::nic::is_likely_infiniband(&d.iface),
+            "detected NIC"
+        );
+    }
+
     let main_worker_threads = cfg.azure.main_worker_threads;
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(main_worker_threads)

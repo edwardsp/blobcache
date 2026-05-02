@@ -90,11 +90,6 @@ impl BlobFetcherPool {
         self.view.clone()
     }
 
-    #[allow(dead_code)]
-    pub fn blob_for(&self, mount: &str) -> Option<Arc<BlobClient>> {
-        self.view.get(mount).cloned()
-    }
-
     /// Round-robin GET. Picks the next worker, dispatches the GET on
     /// that worker's runtime (so the request is driven by that runtime's
     /// reactor + reqwest pool), and awaits the result on the caller's

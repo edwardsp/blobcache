@@ -83,6 +83,16 @@ static REQ_ID: AtomicU64 = AtomicU64::new(1);
 
 type SharedRuntimeState = Rc<RefCell<RuntimeState>>;
 
+/// # RecvSlab invariant
+///
+/// At all quiescent points (between checkout and return), the following holds:
+///   `permits.available_permits() + free.borrow().len() == n_slots`
+///
+/// This is maintained by always pairing operations:
+///   - checkout: acquire semaphore permit → pop from free list
+///   - return (SlabSlot::drop): push to free list → permit dropped (adds back)
+///
+/// A `debug_assert_eq!` in both paths enforces this at runtime in debug builds.
 struct RecvSlab {
     backing: Box<[u8]>,
     slot_size: usize,
@@ -150,16 +160,24 @@ impl RecvSlab {
     }
 
     async fn checkout(self: &Rc<Self>) -> Result<SlabSlot> {
+        debug_assert_eq!(
+            self.permits.available_permits(),
+            self.free.borrow().len(),
+            "RecvSlab invariant violated before checkout"
+        );
         let permit = self
             .permits
             .clone()
             .acquire_owned()
             .await
             .map_err(|_| BcError::Peer("RecvSlab semaphore closed".into()))?;
-        let idx =
-            self.free.borrow_mut().pop().ok_or_else(|| {
-                BcError::Peer("RecvSlab free list empty (semaphore desync)".into())
-            })?;
+        let mut free = self.free.try_borrow_mut().map_err(|_| {
+            BcError::Peer("RecvSlab borrow contention (bug); see opus-eval-8".into())
+        })?;
+        let idx = free
+            .pop()
+            .ok_or_else(|| BcError::Peer("RecvSlab free list empty (semaphore desync)".into()))?;
+        drop(free);
         Ok(SlabSlot {
             slab: self.clone(),
             idx,
@@ -194,6 +212,11 @@ impl SlabSlot {
 impl Drop for SlabSlot {
     fn drop(&mut self) {
         self.slab.free.borrow_mut().push(self.idx);
+        debug_assert_eq!(
+            self.slab.free.borrow().len(),
+            self.slab.permits.available_permits() + 1,
+            "RecvSlab invariant violated after slot return (permit not yet released)"
+        );
     }
 }
 
