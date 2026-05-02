@@ -8,6 +8,7 @@ pub mod config;
 pub mod error;
 pub mod fetcher;
 pub mod fuse_fs;
+pub mod http_util;
 pub mod hydrate;
 pub mod hydrate_jobs;
 pub mod nic;

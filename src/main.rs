@@ -15,6 +15,7 @@ mod config;
 mod error;
 mod fetcher;
 mod fuse_fs;
+mod http_util;
 mod hydrate;
 mod hydrate_jobs;
 mod nic;

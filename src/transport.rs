@@ -164,10 +164,7 @@ impl PeerService {
                     .body(Full::new(b))
                     .unwrap()
             }
-            None => Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .body(Full::new(Bytes::from_static(b"miss")))
-                .unwrap(),
+            None => crate::http_util::error_response(StatusCode::NOT_FOUND, "miss"),
         };
         self.stats
             .server_handler_seconds
@@ -310,24 +307,14 @@ impl PeerClient {
 }
 
 fn json_ok(v: serde_json::Value) -> Response<Full<Bytes>> {
-    let body = serde_json::to_vec(&v).unwrap();
-    Response::builder()
-        .status(200)
-        .header("content-type", "application/json")
-        .body(Full::new(Bytes::from(body)))
-        .unwrap()
+    let body = serde_json::to_vec(&v).unwrap_or_default();
+    crate::http_util::ok_response(body)
 }
 fn not_found() -> Response<Full<Bytes>> {
-    Response::builder()
-        .status(404)
-        .body(Full::new(Bytes::from_static(b"not found")))
-        .unwrap()
+    crate::http_util::error_response(StatusCode::NOT_FOUND, "not found")
 }
 fn bad_request(why: &str) -> Response<Full<Bytes>> {
-    Response::builder()
-        .status(400)
-        .body(Full::new(Bytes::from(format!("bad: {why}"))))
-        .unwrap()
+    crate::http_util::error_response(StatusCode::BAD_REQUEST, &format!("bad: {why}"))
 }
 
 fn hex32(b: &[u8; 32]) -> String {

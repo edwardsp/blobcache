@@ -330,8 +330,10 @@ impl GossipServer {
                             (&Method::POST, "/cluster/sync") => {
                                 let body = req.collect().await.map(|b| b.to_bytes()).unwrap_or_default();
                                 if body.len() > MAX_GOSSIP_BODY_BYTES {
-                                    return Ok::<_, Infallible>(Response::builder().status(413)
-                                        .body(Full::new(HBytes::from_static(b"too large"))).unwrap());
+                                    return Ok::<_, Infallible>(crate::http_util::error_response(
+                                        hyper::StatusCode::PAYLOAD_TOO_LARGE,
+                                        "too large",
+                                    ));
                                 }
                                 match serde_json::from_slice::<GossipPayload>(&body) {
                                     Ok(payload) => {
@@ -339,9 +341,10 @@ impl GossipServer {
                                         if payload.from.cluster_hash != me.me_template.cluster_hash {
                                             me.stats.config_mismatches.inc();
                                             tracing::warn!(peer=%from_id, "cluster_hash mismatch — refusing merge");
-                                            return Ok::<_, Infallible>(Response::builder().status(409)
-                                                .header("content-type", "application/json")
-                                                .body(Full::new(HBytes::from_static(b"{\"error\":\"cluster_hash mismatch\"}"))).unwrap());
+                                            return Ok::<_, Infallible>(crate::http_util::error_response(
+                                                hyper::StatusCode::CONFLICT,
+                                                "{\"error\":\"cluster_hash mismatch\"}",
+                                            ));
                                         }
                                         let mut all = payload.members;
                                         all.push(payload.from);
@@ -352,12 +355,12 @@ impl GossipServer {
                                             members: me.members_all(),
                                         };
                                         let body = serde_json::to_vec(&response_payload).unwrap();
-                                        Response::builder().status(200)
-                                            .header("content-type", "application/json")
-                                            .body(Full::new(HBytes::from(body))).unwrap()
+                                        crate::http_util::ok_response(body)
                                     }
-                                    Err(e) => Response::builder().status(400)
-                                        .body(Full::new(HBytes::from(format!("bad: {e}")))).unwrap(),
+                                    Err(e) => crate::http_util::error_response(
+                                        hyper::StatusCode::BAD_REQUEST,
+                                        &format!("bad: {e}"),
+                                    ),
                                 }
                             }
                             (&Method::GET, "/cluster/bloom") => match &pi {
@@ -368,10 +371,9 @@ impl GossipServer {
                                         .header("x-blobcache-bloom-version", v.to_string())
                                         .body(Full::new(HBytes::from(body))).unwrap()
                                 }
-                                None => Response::builder().status(404)
-                                    .body(Full::new(HBytes::new())).unwrap(),
+                                None => crate::http_util::empty_response(hyper::StatusCode::NOT_FOUND),
                             }
-                            _ => Response::builder().status(404).body(Full::new(HBytes::new())).unwrap(),
+                            _ => crate::http_util::empty_response(hyper::StatusCode::NOT_FOUND),
                         };
                         Ok::<_, Infallible>(resp)
                     }

@@ -568,6 +568,7 @@ pub async fn serve(
     use bytes::Bytes;
     use http_body_util::{BodyExt, Full};
     use hyper::body::Incoming;
+    use hyper::http::StatusCode;
     use hyper::server::conn::http1;
     use hyper::service::service_fn;
     use hyper::{Method, Request, Response};
@@ -669,27 +670,18 @@ pub async fn serve(
                                         },
                                     });
                                     let body = serde_json::to_vec(&v).unwrap();
-                                    Response::builder()
-                                        .status(200)
-                                        .header("content-type", "application/json")
-                                        .body(Full::new(Bytes::from(body)))
-                                        .unwrap()
+                                    crate::http_util::ok_response(body)
                                 }
                                 (&Method::GET, "/peers") => {
                                     let v =
                                         serde_json::json!({"members": membership.members_all()});
                                     let body = serde_json::to_vec(&v).unwrap();
-                                    Response::builder()
-                                        .status(200)
-                                        .header("content-type", "application/json")
-                                        .body(Full::new(Bytes::from(body)))
-                                        .unwrap()
+                                    crate::http_util::ok_response(body)
                                 }
-                                (&Method::GET, "/healthz") => Response::builder()
-                                    .status(200)
-                                    .header("content-type", "text/plain")
-                                    .body(Full::new(Bytes::from_static(b"ok\n")))
-                                    .unwrap(),
+                                (&Method::GET, "/healthz") => crate::http_util::text_response(
+                                    StatusCode::OK,
+                                    "ok\n",
+                                ),
                                 (&Method::GET, "/readyz") => {
                                     // Ready once we have at least one Alive
                                     // member (which includes self after gossip
@@ -705,17 +697,12 @@ pub async fn serve(
                                         })
                                         .count();
                                     if alive >= 1 {
-                                        Response::builder()
-                                            .status(200)
-                                            .header("content-type", "text/plain")
-                                            .body(Full::new(Bytes::from_static(b"ready\n")))
-                                            .unwrap()
+                                        crate::http_util::text_response(StatusCode::OK, "ready\n")
                                     } else {
-                                        Response::builder()
-                                            .status(503)
-                                            .header("content-type", "text/plain")
-                                            .body(Full::new(Bytes::from_static(b"joining\n")))
-                                            .unwrap()
+                                        crate::http_util::text_response(
+                                            StatusCode::SERVICE_UNAVAILABLE,
+                                            "joining\n",
+                                        )
                                     }
                                 }
                                 (&Method::POST, "/hydrate") => {
@@ -733,12 +720,10 @@ pub async fn serve(
                                         Ok(c) => c.to_bytes(),
                                         Err(e) => {
                                             return Ok::<_, Infallible>(
-                                                Response::builder()
-                                                    .status(400)
-                                                    .body(Full::new(Bytes::from(format!(
-                                                        "body read: {e}"
-                                                    ))))
-                                                    .unwrap(),
+                                                crate::http_util::error_response(
+                                                    StatusCode::BAD_REQUEST,
+                                                    &format!("body read: {e}"),
+                                                ),
                                             );
                                         }
                                     };
@@ -747,12 +732,10 @@ pub async fn serve(
                                             Ok(r) => r,
                                             Err(e) => {
                                                 return Ok::<_, Infallible>(
-                                                    Response::builder()
-                                                        .status(400)
-                                                        .body(Full::new(Bytes::from(format!(
-                                                            "json: {e}"
-                                                        ))))
-                                                        .unwrap(),
+                                                    crate::http_util::error_response(
+                                                        StatusCode::BAD_REQUEST,
+                                                        &format!("json: {e}"),
+                                                    ),
                                                 );
                                             }
                                         };
@@ -808,11 +791,7 @@ pub async fn serve(
                                             &serde_json::json!({"job_id": job_id}),
                                         )
                                         .unwrap();
-                                        Response::builder()
-                                            .status(202)
-                                            .header("content-type", "application/json")
-                                            .body(Full::new(Bytes::from(body)))
-                                            .unwrap()
+                                        crate::http_util::json_response(StatusCode::ACCEPTED, body)
                                     } else {
                                         match crate::hydrate::run_coordinator(
                                             hreq,
@@ -829,16 +808,12 @@ pub async fn serve(
                                         {
                                             Ok(r) => {
                                                 let body = serde_json::to_vec(&r).unwrap();
-                                                Response::builder()
-                                                    .status(200)
-                                                    .header("content-type", "application/json")
-                                                    .body(Full::new(Bytes::from(body)))
-                                                    .unwrap()
+                                                crate::http_util::ok_response(body)
                                             }
-                                            Err(e) => Response::builder()
-                                                .status(500)
-                                                .body(Full::new(Bytes::from(format!("{e}"))))
-                                                .unwrap(),
+                                            Err(e) => crate::http_util::error_response(
+                                                StatusCode::INTERNAL_SERVER_ERROR,
+                                                &format!("{e}"),
+                                            ),
                                         }
                                     }
                                 }
@@ -849,16 +824,12 @@ pub async fn serve(
                                     match hydrate_jobs.view(id) {
                                         Some(v) => {
                                             let body = serde_json::to_vec(&v).unwrap();
-                                            Response::builder()
-                                                .status(200)
-                                                .header("content-type", "application/json")
-                                                .body(Full::new(Bytes::from(body)))
-                                                .unwrap()
+                                            crate::http_util::ok_response(body)
                                         }
-                                        None => Response::builder()
-                                            .status(404)
-                                            .body(Full::new(Bytes::from("unknown job_id")))
-                                            .unwrap(),
+                                        None => crate::http_util::error_response(
+                                            StatusCode::NOT_FOUND,
+                                            "unknown job_id",
+                                        ),
                                     }
                                 }
                                 (&Method::POST, "/clear-cache") => {
@@ -872,38 +843,28 @@ pub async fn serve(
                                     {
                                         Ok(r) => {
                                             let body = serde_json::to_vec(&r).unwrap();
-                                            Response::builder()
-                                                .status(200)
-                                                .header("content-type", "application/json")
-                                                .body(Full::new(Bytes::from(body)))
-                                                .unwrap()
+                                            crate::http_util::ok_response(body)
                                         }
-                                        Err(e) => Response::builder()
-                                            .status(500)
-                                            .body(Full::new(Bytes::from(format!("{e}"))))
-                                            .unwrap(),
+                                        Err(e) => crate::http_util::error_response(
+                                            StatusCode::INTERNAL_SERVER_ERROR,
+                                            &format!("{e}"),
+                                        ),
                                     }
                                 }
                                 (&Method::POST, "/clear-cache-shard") => {
                                     let r = crate::clear::run_shard(fetcher.clone()).await;
                                     let body = serde_json::to_vec(&r).unwrap();
-                                    Response::builder()
-                                        .status(200)
-                                        .header("content-type", "application/json")
-                                        .body(Full::new(Bytes::from(body)))
-                                        .unwrap()
+                                    crate::http_util::ok_response(body)
                                 }
                                 (&Method::POST, "/hydrate-shard") => {
                                     let body = match req.into_body().collect().await {
                                         Ok(c) => c.to_bytes(),
                                         Err(e) => {
                                             return Ok::<_, Infallible>(
-                                                Response::builder()
-                                                    .status(400)
-                                                    .body(Full::new(Bytes::from(format!(
-                                                        "body read: {e}"
-                                                    ))))
-                                                    .unwrap(),
+                                                crate::http_util::error_response(
+                                                    StatusCode::BAD_REQUEST,
+                                                    &format!("body read: {e}"),
+                                                ),
                                             );
                                         }
                                     };
@@ -912,12 +873,10 @@ pub async fn serve(
                                             Ok(r) => r,
                                             Err(e) => {
                                                 return Ok::<_, Infallible>(
-                                                    Response::builder()
-                                                        .status(400)
-                                                        .body(Full::new(Bytes::from(format!(
-                                                            "json: {e}"
-                                                        ))))
-                                                        .unwrap(),
+                                                    crate::http_util::error_response(
+                                                        StatusCode::BAD_REQUEST,
+                                                        &format!("json: {e}"),
+                                                    ),
                                                 );
                                             }
                                         };
@@ -928,23 +887,17 @@ pub async fn serve(
                                     )
                                     .await;
                                     let body = serde_json::to_vec(&r).unwrap();
-                                    Response::builder()
-                                        .status(200)
-                                        .header("content-type", "application/json")
-                                        .body(Full::new(Bytes::from(body)))
-                                        .unwrap()
+                                     crate::http_util::ok_response(body)
                                 }
                                 (&Method::POST, "/hydrate-broadcast-shard") => {
                                     let body = match req.into_body().collect().await {
                                         Ok(c) => c.to_bytes(),
                                         Err(e) => {
                                             return Ok::<_, Infallible>(
-                                                Response::builder()
-                                                    .status(400)
-                                                    .body(Full::new(Bytes::from(format!(
-                                                        "body read: {e}"
-                                                    ))))
-                                                    .unwrap(),
+                                                crate::http_util::error_response(
+                                                    StatusCode::BAD_REQUEST,
+                                                    &format!("body read: {e}"),
+                                                ),
                                             );
                                         }
                                     };
@@ -953,12 +906,10 @@ pub async fn serve(
                                             Ok(r) => r,
                                             Err(e) => {
                                                 return Ok::<_, Infallible>(
-                                                    Response::builder()
-                                                        .status(400)
-                                                        .body(Full::new(Bytes::from(format!(
-                                                            "json: {e}"
-                                                        ))))
-                                                        .unwrap(),
+                                                    crate::http_util::error_response(
+                                                        StatusCode::BAD_REQUEST,
+                                                        &format!("json: {e}"),
+                                                    ),
                                                 );
                                             }
                                         };
@@ -969,23 +920,17 @@ pub async fn serve(
                                     )
                                     .await;
                                     let body = serde_json::to_vec(&r).unwrap();
-                                    Response::builder()
-                                        .status(200)
-                                        .header("content-type", "application/json")
-                                        .body(Full::new(Bytes::from(body)))
-                                        .unwrap()
+                                    crate::http_util::ok_response(body)
                                 }
                                 (&Method::POST, "/hydrate-ring-step") => {
                                     let body = match req.into_body().collect().await {
                                         Ok(c) => c.to_bytes(),
                                         Err(e) => {
                                             return Ok::<_, Infallible>(
-                                                Response::builder()
-                                                    .status(400)
-                                                    .body(Full::new(Bytes::from(format!(
-                                                        "body read: {e}"
-                                                    ))))
-                                                    .unwrap(),
+                                                crate::http_util::error_response(
+                                                    StatusCode::BAD_REQUEST,
+                                                    &format!("body read: {e}"),
+                                                ),
                                             );
                                         }
                                     };
@@ -994,12 +939,10 @@ pub async fn serve(
                                             Ok(r) => r,
                                             Err(e) => {
                                                 return Ok::<_, Infallible>(
-                                                    Response::builder()
-                                                        .status(400)
-                                                        .body(Full::new(Bytes::from(format!(
-                                                            "json: {e}"
-                                                        ))))
-                                                        .unwrap(),
+                                                    crate::http_util::error_response(
+                                                        StatusCode::BAD_REQUEST,
+                                                        &format!("json: {e}"),
+                                                    ),
                                                 );
                                             }
                                         };
@@ -1010,16 +953,9 @@ pub async fn serve(
                                     )
                                     .await;
                                     let body = serde_json::to_vec(&r).unwrap();
-                                    Response::builder()
-                                        .status(200)
-                                        .header("content-type", "application/json")
-                                        .body(Full::new(Bytes::from(body)))
-                                        .unwrap()
+                                    crate::http_util::ok_response(body)
                                 }
-                                _ => Response::builder()
-                                    .status(404)
-                                    .body(Full::new(Bytes::new()))
-                                    .unwrap(),
+                                _ => crate::http_util::empty_response(StatusCode::NOT_FOUND),
                             };
                             Ok::<_, Infallible>(resp)
                         }
