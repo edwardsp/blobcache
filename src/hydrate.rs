@@ -308,6 +308,7 @@ pub async fn run_coordinator(
     me_id: String,
     me_transport_url: String,
     http: reqwest::Client,
+    admin_token: Option<String>,
 ) -> Result<HydrateResponse> {
     let rid = crate::request_id::RequestId::new();
     let span = tracing::info_span!(
@@ -500,6 +501,7 @@ pub async fn run_coordinator(
                 .to_string();
             let endpoint = format!("http://{host}:7773/hydrate-shard");
             let http = http.clone();
+            let admin_token = admin_token.clone();
             handles.push(tokio::spawn(async move {
                 let body = HydrateShardRequest {
                     mount: mount_name,
@@ -507,12 +509,12 @@ pub async fn run_coordinator(
                 };
                 let t0 = Instant::now();
                 let post_start_unix_ms = now_unix_ms();
-                let resp = http
-                    .post(&endpoint)
-                    .json(&body)
-                    .timeout(shard_timeout)
-                    .send()
-                    .await;
+                let mut builder = http.post(&endpoint).json(&body).timeout(shard_timeout);
+                if let Some(ref tok) = admin_token {
+                    builder =
+                        builder.header(reqwest::header::AUTHORIZATION, format!("Bearer {tok}"));
+                }
+                let resp = builder.send().await;
                 match resp {
                     Ok(r) => match r.json::<HydrateShardResponse>().await {
                         Ok(s) => PerPeerStats {
@@ -623,6 +625,7 @@ pub async fn run_coordinator(
             mounts.clone(),
             http.clone(),
             global_timeout,
+            admin_token.clone(),
         )
         .await;
         phase_b_elapsed_ms = Some(phase_b_t0.elapsed().as_millis() as u64);
@@ -660,6 +663,7 @@ pub async fn run_coordinator(
             mounts.clone(),
             http.clone(),
             global_timeout,
+            admin_token.clone(),
         )
         .await;
         broadcast_peers = peers_out;
@@ -736,6 +740,7 @@ async fn run_broadcast_phase(
     mounts: Arc<HashMap<String, MountConfig>>,
     http: reqwest::Client,
     global_timeout: std::time::Duration,
+    admin_token: Option<String>,
 ) -> Vec<PerPeerStats> {
     let shard_timeout = global_timeout
         .checked_sub(COORD_TO_SHARD_SAFETY_MARGIN)
@@ -780,15 +785,21 @@ async fn run_broadcast_phase(
                 .to_string();
             let endpoint = format!("http://{host}:7773/hydrate-broadcast-shard");
             let http = http.clone();
+            let admin_token = admin_token.clone();
             handles.push(tokio::spawn(async move {
                 let t0 = Instant::now();
                 let post_start_unix_ms = now_unix_ms();
-                let resp = http
+                let mut builder = http
                     .post(&endpoint)
                     .json(&body)
-                    .timeout(shard_timeout)
-                    .send()
-                    .await;
+                    .timeout(shard_timeout);
+                if let Some(ref tok) = admin_token {
+                    builder = builder.header(
+                        reqwest::header::AUTHORIZATION,
+                        format!("Bearer {tok}"),
+                    );
+                }
+                let resp = builder.send().await;
                 match resp {
                     Ok(r) => match r.json::<HydrateBroadcastShardResponse>().await {
                         Ok(s) => {
@@ -1084,6 +1095,7 @@ async fn run_ring_phase(
     mounts: Arc<HashMap<String, MountConfig>>,
     http: reqwest::Client,
     global_timeout: std::time::Duration,
+    admin_token: Option<String>,
 ) -> (Vec<PerPeerStats>, Vec<RingStepStat>) {
     let _ = me_transport_url;
     let shard_timeout = global_timeout
@@ -1161,14 +1173,15 @@ async fn run_ring_phase(
                     .to_string();
                 let endpoint = format!("http://{host}:7773/hydrate-ring-step");
                 let http = http.clone();
+                let admin_token = admin_token.clone();
                 handles.push(tokio::spawn(async move {
                     let post_t0 = now_unix_ms();
-                    let resp = http
-                        .post(&endpoint)
-                        .json(&body)
-                        .timeout(shard_timeout)
-                        .send()
-                        .await;
+                    let mut builder = http.post(&endpoint).json(&body).timeout(shard_timeout);
+                    if let Some(ref tok) = admin_token {
+                        builder =
+                            builder.header(reqwest::header::AUTHORIZATION, format!("Bearer {tok}"));
+                    }
+                    let resp = builder.send().await;
                     let r = match resp {
                         Ok(r) => match r.json::<HydrateRingStepResponse>().await {
                             Ok(s) => s,

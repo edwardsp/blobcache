@@ -597,6 +597,28 @@ impl Stats {
 // should be split into per-route handler functions to improve testability
 // and allow middleware insertion.  Deferred: zero behavioural change but
 // high churn; tracked in opus_code_eval_actions.md row 18.
+#[allow(clippy::result_large_err)]
+fn check_admin_auth(
+    headers: &hyper::HeaderMap,
+    expected: Option<&str>,
+) -> Result<(), hyper::Response<crate::http_util::Body>> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let actual = headers
+        .get(hyper::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "));
+    if actual == Some(expected) {
+        Ok(())
+    } else {
+        Err(crate::http_util::error_response(
+            hyper::http::StatusCode::UNAUTHORIZED,
+            "missing or invalid bearer token",
+        ))
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn serve(
     stats: Arc<Stats>,
@@ -609,6 +631,7 @@ pub async fn serve(
     chunk_size: u64,
     me_id: String,
     me_transport_url: String,
+    admin_token: Option<String>,
 ) -> crate::error::Result<()> {
     use bytes::Bytes;
     use http_body_util::{BodyExt, Full};
@@ -643,6 +666,7 @@ pub async fn serve(
         let me_url = me_transport_url.clone();
         let hydrate_http = hydrate_http.clone();
         let hydrate_jobs = hydrate_jobs.clone();
+        let admin_token = admin_token.clone();
         tokio::spawn(async move {
             let io = TokioIo::new(stream);
             let _ = http1::Builder::new()
@@ -659,6 +683,7 @@ pub async fn serve(
                         let me_url = me_url.clone();
                         let hydrate_http = hydrate_http.clone();
                         let hydrate_jobs = hydrate_jobs.clone();
+                        let admin_token = admin_token.clone();
                         async move {
                             let resp = match (req.method(), req.uri().path()) {
                                 (&Method::GET, "/metrics") => {
@@ -764,6 +789,9 @@ pub async fn serve(
                                     }
                                 }
                                 (&Method::POST, "/hydrate") => {
+                                    if let Err(e) = check_admin_auth(req.headers(), admin_token.as_deref()) {
+                                        e
+                                    } else {
                                     let is_async = req
                                         .uri()
                                         .query()
@@ -799,32 +827,34 @@ pub async fn serve(
                                         };
                                     if is_async {
                                         let (job_id, state) = hydrate_jobs.create();
-                                        let fetcher_c = fetcher.clone();
-                                        let blobs_c = blobs.clone();
-                                        let mounts_c = mounts.clone();
-                                        let membership_c = membership.clone();
-                                        let me_id_c = me_id.clone();
-                                        let me_url_c = me_url.clone();
-                                        let http_c = hydrate_http.clone();
-                                        let job_id_log = job_id.clone();
-                                        tokio::spawn(async move {
-                                            {
-                                                let mut g = state.lock();
-                                                g.status =
-                                                    crate::hydrate_jobs::JobStatus::Running;
-                                            }
-                                            let res = crate::hydrate::run_coordinator(
-                                                hreq,
-                                                chunk_size,
-                                                fetcher_c,
-                                                blobs_c,
-                                                mounts_c,
-                                                membership_c,
-                                                me_id_c,
-                                                me_url_c,
-                                                http_c,
-                                            )
-                                            .await;
+                                         let fetcher_c = fetcher.clone();
+                                         let blobs_c = blobs.clone();
+                                         let mounts_c = mounts.clone();
+                                         let membership_c = membership.clone();
+                                         let me_id_c = me_id.clone();
+                                         let me_url_c = me_url.clone();
+                                         let http_c = hydrate_http.clone();
+                                         let job_id_log = job_id.clone();
+                                         let admin_token_c = admin_token.clone();
+                                         tokio::spawn(async move {
+                                             {
+                                                 let mut g = state.lock();
+                                                 g.status =
+                                                     crate::hydrate_jobs::JobStatus::Running;
+                                             }
+                                             let res = crate::hydrate::run_coordinator(
+                                                 hreq,
+                                                 chunk_size,
+                                                 fetcher_c,
+                                                 blobs_c,
+                                                 mounts_c,
+                                                 membership_c,
+                                                 me_id_c,
+                                                 me_url_c,
+                                                 http_c,
+                                                 admin_token_c,
+                                             )
+                                             .await;
                                             let mut g = state.lock();
                                             g.finished_at = Some(std::time::Instant::now());
                                             match res {
@@ -850,18 +880,19 @@ pub async fn serve(
                                         )
                                         .unwrap();
                                         crate::http_util::json_response(StatusCode::ACCEPTED, body)
-                                    } else {
-                                        match crate::hydrate::run_coordinator(
-                                            hreq,
-                                            chunk_size,
-                                            fetcher.clone(),
-                                            blobs.clone(),
-                                            mounts.clone(),
-                                            membership.clone(),
-                                            me_id.clone(),
-                                            me_url.clone(),
-                                            hydrate_http.clone(),
-                                        )
+                                     } else {
+                                         match crate::hydrate::run_coordinator(
+                                             hreq,
+                                             chunk_size,
+                                             fetcher.clone(),
+                                             blobs.clone(),
+                                             mounts.clone(),
+                                             membership.clone(),
+                                             me_id.clone(),
+                                             me_url.clone(),
+                                             hydrate_http.clone(),
+                                             admin_token.clone(),
+                                         )
                                         .await
                                         {
                                             Ok(r) => {
@@ -872,10 +903,11 @@ pub async fn serve(
                                                 StatusCode::INTERNAL_SERVER_ERROR,
                                                 &format!("{e}"),
                                             ),
-                                        }
-                                    }
-                                }
-                                (&Method::GET, p)
+                                         }
+                                     }
+                                     }
+                                 }
+                                 (&Method::GET, p)
                                     if p.starts_with("/hydrate/") && p.len() > 9 =>
                                 {
                                     let id = &p[9..];
@@ -891,11 +923,15 @@ pub async fn serve(
                                     }
                                 }
                                 (&Method::POST, "/clear-cache") => {
+                                    if let Err(e) = check_admin_auth(req.headers(), admin_token.as_deref()) {
+                                        e
+                                    } else {
                                     match crate::clear::run_coordinator(
                                         fetcher.clone(),
                                         membership.clone(),
                                         me_id.clone(),
                                         hydrate_http.clone(),
+                                        admin_token.clone(),
                                     )
                                     .await
                                     {
@@ -908,13 +944,21 @@ pub async fn serve(
                                             &format!("{e}"),
                                         ),
                                     }
+                                    }
                                 }
                                 (&Method::POST, "/clear-cache-shard") => {
+                                    if let Err(e) = check_admin_auth(req.headers(), admin_token.as_deref()) {
+                                        e
+                                    } else {
                                     let r = crate::clear::run_shard(fetcher.clone()).await;
                                     let body = serde_json::to_vec(&r).unwrap();
                                     crate::http_util::ok_response(body)
+                                    }
                                 }
                                 (&Method::POST, "/hydrate-shard") => {
+                                    if let Err(e) = check_admin_auth(req.headers(), admin_token.as_deref()) {
+                                        e
+                                    } else {
                                     let body = match req.into_body().collect().await {
                                         Ok(c) => c.to_bytes(),
                                         Err(e) => {
@@ -946,8 +990,12 @@ pub async fn serve(
                                     .await;
                                     let body = serde_json::to_vec(&r).unwrap();
                                      crate::http_util::ok_response(body)
+                                    }
                                 }
                                 (&Method::POST, "/hydrate-broadcast-shard") => {
+                                    if let Err(e) = check_admin_auth(req.headers(), admin_token.as_deref()) {
+                                        e
+                                    } else {
                                     let body = match req.into_body().collect().await {
                                         Ok(c) => c.to_bytes(),
                                         Err(e) => {
@@ -979,8 +1027,12 @@ pub async fn serve(
                                     .await;
                                     let body = serde_json::to_vec(&r).unwrap();
                                     crate::http_util::ok_response(body)
+                                    }
                                 }
                                 (&Method::POST, "/hydrate-ring-step") => {
+                                    if let Err(e) = check_admin_auth(req.headers(), admin_token.as_deref()) {
+                                        e
+                                    } else {
                                     let body = match req.into_body().collect().await {
                                         Ok(c) => c.to_bytes(),
                                         Err(e) => {
@@ -1012,8 +1064,9 @@ pub async fn serve(
                                     .await;
                                     let body = serde_json::to_vec(&r).unwrap();
                                     crate::http_util::ok_response(body)
+                                    }
                                 }
-                                _ => crate::http_util::empty_response(StatusCode::NOT_FOUND),
+                                 _ => crate::http_util::empty_response(StatusCode::NOT_FOUND),
                             };
                             Ok::<_, Infallible>(resp)
                         }
@@ -1021,5 +1074,38 @@ pub async fn serve(
                 )
                 .await;
         });
+    }
+}
+
+#[cfg(test)]
+mod auth_tests {
+    use super::check_admin_auth;
+    use hyper::header::AUTHORIZATION;
+    use hyper::HeaderMap;
+
+    #[test]
+    fn no_token_configured_always_ok() {
+        let headers = HeaderMap::new();
+        assert!(check_admin_auth(&headers, None).is_ok());
+    }
+
+    #[test]
+    fn token_configured_missing_header_rejected() {
+        let headers = HeaderMap::new();
+        assert!(check_admin_auth(&headers, Some("secret")).is_err());
+    }
+
+    #[test]
+    fn token_configured_wrong_token_rejected() {
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, "Bearer wrong".parse().unwrap());
+        assert!(check_admin_auth(&headers, Some("secret")).is_err());
+    }
+
+    #[test]
+    fn token_configured_correct_token_ok() {
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, "Bearer secret".parse().unwrap());
+        assert!(check_admin_auth(&headers, Some("secret")).is_ok());
     }
 }

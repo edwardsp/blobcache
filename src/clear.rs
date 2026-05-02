@@ -72,6 +72,7 @@ pub async fn run_coordinator(
     membership: Membership,
     me_id: String,
     http: reqwest::Client,
+    admin_token: Option<String>,
 ) -> Result<ClearResponse> {
     let t0 = Instant::now();
     let mut targets: Vec<(String, Option<String>)> = vec![(me_id.clone(), None)];
@@ -115,15 +116,19 @@ pub async fn run_coordinator(
                 .to_string();
             let endpoint = format!("http://{host}:7773/clear-cache-shard");
             let http = http.clone();
+            let admin_token = admin_token.clone();
             handles.push(tokio::spawn(async move {
                 let t0 = Instant::now();
                 let post_start = now_unix_ms();
-                let resp = http
+                let mut builder = http
                     .post(&endpoint)
                     .json(&ClearRequest::default())
-                    .timeout(shard_timeout)
-                    .send()
-                    .await;
+                    .timeout(shard_timeout);
+                if let Some(ref tok) = admin_token {
+                    builder =
+                        builder.header(reqwest::header::AUTHORIZATION, format!("Bearer {tok}"));
+                }
+                let resp = builder.send().await;
                 match resp {
                     Ok(r) => match r.json::<ClearShardResponse>().await {
                         Ok(s) => PerPeerClear {

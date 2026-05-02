@@ -363,6 +363,7 @@ fn main() -> anyhow::Result<()> {
         cfg.cache.chunk_size,
         node_id.clone(),
         advertise.clone(),
+        cfg.admin.token.clone(),
     ));
 
     let handle = rt.handle().clone();

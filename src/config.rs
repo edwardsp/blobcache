@@ -14,7 +14,27 @@ pub struct Config {
     pub transport: TransportConfig,
     pub stats: StatsConfig,
     #[serde(default)]
+    pub admin: AdminConfig,
+    #[serde(default)]
     pub mounts: Vec<MountConfig>,
+}
+
+/// Optional authentication for destructive admin endpoints.
+///
+/// Action 5 from opus_code_eval: when `token` is set, all destructive POSTs
+/// (`/clear-cache`, `/clear-cache-shard`, `/hydrate`, `/hydrate-shard`,
+/// `/hydrate-broadcast-shard`, `/hydrate-ring-step`) require an
+/// `Authorization: Bearer <token>` header.  Read-only endpoints
+/// (`/metrics`, `/stats`, `/peers`) are never gated.
+/// Defaults to `None` (unauthenticated) for backward compatibility.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct AdminConfig {
+    /// Optional bearer token for destructive admin POST endpoints.
+    /// When unset (default), endpoints are unauthenticated.
+    /// When set, requests without a matching `Authorization: Bearer <token>`
+    /// header receive 401.  Inter-node calls include the token automatically.
+    #[serde(default)]
+    pub token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
