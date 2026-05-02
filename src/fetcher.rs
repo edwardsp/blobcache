@@ -1,5 +1,5 @@
 use base64::prelude::{Engine as _, BASE64_STANDARD};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use lru::LruCache;
 use parking_lot::Mutex;
@@ -1161,23 +1161,16 @@ impl Fetcher {
                 None => break,
             };
         }
-        let mut chunks = Vec::with_capacity(tasks.len());
+        let total_len = (end - offset) as usize;
+        let mut buf = BytesMut::zeroed(total_len);
         for t in tasks {
             let (co, data) = t
                 .await
                 .map_err(|e| BcError::Other(format!("join: {e}")))??;
-            chunks.push((co, data));
+            let chunk_start = (co - offset) as usize;
+            buf[chunk_start..chunk_start + data.len()].copy_from_slice(&data);
         }
-        chunks.sort_by_key(|(o, _)| *o);
-
-        if chunks.len() == 1 {
-            return Ok(chunks.into_iter().next().unwrap().1);
-        }
-        let mut out = Vec::with_capacity((end - offset) as usize);
-        for (_co, data) in chunks {
-            out.extend_from_slice(&data);
-        }
-        Ok(Bytes::from(out))
+        Ok(buf.freeze())
     }
 
     fn clone_handles(&self) -> Self {

@@ -45,7 +45,7 @@ Status legend:
 | # | Title | Resolution | Status |
 |---|---|---|---|
 | 21 | ~25 Hyper builder `unwrap()`s | **Fix**: helper `crate::http_util::ok_response` / `error_response` returning `Response<...>` with `.unwrap_or_else` fallback. | ✅ |
-| 22 | Inconsistent `tracing::Instrument` | **Fix**: span all FUSE entrypoints + all hydrate handlers with rid. | 🚧 |
+| 22 | Inconsistent `tracing::Instrument` | **Fix**: span all FUSE entrypoints + all hydrate handlers with rid. | ✅ |
 | 23 | `BloomVersion` saturating add | 📝 Document that `u64` overflow is multi-century at realistic insert rates; saturating semantics are intentional to never produce a 0 version (which is sentinel for "unknown"). | 📝 |
 | 24 | ~280 pedantic clippy warnings | 📝 Add `clippy.toml` raising `cast_*` thresholds; document policy in `AGENTS.md`. | ✅ |
 | 25 | `nic::enumerate` / `is_likely_infiniband` dead | **Wire**: emit detected IB devices via `info!` log on startup so operators see what was found; keeps the heuristic alive without auto-binding (which would change deploy behaviour). | ✅ |
