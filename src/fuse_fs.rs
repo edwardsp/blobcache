@@ -495,15 +495,27 @@ impl Filesystem for BlobFs {
         let me = self.clone_handles();
         let fuse_reads = self.fuse_reads.clone();
         let fuse_read_bytes = self.fuse_read_bytes.clone();
-        let rid = crate::request_id::RequestId::new();
-        let span = tracing::info_span!(
-            "fuse_read",
-            rid = %rid,
-            mount = %me.mount.name,
-            ino = ino,
-            offset = offset,
-            size = size,
-        );
+        // NOTE(opus-eval-22-perf): FUSE read() is the cluster's hot path
+        // (~2.6k calls/sec/pod with 256 KiB FUSE reads from `cat`).
+        // Eagerly allocating a UUID RequestId and an info-level span per
+        // read cost ~20s of PASS1 wall on a 17-pod, 413 GiB sweep
+        // (commit bd719a2 introduced this regression). Gate span + rid on
+        // DEBUG-level enabled to restore pre-bd719a2 hot-path cost while
+        // preserving rid-bearing correlation when DEBUG tracing is on.
+        let trace_on = tracing::enabled!(tracing::Level::DEBUG);
+        let rid_opt = trace_on.then(crate::request_id::RequestId::new);
+        let span = if let Some(rid) = rid_opt.as_ref() {
+            tracing::debug_span!(
+                "fuse_read",
+                rid = %rid,
+                mount = %me.mount.name,
+                ino = ino,
+                offset = offset,
+                size = size,
+            )
+        } else {
+            tracing::Span::none()
+        };
         self.rt.spawn(tracing::Instrument::instrument(
             async move {
                 let t_read = std::time::Instant::now();
@@ -537,7 +549,7 @@ impl Filesystem for BlobFs {
                         offset as u64,
                         length,
                         file_size,
-                        Some(&rid),
+                        rid_opt.as_ref(),
                     )
                     .await
                 {
