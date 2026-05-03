@@ -159,6 +159,25 @@ impl Drop for ChunkPermit {
     }
 }
 
+/// Copy `data` (the bytes of one chunk's contribution to a `fetch_range`
+/// result) into `buf` at the correct offset.
+///
+/// `request_offset` is the global file offset where `buf` starts.
+/// `chunk_global_offset` is the chunk-aligned global file offset of `data`'s
+/// source chunk. `data` itself may be a sub-slice of that chunk (when the
+/// request begins or ends mid-chunk), so the destination index is the byte
+/// position within the request, NOT `chunk_global_offset - request_offset`
+/// (which underflows when the request starts mid-chunk).
+fn assemble_chunk_into(
+    buf: &mut BytesMut,
+    request_offset: u64,
+    chunk_global_offset: u64,
+    data: &[u8],
+) {
+    let dst_start = (chunk_global_offset.max(request_offset) - request_offset) as usize;
+    buf[dst_start..dst_start + data.len()].copy_from_slice(data);
+}
+
 impl Fetcher {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -1167,8 +1186,7 @@ impl Fetcher {
             let (co, data) = t
                 .await
                 .map_err(|e| BcError::Other(format!("join: {e}")))??;
-            let chunk_start = (co - offset) as usize;
-            buf[chunk_start..chunk_start + data.len()].copy_from_slice(&data);
+            assemble_chunk_into(&mut buf, offset, co, &data);
         }
         Ok(buf.freeze())
     }
@@ -1413,5 +1431,51 @@ mod peer_lru_tests {
             "cap 0 means any non-empty value is oversized"
         );
         assert_eq!(lru.bytes, 0);
+    }
+}
+
+#[cfg(test)]
+mod assemble_chunk_tests {
+    use super::assemble_chunk_into;
+    use bytes::BytesMut;
+
+    const CS: u64 = 4 * 1024 * 1024;
+
+    #[test]
+    fn aligned_single_chunk_full() {
+        let mut buf = BytesMut::zeroed(CS as usize);
+        let data = vec![0xAB; CS as usize];
+        assemble_chunk_into(&mut buf, 0, 0, &data);
+        assert!(buf.iter().all(|&b| b == 0xAB));
+    }
+
+    #[test]
+    fn request_starts_mid_chunk() {
+        let req_off = 256 * 1024;
+        let req_len = 256 * 1024;
+        let mut buf = BytesMut::zeroed(req_len);
+        let data = vec![0xCD; req_len];
+        assemble_chunk_into(&mut buf, req_off, 0, &data);
+        assert!(buf.iter().all(|&b| b == 0xCD));
+    }
+
+    #[test]
+    fn request_spans_two_chunks() {
+        let req_off = CS - 1024;
+        let req_len = 2048;
+        let mut buf = BytesMut::zeroed(req_len);
+        assemble_chunk_into(&mut buf, req_off, 0, &vec![0x11; 1024]);
+        assemble_chunk_into(&mut buf, req_off, CS, &vec![0x22; 1024]);
+        assert!(buf[..1024].iter().all(|&b| b == 0x11));
+        assert!(buf[1024..].iter().all(|&b| b == 0x22));
+    }
+
+    #[test]
+    fn request_ends_mid_chunk() {
+        let req_off = 0;
+        let req_len = 1024;
+        let mut buf = BytesMut::zeroed(req_len);
+        assemble_chunk_into(&mut buf, req_off, 0, &vec![0xEE; req_len]);
+        assert!(buf.iter().all(|&b| b == 0xEE));
     }
 }
