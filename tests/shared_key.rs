@@ -23,10 +23,12 @@ fn sign_request_known_input_regression() {
     let key_b64 =
         "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
-    let sig = sign_request("acct", key_b64, "GET", &url, &headers, None);
+    let sig =
+        sign_request("acct", key_b64, "GET", &url, &headers, None).expect("sign_request failed");
 
     assert!(sig.starts_with("SharedKey acct:"), "header prefix");
-    let s1 = sign_request("acct", key_b64, "GET", &url, &headers, None);
+    let s1 =
+        sign_request("acct", key_b64, "GET", &url, &headers, None).expect("sign_request failed");
     assert_eq!(sig, s1, "deterministic for identical inputs");
 }
 
@@ -35,8 +37,8 @@ fn sign_request_changes_with_method() {
     let url = Url::parse("https://acct.blob.core.windows.net/c/b").unwrap();
     let headers = hm(&[("x-ms-date", "d")]);
     let k = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-    let g = sign_request("acct", k, "GET", &url, &headers, None);
-    let h = sign_request("acct", k, "HEAD", &url, &headers, None);
+    let g = sign_request("acct", k, "GET", &url, &headers, None).expect("sign_request failed");
+    let h = sign_request("acct", k, "HEAD", &url, &headers, None).expect("sign_request failed");
     assert_ne!(g, h);
 }
 
@@ -46,8 +48,8 @@ fn sign_request_changes_with_range_header() {
     let k = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
     let h1 = hm(&[("x-ms-date", "d")]);
     let h2 = hm(&[("x-ms-date", "d"), ("range", "bytes=0-1023")]);
-    let s1 = sign_request("acct", k, "GET", &url, &h1, None);
-    let s2 = sign_request("acct", k, "GET", &url, &h2, None);
+    let s1 = sign_request("acct", k, "GET", &url, &h1, None).expect("sign_request failed");
+    let s2 = sign_request("acct", k, "GET", &url, &h2, None).expect("sign_request failed");
     assert_ne!(s1, s2);
 }
 
@@ -57,8 +59,8 @@ fn sign_request_changes_with_xms_header_set() {
     let k = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
     let h1 = hm(&[("x-ms-date", "d"), ("x-ms-version", "2021-12-02")]);
     let h2 = hm(&[("x-ms-date", "d"), ("x-ms-version", "2020-04-08")]);
-    let s1 = sign_request("acct", k, "GET", &url, &h1, None);
-    let s2 = sign_request("acct", k, "GET", &url, &h2, None);
+    let s1 = sign_request("acct", k, "GET", &url, &h1, None).expect("sign_request failed");
+    let s2 = sign_request("acct", k, "GET", &url, &h2, None).expect("sign_request failed");
     assert_ne!(s1, s2);
 }
 
@@ -77,8 +79,8 @@ fn sign_request_xms_headers_canonicalised_in_sorted_order() {
         ("x-ms-date", "d"),
     ]);
     assert_eq!(
-        sign_request("acct", k, "GET", &url, &h_alpha, None),
-        sign_request("acct", k, "GET", &url, &h_beta, None),
+        sign_request("acct", k, "GET", &url, &h_alpha, None).expect("sign_request failed"),
+        sign_request("acct", k, "GET", &url, &h_beta, None).expect("sign_request failed"),
         "x-ms-* header insertion order must NOT affect signature; canonicalisation sorts them"
     );
 }
@@ -92,8 +94,8 @@ fn sign_request_query_params_canonicalised_in_sorted_order() {
     let u2 =
         Url::parse("https://acct.blob.core.windows.net/c/b?restype=container&comp=list").unwrap();
     assert_eq!(
-        sign_request("acct", k, "GET", &u1, &h, None),
-        sign_request("acct", k, "GET", &u2, &h, None),
+        sign_request("acct", k, "GET", &u1, &h, None).expect("sign_request failed"),
+        sign_request("acct", k, "GET", &u2, &h, None).expect("sign_request failed"),
         "query parameter order must NOT affect signature"
     );
 }
@@ -103,12 +105,12 @@ fn sign_request_content_length_zero_treated_as_empty() {
     let url = Url::parse("https://acct.blob.core.windows.net/c/b").unwrap();
     let k = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
     let h = hm(&[("x-ms-date", "d")]);
-    let s_zero = sign_request("acct", k, "GET", &url, &h, Some(0));
-    let s_none = sign_request("acct", k, "GET", &url, &h, None);
+    let s_zero = sign_request("acct", k, "GET", &url, &h, Some(0)).expect("sign_request failed");
+    let s_none = sign_request("acct", k, "GET", &url, &h, None).expect("sign_request failed");
     assert_eq!(
         s_zero, s_none,
         "Some(0) and None must produce the same signature (Azure spec: empty string for zero content-length)"
     );
-    let s_some = sign_request("acct", k, "GET", &url, &h, Some(1024));
+    let s_some = sign_request("acct", k, "GET", &url, &h, Some(1024)).expect("sign_request failed");
     assert_ne!(s_some, s_zero);
 }

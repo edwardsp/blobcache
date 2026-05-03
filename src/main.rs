@@ -15,6 +15,7 @@ mod config;
 mod error;
 mod fetcher;
 mod fuse_fs;
+mod http_util;
 mod hydrate;
 mod hydrate_jobs;
 mod nic;
@@ -49,6 +50,15 @@ fn main() -> anyhow::Result<()> {
 
     let cfg = Config::from_path(&args.config).context("load config")?;
     tracing::info!(?cfg.cache.dir, "starting blobcached");
+
+    for d in crate::nic::enumerate(false) {
+        tracing::info!(
+            iface = %d.iface,
+            ip = %d.ip,
+            is_likely_infiniband = crate::nic::is_likely_infiniband(&d.iface),
+            "detected NIC"
+        );
+    }
 
     let main_worker_threads = cfg.azure.main_worker_threads;
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -165,6 +175,24 @@ fn main() -> anyhow::Result<()> {
         state: NodeState::Alive,
         incarnation: 1,
         bloom_version: 0,
+        admin_url: Some({
+            let bind = &cfg.stats.bind;
+            if let Some((host, port)) = bind.rsplit_once(':') {
+                if host == "0.0.0.0" || host.is_empty() {
+                    let local = nic::enumerate(true)
+                        .into_iter()
+                        .find(|a| matches!(a.ip, std::net::IpAddr::V4(_)));
+                    match local {
+                        Some(a) => format!("http://{}:{}", a.ip, port),
+                        None => format!("http://127.0.0.1:{port}"),
+                    }
+                } else {
+                    format!("http://{bind}")
+                }
+            } else {
+                format!("http://{bind}")
+            }
+        }),
     };
     #[allow(unused_mut)]
     let mut membership = Membership::new(me, stats.cluster_stats.clone());
@@ -254,6 +282,7 @@ fn main() -> anyhow::Result<()> {
         cfg.transport.peer_max_maybe_attempts,
         cfg.transport.stampede_wait_ms,
         mounts.clone(),
+        cfg.transport.peer_concurrency,
     ));
 
     // ChunkProvider wraps Fetcher::serve_peer_chunk so the peer-service
@@ -352,6 +381,7 @@ fn main() -> anyhow::Result<()> {
         cfg.cache.chunk_size,
         node_id.clone(),
         advertise.clone(),
+        cfg.admin.token.clone(),
     ));
 
     let handle = rt.handle().clone();

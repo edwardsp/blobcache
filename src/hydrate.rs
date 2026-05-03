@@ -6,9 +6,21 @@
 // and updates its bloom). The result: aggregate bandwidth scales ~linearly
 // with cluster size, since every node pulls a different ~1/N of the data
 // in parallel from Azure.
+//
+//! NOTE(opus-eval-27): Planned split (deferred to a follow-up PR).
+//! This file (1478 LOC) mixes coordinator logic, per-phase orchestration,
+//! and wire types.  Proposed layout:
+//!   - `hydrate/coordinator.rs`  — top-level fan-out and result aggregation
+//!   - `hydrate/phases/shard.rs` — shard-mode phase
+//!   - `hydrate/phases/broadcast.rs` — broadcast-mode phase
+//!   - `hydrate/phases/ring.rs`  — ring-step phase
+//!   - `hydrate/wire.rs`         — request/response serde types
+//!
+//! Rationale for deferral: zero behavioural change, large diff (~600 LOC
+//! moved), would block unrelated PRs during review.
 
 use crate::azure::BlobClient;
-use crate::cluster::{Membership, NodeState};
+use crate::cluster::Membership;
 use crate::config::MountConfig;
 use crate::error::{BcError, Result};
 use crate::fetcher::Fetcher;
@@ -25,6 +37,11 @@ fn now_unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Safety margin subtracted from the coordinator timeout to derive the
+/// per-shard request timeout (Action 20 from opus_code_eval).  Fixed at 2 s
+/// because the dominant overhead is per-request HTTP roundtrip latency, not
+/// chunk-count-proportional work.
+const COORD_TO_SHARD_SAFETY_MARGIN: std::time::Duration = std::time::Duration::from_secs(2);
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChunkSpec {
     pub blob: String,
@@ -76,6 +93,9 @@ pub struct BroadcastSource {
     #[serde(default)]
     pub ucx_worker_addr_b64: Option<String>,
     pub chunks: Vec<ChunkSpec>,
+    /// Admin URL for coordinator→shard HTTP calls; `None` on older peers.
+    #[serde(default)]
+    pub admin_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -198,6 +218,13 @@ pub async fn run_shard(
     fetcher: Arc<Fetcher>,
     mounts: Arc<HashMap<String, MountConfig>>,
 ) -> HydrateShardResponse {
+    let rid = crate::request_id::RequestId::new();
+    let span = tracing::info_span!(
+        "hydrate_shard",
+        rid = %rid,
+        mount = %req.mount,
+    );
+    let _g = span.enter();
     let t0 = Instant::now();
     let start_unix_ms = now_unix_ms();
     let mount = match mounts.get(&req.mount) {
@@ -284,7 +311,16 @@ pub async fn run_coordinator(
     me_id: String,
     me_transport_url: String,
     http: reqwest::Client,
+    admin_token: Option<String>,
 ) -> Result<HydrateResponse> {
+    let rid = crate::request_id::RequestId::new();
+    let span = tracing::info_span!(
+        "hydrate_coordinator",
+        rid = %rid,
+        mount = %req.mount,
+        path = %req.path,
+    );
+    let _g = span.enter();
     let t0 = Instant::now();
     let mode = hydrate_mode(req.mode);
     tracing::info!(
@@ -374,21 +410,22 @@ pub async fn run_coordinator(
     // Each target is (node_id, Option<transport_url> -- None means self,
     // Option<ucx_worker_addr_b64>). Self goes first so chunk 0 lands locally
     // and uneven N-distribution is deterministic for benchmarking.
-    let alive_members = membership.members_all();
-    let me_worker_b64 = alive_members
-        .iter()
-        .find(|n| n.id == me_id)
-        .and_then(|n| n.ucx_worker_addr_b64.clone());
-    let mut targets: Vec<(String, Option<String>, Option<String>)> =
-        vec![(me_id.clone(), None, me_worker_b64.clone())];
+    //
+    // members_alive_same_cluster() excludes self, so we read the local UCX
+    // worker addr directly from me_template (Action 14 from opus_code_eval:
+    // the previous code used members_all() which included self by accident,
+    // and crossed cluster boundaries when multiple clusters shared gossip).
+    let alive_members = membership.members_alive_same_cluster();
+    let me_worker_b64 = membership.me_template.ucx_worker_addr_b64.clone();
+    let mut targets: Vec<(String, Option<String>, Option<String>, Option<String>)> =
+        vec![(me_id.clone(), None, me_worker_b64.clone(), None)];
     for n in &alive_members {
-        if matches!(n.state, NodeState::Alive) && n.id != me_id {
-            targets.push((
-                n.id.clone(),
-                Some(n.transport_url.clone()),
-                n.ucx_worker_addr_b64.clone(),
-            ));
-        }
+        targets.push((
+            n.id.clone(),
+            Some(n.transport_url.clone()),
+            n.ucx_worker_addr_b64.clone(),
+            Some(n.effective_admin_url()),
+        ));
     }
     let n_targets = targets.len();
     let mut buckets: Vec<Vec<ChunkSpec>> = (0..n_targets).map(|_| Vec::new()).collect();
@@ -402,23 +439,39 @@ pub async fn run_coordinator(
         .iter()
         .zip(buckets.iter())
         .map(
-            |((node_id, transport_url, worker_b64), chunks)| BroadcastSource {
+            |((node_id, transport_url, worker_b64, admin_url), chunks)| BroadcastSource {
                 node_id: node_id.clone(),
                 transport_url: transport_url
                     .clone()
                     .unwrap_or_else(|| me_transport_url.clone()),
                 ucx_worker_addr_b64: worker_b64.clone(),
                 chunks: chunks.clone(),
+                admin_url: admin_url.clone(),
             },
         )
         .collect();
 
+    // Action 20 from opus_code_eval: per-shard request timeout is derived from
+    // the coordinator timeout minus a 2s safety margin so a shard that runs
+    // to its full timeout still leaves the coordinator time to collect its
+    // error and respond cleanly, rather than aborting mid-collection.  The
+    // margin is fixed (not percentage-based) because the dominant cost is
+    // per-request HTTP roundtrip overhead, not chunk-count-proportional work.
+    let global_timeout_secs: u64 = std::env::var("BLOBCACHE_HYDRATE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3700);
+    let global_timeout = std::time::Duration::from_secs(global_timeout_secs);
+    let shard_timeout = global_timeout
+        .checked_sub(COORD_TO_SHARD_SAFETY_MARGIN)
+        .unwrap_or(global_timeout / 2);
+
     let phase_a_t0 = Instant::now();
     let mut handles = Vec::with_capacity(n_targets);
-    for ((node_id, transport_url, _), chunks) in targets.into_iter().zip(buckets) {
+    for ((node_id, transport_url, _, admin_url), chunks) in targets.into_iter().zip(buckets) {
         let assigned = chunks.len() as u64;
         let mount_name = req.mount.clone();
-        let Some(url) = transport_url else {
+        let Some(_transport_url) = transport_url else {
             let f = fetcher.clone();
             let m = mounts.clone();
             handles.push(tokio::spawn(async move {
@@ -445,14 +498,12 @@ pub async fn run_coordinator(
             continue;
         };
         {
-            let host = url
-                .trim_start_matches("http://")
-                .split(':')
-                .next()
-                .unwrap_or("")
-                .to_string();
-            let endpoint = format!("http://{host}:7773/hydrate-shard");
+            let endpoint = format!(
+                "{}/hydrate-shard",
+                admin_url.unwrap_or_default().trim_end_matches('/')
+            );
             let http = http.clone();
+            let admin_token = admin_token.clone();
             handles.push(tokio::spawn(async move {
                 let body = HydrateShardRequest {
                     mount: mount_name,
@@ -460,12 +511,12 @@ pub async fn run_coordinator(
                 };
                 let t0 = Instant::now();
                 let post_start_unix_ms = now_unix_ms();
-                let resp = http
-                    .post(&endpoint)
-                    .json(&body)
-                    .timeout(std::time::Duration::from_secs(3600))
-                    .send()
-                    .await;
+                let mut builder = http.post(&endpoint).json(&body).timeout(shard_timeout);
+                if let Some(ref tok) = admin_token {
+                    builder =
+                        builder.header(reqwest::header::AUTHORIZATION, format!("Bearer {tok}"));
+                }
+                let resp = builder.send().await;
                 match resp {
                     Ok(r) => match r.json::<HydrateShardResponse>().await {
                         Ok(s) => PerPeerStats {
@@ -505,11 +556,6 @@ pub async fn run_coordinator(
     }
 
     let mut peers = Vec::with_capacity(n_targets);
-    let global_timeout_secs: u64 = std::env::var("BLOBCACHE_HYDRATE_TIMEOUT_SECS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(3700);
-    let global_timeout = std::time::Duration::from_secs(global_timeout_secs);
     let abort_handles: Vec<_> = handles.iter().map(|h| h.abort_handle()).collect();
     let join_all = async {
         let mut out = Vec::with_capacity(n_targets);
@@ -542,7 +588,8 @@ pub async fn run_coordinator(
                 fetched: 0,
                 bytes: 0,
                 errors: vec![format!(
-                    "coordinator timeout after {global_timeout_secs}s; aborted outstanding shards"
+                    "coordinator timeout after {}s; aborted outstanding shards",
+                    global_timeout.as_secs()
                 )],
                 elapsed_ms: global_timeout.as_millis() as u64,
                 start_unix_ms: 0,
@@ -580,6 +627,7 @@ pub async fn run_coordinator(
             mounts.clone(),
             http.clone(),
             global_timeout,
+            admin_token.clone(),
         )
         .await;
         phase_b_elapsed_ms = Some(phase_b_t0.elapsed().as_millis() as u64);
@@ -617,6 +665,7 @@ pub async fn run_coordinator(
             mounts.clone(),
             http.clone(),
             global_timeout,
+            admin_token.clone(),
         )
         .await;
         broadcast_peers = peers_out;
@@ -693,12 +742,19 @@ async fn run_broadcast_phase(
     mounts: Arc<HashMap<String, MountConfig>>,
     http: reqwest::Client,
     global_timeout: std::time::Duration,
+    admin_token: Option<String>,
 ) -> Vec<PerPeerStats> {
+    let shard_timeout = global_timeout
+        .checked_sub(COORD_TO_SHARD_SAFETY_MARGIN)
+        .unwrap_or(global_timeout / 2);
     let n_targets = plan.len();
     let mut handles = Vec::with_capacity(n_targets);
     for receiver in plan.iter() {
         let receiver_id = receiver.node_id.clone();
-        let receiver_url = receiver.transport_url.clone();
+        let receiver_admin_url = receiver
+            .admin_url
+            .clone()
+            .unwrap_or_else(|| crate::cluster::port_substitute(&receiver.transport_url, 7773));
         let sources: Vec<BroadcastSource> = plan
             .iter()
             .filter(|s| s.node_id != receiver_id)
@@ -726,23 +782,26 @@ async fn run_broadcast_phase(
                 }
             }));
         } else {
-            let host = receiver_url
-                .trim_start_matches("http://")
-                .split(':')
-                .next()
-                .unwrap_or("")
-                .to_string();
-            let endpoint = format!("http://{host}:7773/hydrate-broadcast-shard");
+            let endpoint = format!(
+                "{}/hydrate-broadcast-shard",
+                receiver_admin_url.trim_end_matches('/')
+            );
             let http = http.clone();
+            let admin_token = admin_token.clone();
             handles.push(tokio::spawn(async move {
                 let t0 = Instant::now();
                 let post_start_unix_ms = now_unix_ms();
-                let resp = http
+                let mut builder = http
                     .post(&endpoint)
                     .json(&body)
-                    .timeout(std::time::Duration::from_secs(3600))
-                    .send()
-                    .await;
+                    .timeout(shard_timeout);
+                if let Some(ref tok) = admin_token {
+                    builder = builder.header(
+                        reqwest::header::AUTHORIZATION,
+                        format!("Bearer {tok}"),
+                    );
+                }
+                let resp = builder.send().await;
                 match resp {
                     Ok(r) => match r.json::<HydrateBroadcastShardResponse>().await {
                         Ok(s) => {
@@ -852,6 +911,13 @@ pub async fn run_broadcast_shard(
     fetcher: Arc<Fetcher>,
     mounts: Arc<HashMap<String, MountConfig>>,
 ) -> HydrateBroadcastShardResponse {
+    let rid = crate::request_id::RequestId::new();
+    let span = tracing::info_span!(
+        "hydrate_broadcast_shard",
+        rid = %rid,
+        mount = %req.mount,
+    );
+    let _g = span.enter();
     let t0 = Instant::now();
     let start_unix_ms = now_unix_ms();
     let mount = match mounts.get(&req.mount) {
@@ -1031,8 +1097,12 @@ async fn run_ring_phase(
     mounts: Arc<HashMap<String, MountConfig>>,
     http: reqwest::Client,
     global_timeout: std::time::Duration,
+    admin_token: Option<String>,
 ) -> (Vec<PerPeerStats>, Vec<RingStepStat>) {
     let _ = me_transport_url;
+    let shard_timeout = global_timeout
+        .checked_sub(COORD_TO_SHARD_SAFETY_MARGIN)
+        .unwrap_or(global_timeout / 2);
     let mut sorted_plan: Vec<BroadcastSource> = plan.to_vec();
     sorted_plan.sort_by(|a, b| a.node_id.cmp(&b.node_id));
     let world = sorted_plan.len();
@@ -1088,7 +1158,10 @@ async fn run_ring_phase(
                 chunks: source.chunks.clone(),
             };
             let receiver_id = receiver.node_id.clone();
-            let receiver_url = receiver.transport_url.clone();
+            let receiver_admin_url = receiver
+                .admin_url
+                .clone()
+                .unwrap_or_else(|| crate::cluster::port_substitute(&receiver.transport_url, 7773));
             if receiver_id == me_id {
                 let f = fetcher.clone();
                 let m = mounts.clone();
@@ -1097,22 +1170,20 @@ async fn run_ring_phase(
                     (receiver_id, r)
                 }));
             } else {
-                let host = receiver_url
-                    .trim_start_matches("http://")
-                    .split(':')
-                    .next()
-                    .unwrap_or("")
-                    .to_string();
-                let endpoint = format!("http://{host}:7773/hydrate-ring-step");
+                let endpoint = format!(
+                    "{}/hydrate-ring-step",
+                    receiver_admin_url.trim_end_matches('/')
+                );
                 let http = http.clone();
+                let admin_token = admin_token.clone();
                 handles.push(tokio::spawn(async move {
                     let post_t0 = now_unix_ms();
-                    let resp = http
-                        .post(&endpoint)
-                        .json(&body)
-                        .timeout(std::time::Duration::from_secs(1800))
-                        .send()
-                        .await;
+                    let mut builder = http.post(&endpoint).json(&body).timeout(shard_timeout);
+                    if let Some(ref tok) = admin_token {
+                        builder =
+                            builder.header(reqwest::header::AUTHORIZATION, format!("Bearer {tok}"));
+                    }
+                    let resp = builder.send().await;
                     let r = match resp {
                         Ok(r) => match r.json::<HydrateRingStepResponse>().await {
                             Ok(s) => s,
@@ -1249,6 +1320,14 @@ pub async fn run_ring_step(
     fetcher: Arc<Fetcher>,
     mounts: Arc<HashMap<String, MountConfig>>,
 ) -> HydrateRingStepResponse {
+    let rid = crate::request_id::RequestId::new();
+    let span = tracing::info_span!(
+        "hydrate_ring_step",
+        rid = %rid,
+        mount = %req.mount,
+        step = req.step,
+    );
+    let _g = span.enter();
     let start_unix_ms = now_unix_ms();
     let pulls_t0 = Instant::now();
     let mount = match mounts.get(&req.mount) {

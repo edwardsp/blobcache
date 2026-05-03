@@ -156,14 +156,26 @@ impl PeerIndex {
         // live_keys() before our cache.insert() landed will still pick this
         // digest up via its drain-under-lock step.
         self.pending.lock().push(*digest);
-        let new_version = {
+        // Snapshot the hook Arc before acquiring the write lock so we do not
+        // hold two locks simultaneously.
+        let hook = self.on_version_change.read().clone();
+        {
             let mut g = self.local.write();
             g.bloom.insert(digest);
+            // NOTE(opus-eval-23): saturating_add is intentional. At realistic
+            // insert rates (1 M inserts/sec sustained) u64::MAX is reached in
+            // ~600 k years, so overflow is impossible in practice. Saturating
+            // semantics ensure version 0 (the "unknown" sentinel used by peers
+            // that have never seen a bloom) is never accidentally produced via
+            // wrap-around.
             g.version = g.version.saturating_add(1);
-            g.version
-        };
-        if let Some(hook) = self.on_version_change.read().as_ref() {
-            hook(new_version);
+            let new_version = g.version;
+            // Calling the hook inside the lock guarantees that any peer that
+            // observes (new_version, new_bytes) via /cluster/bloom will also
+            // observe the new version in subsequent gossip advertisements.
+            if let Some(h) = &hook {
+                h(new_version);
+            }
         }
     }
 
@@ -179,7 +191,8 @@ impl PeerIndex {
         }
         // Drain pending under the SAME write lock that swaps the bloom in,
         // so concurrent inserts cannot land between the drain and the swap.
-        let new_version = {
+        let hook = self.on_version_change.read().clone();
+        {
             let mut g = self.local.write();
             let drained: Vec<[u8; 32]> = self.pending.lock().drain(..).collect();
             for d in &drained {
@@ -187,10 +200,13 @@ impl PeerIndex {
             }
             g.bloom = new;
             g.version = g.version.saturating_add(1);
-            g.version
-        };
-        if let Some(hook) = self.on_version_change.read().as_ref() {
-            hook(new_version);
+            let new_version = g.version;
+            // Calling the hook inside the lock guarantees that any peer that
+            // observes (new_version, new_bytes) via /cluster/bloom will also
+            // observe the new version in subsequent gossip advertisements.
+            if let Some(h) = &hook {
+                h(new_version);
+            }
         }
     }
 

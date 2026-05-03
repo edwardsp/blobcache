@@ -1,5 +1,5 @@
 use base64::prelude::{Engine as _, BASE64_STANDARD};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use lru::LruCache;
 use parking_lot::Mutex;
@@ -92,6 +92,7 @@ pub struct Fetcher {
     chunk_sem: Arc<Semaphore>,
     chunk_concurrency: usize,
     inflight_writes: Arc<DashMap<ChunkKey, Bytes>>,
+    inflight_writes_drained: Arc<tokio::sync::Notify>,
     insert_failures: Arc<Mutex<Vec<(ChunkKey, String)>>>,
     seq_state: Arc<DashMap<String, SeqState>>,
     prefetch_sem: Arc<Semaphore>,
@@ -100,6 +101,8 @@ pub struct Fetcher {
     prefetch_origin_only: bool,
     cache_on_peer_fetch: bool,
     peer_lru: Option<Arc<Mutex<PeerLru>>>,
+    peer_sems: Arc<DashMap<String, Arc<Semaphore>>>,
+    peer_concurrency: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -156,6 +159,25 @@ impl Drop for ChunkPermit {
     }
 }
 
+/// Copy `data` (the bytes of one chunk's contribution to a `fetch_range`
+/// result) into `buf` at the correct offset.
+///
+/// `request_offset` is the global file offset where `buf` starts.
+/// `chunk_global_offset` is the chunk-aligned global file offset of `data`'s
+/// source chunk. `data` itself may be a sub-slice of that chunk (when the
+/// request begins or ends mid-chunk), so the destination index is the byte
+/// position within the request, NOT `chunk_global_offset - request_offset`
+/// (which underflows when the request starts mid-chunk).
+fn assemble_chunk_into(
+    buf: &mut BytesMut,
+    request_offset: u64,
+    chunk_global_offset: u64,
+    data: &[u8],
+) {
+    let dst_start = (chunk_global_offset.max(request_offset) - request_offset) as usize;
+    buf[dst_start..dst_start + data.len()].copy_from_slice(data);
+}
+
 impl Fetcher {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -179,6 +201,7 @@ impl Fetcher {
         peer_max_maybe_attempts: usize,
         stampede_wait_ms: u32,
         mounts: Arc<HashMap<String, MountConfig>>,
+        peer_concurrency: usize,
     ) -> Self {
         let permits = chunk_concurrency.max(1);
         let pf_permits = prefetch_concurrency.max(1);
@@ -205,6 +228,7 @@ impl Fetcher {
             chunk_sem: Arc::new(Semaphore::new(permits)),
             chunk_concurrency: permits,
             inflight_writes: Arc::new(DashMap::new()),
+            inflight_writes_drained: Arc::new(tokio::sync::Notify::new()),
             insert_failures: Arc::new(Mutex::new(Vec::new())),
             seq_state: Arc::new(DashMap::new()),
             prefetch_sem: Arc::new(Semaphore::new(pf_permits)),
@@ -217,6 +241,8 @@ impl Fetcher {
             } else {
                 None
             },
+            peer_sems: Arc::new(DashMap::new()),
+            peer_concurrency: peer_concurrency.max(1),
         }
     }
 
@@ -557,7 +583,7 @@ impl Fetcher {
         rid: Option<&crate::request_id::RequestId>,
     ) -> Result<Bytes> {
         if !bypass_peers {
-            let alive = self.membership.members_alive();
+            let alive = self.membership.members_alive_same_cluster();
             let candidates = self.peer_index.rank_candidates(
                 key,
                 &alive,
@@ -570,22 +596,32 @@ impl Fetcher {
             } else if !alive.is_empty() {
                 self.stats.peer_bloom_no_holder.inc();
             }
+            // peer_max_candidates is a HARD ceiling on combined yes+maybe attempts;
+            // peer_max_yes_attempts and peer_max_maybe_attempts are SOFT caps within
+            // their respective pools.  Without the combined cap, pathological alive
+            // sets could exceed the operator's budget (Action 3 from opus_code_eval).
+            //
             // Try yes-set first (peers whose advertised bloom contains this
             // chunk), then maybe-set (peers with no bloom yet, e.g. just joined).
             // Each set has its own budget so a flood of false-positives in yes
             // can't starve the maybe-set.
-            let mut ordered: Vec<(usize, &crate::cluster::NodeInfo)> = Vec::new();
-            for (i, p) in candidates.yes.iter().enumerate() {
-                ordered.push((i, p));
-            }
-            let yes_len = candidates.yes.len();
-            for (i, p) in candidates.maybe.iter().enumerate() {
-                ordered.push((yes_len + i, p));
-            }
-            for (idx, peer) in ordered.iter() {
-                let was_yes = *idx < yes_len;
+            let yes_cap = self.peer_max_yes_attempts.min(self.peer_max_candidates);
+            let mut yes_used = 0usize;
+            for peer in candidates.yes.iter().take(yes_cap) {
+                yes_used += 1;
                 if let Some(data) = self
-                    .try_peer_fetch(peer, key, expected_len, was_yes, 0, rid)
+                    .try_peer_fetch(peer, key, expected_len, true, 0, rid)
+                    .await?
+                {
+                    return Ok(data);
+                }
+            }
+            let maybe_cap = self
+                .peer_max_maybe_attempts
+                .min(self.peer_max_candidates.saturating_sub(yes_used));
+            for peer in candidates.maybe.iter().take(maybe_cap) {
+                if let Some(data) = self
+                    .try_peer_fetch(peer, key, expected_len, false, 0, rid)
                     .await?
                 {
                     return Ok(data);
@@ -667,6 +703,23 @@ impl Fetcher {
         wait_ms: u32,
         rid: Option<&crate::request_id::RequestId>,
     ) -> Result<Option<Bytes>> {
+        // Per-peer concurrency cap (Action 2 from opus_code_eval): without this,
+        // a hot peer can be flooded by parallel fetches from this node, causing
+        // HoL blocking on the peer's own chunk_sem.  peer_concurrency (default 8)
+        // gates how many in-flight requests we issue to any single peer.
+        let peer_id = peer.id.clone();
+        let sem = self
+            .peer_sems
+            .entry(peer_id)
+            .or_insert_with(|| Arc::new(Semaphore::new(self.peer_concurrency)))
+            .clone();
+        // Semaphores are only closed by explicit Semaphore::close(), which we
+        // never call, so acquire_owned() cannot return Err in practice.
+        let _permit = sem
+            .acquire_owned()
+            .await
+            .expect("peer semaphore never closed");
+
         let worker_addr = match &peer.ucx_worker_addr_b64 {
             Some(encoded) => match BASE64_STANDARD.decode(encoded) {
                 Ok(decoded) => Some(decoded),
@@ -878,6 +931,7 @@ impl Fetcher {
         let cache = self.cache.clone();
         let stats = self.stats.clone();
         let inflight = self.inflight_writes.clone();
+        let inflight_writes_drained = self.inflight_writes_drained.clone();
         let insert_failures = self.insert_failures.clone();
         let peer_index = self.peer_index.clone();
         let k = key.clone();
@@ -905,6 +959,9 @@ impl Fetcher {
             }
             inflight.remove(&key);
             stats.inflight_writes.dec();
+            if inflight.is_empty() {
+                inflight_writes_drained.notify_waiters();
+            }
         });
     }
 
@@ -1030,18 +1087,19 @@ impl Fetcher {
             if self.inflight_writes.is_empty() {
                 return;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            // CRITICAL: create notified() future BEFORE the empty check, so we
+            // cannot miss a notify_waiters() that fires between check and await.
+            let notified = self.inflight_writes_drained.notified();
+            if self.inflight_writes.is_empty() {
+                return;
+            }
+            notified.await;
         }
     }
 
     pub fn take_insert_failures(&self) -> Vec<(ChunkKey, String)> {
         let mut g = self.insert_failures.lock();
         std::mem::take(&mut *g)
-    }
-
-    #[allow(dead_code)]
-    pub fn insert_received_chunk(self: &Arc<Self>, key: ChunkKey, data: Bytes) {
-        self.spawn_insert(key, data);
     }
 
     /// Drain any in-flight insert tasks, drop the on-disk cache, and reset
@@ -1092,6 +1150,21 @@ impl Fetcher {
 
         self.maybe_trigger_prefetch(mount, blob_path, offset, end, file_size);
 
+        // Single-chunk fast path: zero-copy return, no BytesMut alloc.
+        // Dominant FUSE-read shape (kernel splits at chunk boundaries via
+        // FUSE max_read). Avoids ~2x memory-bandwidth touch on the hot path.
+        if first_chunk == last_chunk {
+            let o = first_chunk;
+            let chunk_len = cs.min(file_size - o);
+            let take_start = offset - o;
+            let take_end = end - o;
+            let sub_len = take_end - take_start;
+            let _permit = self.acquire_chunk_permit().await?;
+            return self
+                .fetch_chunk_range(mount, blob_path, o, take_start, sub_len, chunk_len, rid)
+                .await;
+        }
+
         let mut tasks = Vec::new();
         let mut o = first_chunk;
         while o <= last_chunk {
@@ -1122,23 +1195,24 @@ impl Fetcher {
                 None => break,
             };
         }
-        let mut chunks = Vec::with_capacity(tasks.len());
+        // Multi-chunk path: pre-size capacity, skip zero-init. The disjoint
+        // [take_start, take_end) windows above tile [offset, end) exactly, so
+        // every byte gets written by one assemble_chunk_into copy below.
+        let total_len = (end - offset) as usize;
+        let mut buf = BytesMut::with_capacity(total_len);
+        // SAFETY: capacity == total_len; the per-chunk copies below fill
+        // every byte in 0..total_len before freeze() publishes the slice.
+        // Chunks are disjoint and their union is exactly [offset, end).
+        unsafe {
+            buf.set_len(total_len);
+        }
         for t in tasks {
             let (co, data) = t
                 .await
                 .map_err(|e| BcError::Other(format!("join: {e}")))??;
-            chunks.push((co, data));
+            assemble_chunk_into(&mut buf, offset, co, &data);
         }
-        chunks.sort_by_key(|(o, _)| *o);
-
-        if chunks.len() == 1 {
-            return Ok(chunks.into_iter().next().unwrap().1);
-        }
-        let mut out = Vec::with_capacity((end - offset) as usize);
-        for (_co, data) in chunks {
-            out.extend_from_slice(&data);
-        }
-        Ok(Bytes::from(out))
+        Ok(buf.freeze())
     }
 
     fn clone_handles(&self) -> Self {
@@ -1160,6 +1234,7 @@ impl Fetcher {
             chunk_sem: self.chunk_sem.clone(),
             chunk_concurrency: self.chunk_concurrency,
             inflight_writes: self.inflight_writes.clone(),
+            inflight_writes_drained: self.inflight_writes_drained.clone(),
             insert_failures: self.insert_failures.clone(),
             seq_state: self.seq_state.clone(),
             prefetch_sem: self.prefetch_sem.clone(),
@@ -1168,6 +1243,8 @@ impl Fetcher {
             prefetch_origin_only: self.prefetch_origin_only,
             cache_on_peer_fetch: self.cache_on_peer_fetch,
             peer_lru: self.peer_lru.clone(),
+            peer_sems: self.peer_sems.clone(),
+            peer_concurrency: self.peer_concurrency,
         }
     }
 
@@ -1378,5 +1455,70 @@ mod peer_lru_tests {
             "cap 0 means any non-empty value is oversized"
         );
         assert_eq!(lru.bytes, 0);
+    }
+}
+
+#[cfg(test)]
+mod assemble_chunk_tests {
+    use super::assemble_chunk_into;
+    use bytes::BytesMut;
+
+    const CS: u64 = 4 * 1024 * 1024;
+
+    #[test]
+    fn aligned_single_chunk_full() {
+        let mut buf = BytesMut::zeroed(CS as usize);
+        let data = vec![0xAB; CS as usize];
+        assemble_chunk_into(&mut buf, 0, 0, &data);
+        assert!(buf.iter().all(|&b| b == 0xAB));
+    }
+
+    #[test]
+    fn request_starts_mid_chunk() {
+        let req_off = 256 * 1024;
+        let req_len = 256 * 1024;
+        let mut buf = BytesMut::zeroed(req_len);
+        let data = vec![0xCD; req_len];
+        assemble_chunk_into(&mut buf, req_off, 0, &data);
+        assert!(buf.iter().all(|&b| b == 0xCD));
+    }
+
+    #[test]
+    fn request_spans_two_chunks() {
+        let req_off = CS - 1024;
+        let req_len = 2048;
+        let mut buf = BytesMut::zeroed(req_len);
+        assemble_chunk_into(&mut buf, req_off, 0, &vec![0x11; 1024]);
+        assemble_chunk_into(&mut buf, req_off, CS, &vec![0x22; 1024]);
+        assert!(buf[..1024].iter().all(|&b| b == 0x11));
+        assert!(buf[1024..].iter().all(|&b| b == 0x22));
+    }
+
+    #[test]
+    fn request_ends_mid_chunk() {
+        let req_off = 0;
+        let req_len = 1024;
+        let mut buf = BytesMut::zeroed(req_len);
+        assemble_chunk_into(&mut buf, req_off, 0, &vec![0xEE; req_len]);
+        assert!(buf.iter().all(|&b| b == 0xEE));
+    }
+
+    #[test]
+    fn uninit_buf_tiled_by_disjoint_chunks_matches_zeroed_buf() {
+        let req_off = CS - 1024;
+        let req_len = 2048;
+
+        let mut zeroed = BytesMut::zeroed(req_len);
+        assemble_chunk_into(&mut zeroed, req_off, 0, &vec![0x11; 1024]);
+        assemble_chunk_into(&mut zeroed, req_off, CS, &vec![0x22; 1024]);
+
+        let mut uninit = BytesMut::with_capacity(req_len);
+        unsafe {
+            uninit.set_len(req_len);
+        }
+        assemble_chunk_into(&mut uninit, req_off, 0, &vec![0x11; 1024]);
+        assemble_chunk_into(&mut uninit, req_off, CS, &vec![0x22; 1024]);
+
+        assert_eq!(zeroed.freeze(), uninit.freeze());
     }
 }

@@ -2,6 +2,7 @@ use prometheus::{
     Encoder, Histogram, HistogramOpts, IntCounter, IntCounterVec, IntGauge, Opts, Registry,
     TextEncoder,
 };
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 pub struct Stats {
@@ -12,6 +13,16 @@ pub struct Stats {
     pub cache_inserts: IntCounter,
     pub cache_reconcile_drops: IntCounter,
     pub cache_bytes: IntGauge,
+    /// Baselines for delta-publishing cache counters to Prometheus.
+    /// Each stores the last value of the corresponding AtomicU64 source that
+    /// was forwarded to the IntCounter, so we can `inc_by(cur - prev)` instead
+    /// of `reset() + inc_by(cur)`.  This preserves Prometheus counter
+    /// monotonicity: a scrape racing mid-update can never observe a decrease.
+    pub last_pub_hits: AtomicU64,
+    pub last_pub_misses: AtomicU64,
+    pub last_pub_evictions: AtomicU64,
+    pub last_pub_inserts: AtomicU64,
+    pub last_pub_reconcile_drops: AtomicU64,
     pub blob_fetches: IntCounter,
     pub blob_fetch_bytes: IntCounter,
     // Throttling visibility: when Azure egress saturates the storage account
@@ -85,6 +96,7 @@ pub struct Stats {
     pub inflight_writes: IntGauge,
     pub singleflight_inflight: IntGauge,
     pub chunk_permits_in_use: IntGauge,
+    pub fuse_by_ino_entries: IntGauge,
     pub chunk_total_seconds: Histogram,
     pub chunk_cache_get_seconds: Histogram,
     pub chunk_peer_fetch_seconds: Histogram,
@@ -334,6 +346,11 @@ impl Stats {
             "chunk_concurrency semaphore permits currently held",
         )
         .unwrap();
+        let fuse_by_ino_entries = IntGauge::new(
+            "blobcache_fuse_by_ino_entries",
+            "entries currently tracked in the FUSE by_ino inode map",
+        )
+        .unwrap();
 
         let mk_hist = |name: &str, help: &str| {
             Histogram::with_opts(HistogramOpts::new(name, help).buckets(vec![
@@ -449,6 +466,7 @@ impl Stats {
             &inflight_writes,
             &singleflight_inflight,
             &chunk_permits_in_use,
+            &fuse_by_ino_entries,
         ] {
             r.register(Box::new(g.clone())).unwrap();
         }
@@ -474,6 +492,11 @@ impl Stats {
             cache_inserts,
             cache_reconcile_drops,
             cache_bytes,
+            last_pub_hits: AtomicU64::new(0),
+            last_pub_misses: AtomicU64::new(0),
+            last_pub_evictions: AtomicU64::new(0),
+            last_pub_inserts: AtomicU64::new(0),
+            last_pub_reconcile_drops: AtomicU64::new(0),
             blob_fetches,
             blob_fetch_bytes,
             blob_request_status_total,
@@ -515,6 +538,7 @@ impl Stats {
             inflight_writes,
             singleflight_inflight,
             chunk_permits_in_use,
+            fuse_by_ino_entries,
             chunk_total_seconds,
             chunk_cache_get_seconds,
             chunk_peer_fetch_seconds,
@@ -545,6 +569,54 @@ impl Stats {
         TextEncoder::new().encode(&mfs, &mut buf).unwrap();
         buf
     }
+
+    /// Advance `metric` by the delta between `source` and `last_published`.
+    ///
+    /// Prometheus counters must be monotonically non-decreasing.  The old
+    /// `reset() + inc_by(N)` pattern violates this: a scrape that races
+    /// between the reset and the inc_by sees a value of 0, which is smaller
+    /// than the previous scrape.  By computing `delta = cur - prev` and only
+    /// calling `inc_by(delta)` we never decrease the counter, so any scrape
+    /// at any point in time sees a value ≥ the previous scrape.
+    ///
+    /// If `source` went backwards (e.g. process restart with a shared
+    /// AtomicU64 that was reset externally), we silently update the baseline
+    /// without touching the Prometheus counter, preserving monotonicity.
+    pub fn publish_delta(metric: &IntCounter, source: &AtomicU64, last_published: &AtomicU64) {
+        use std::sync::atomic::Ordering;
+        let cur = source.load(Ordering::Relaxed);
+        let prev = last_published.swap(cur, Ordering::Relaxed);
+        if cur >= prev {
+            metric.inc_by(cur - prev);
+        }
+    }
+}
+
+// NOTE(opus-eval-18): Known refactor target. This function is a single
+// ~490-line nested closure handling every stats/admin route inline.  It
+// should be split into per-route handler functions to improve testability
+// and allow middleware insertion.  Deferred: zero behavioural change but
+// high churn; tracked in opus_code_eval_actions.md row 18.
+#[allow(clippy::result_large_err)]
+fn check_admin_auth(
+    headers: &hyper::HeaderMap,
+    expected: Option<&str>,
+) -> Result<(), hyper::Response<crate::http_util::Body>> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let actual = headers
+        .get(hyper::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "));
+    if actual == Some(expected) {
+        Ok(())
+    } else {
+        Err(crate::http_util::error_response(
+            hyper::http::StatusCode::UNAUTHORIZED,
+            "missing or invalid bearer token",
+        ))
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -559,10 +631,12 @@ pub async fn serve(
     chunk_size: u64,
     me_id: String,
     me_transport_url: String,
+    admin_token: Option<String>,
 ) -> crate::error::Result<()> {
     use bytes::Bytes;
     use http_body_util::{BodyExt, Full};
     use hyper::body::Incoming;
+    use hyper::http::StatusCode;
     use hyper::server::conn::http1;
     use hyper::service::service_fn;
     use hyper::{Method, Request, Response};
@@ -592,6 +666,7 @@ pub async fn serve(
         let me_url = me_transport_url.clone();
         let hydrate_http = hydrate_http.clone();
         let hydrate_jobs = hydrate_jobs.clone();
+        let admin_token = admin_token.clone();
         tokio::spawn(async move {
             let io = TokioIo::new(stream);
             let _ = http1::Builder::new()
@@ -608,22 +683,36 @@ pub async fn serve(
                         let me_url = me_url.clone();
                         let hydrate_http = hydrate_http.clone();
                         let hydrate_jobs = hydrate_jobs.clone();
+                        let admin_token = admin_token.clone();
                         async move {
                             let resp = match (req.method(), req.uri().path()) {
                                 (&Method::GET, "/metrics") => {
                                     let cs = &cache.stats;
-                                    s.cache_hits.reset();
-                                    s.cache_hits.inc_by(cs.hits.load(Ordering::Relaxed));
-                                    s.cache_misses.reset();
-                                    s.cache_misses.inc_by(cs.misses.load(Ordering::Relaxed));
-                                    s.cache_evictions.reset();
-                                    s.cache_evictions
-                                        .inc_by(cs.evictions.load(Ordering::Relaxed));
-                                    s.cache_inserts.reset();
-                                    s.cache_inserts.inc_by(cs.inserts.load(Ordering::Relaxed));
-                                    s.cache_reconcile_drops.reset();
-                                    s.cache_reconcile_drops
-                                        .inc_by(cs.reconcile_drops.load(Ordering::Relaxed));
+                                    Stats::publish_delta(
+                                        &s.cache_hits,
+                                        &cs.hits,
+                                        &s.last_pub_hits,
+                                    );
+                                    Stats::publish_delta(
+                                        &s.cache_misses,
+                                        &cs.misses,
+                                        &s.last_pub_misses,
+                                    );
+                                    Stats::publish_delta(
+                                        &s.cache_evictions,
+                                        &cs.evictions,
+                                        &s.last_pub_evictions,
+                                    );
+                                    Stats::publish_delta(
+                                        &s.cache_inserts,
+                                        &cs.inserts,
+                                        &s.last_pub_inserts,
+                                    );
+                                    Stats::publish_delta(
+                                        &s.cache_reconcile_drops,
+                                        &cs.reconcile_drops,
+                                        &s.last_pub_reconcile_drops,
+                                    );
                                     s.cache_bytes
                                         .set(cs.bytes_in_use.load(Ordering::Relaxed) as i64);
                                     let all = membership.members_all();
@@ -664,27 +753,18 @@ pub async fn serve(
                                         },
                                     });
                                     let body = serde_json::to_vec(&v).unwrap();
-                                    Response::builder()
-                                        .status(200)
-                                        .header("content-type", "application/json")
-                                        .body(Full::new(Bytes::from(body)))
-                                        .unwrap()
+                                    crate::http_util::ok_response(body)
                                 }
                                 (&Method::GET, "/peers") => {
                                     let v =
                                         serde_json::json!({"members": membership.members_all()});
                                     let body = serde_json::to_vec(&v).unwrap();
-                                    Response::builder()
-                                        .status(200)
-                                        .header("content-type", "application/json")
-                                        .body(Full::new(Bytes::from(body)))
-                                        .unwrap()
+                                    crate::http_util::ok_response(body)
                                 }
-                                (&Method::GET, "/healthz") => Response::builder()
-                                    .status(200)
-                                    .header("content-type", "text/plain")
-                                    .body(Full::new(Bytes::from_static(b"ok\n")))
-                                    .unwrap(),
+                                (&Method::GET, "/healthz") => crate::http_util::text_response(
+                                    StatusCode::OK,
+                                    "ok\n",
+                                ),
                                 (&Method::GET, "/readyz") => {
                                     // Ready once we have at least one Alive
                                     // member (which includes self after gossip
@@ -700,20 +780,18 @@ pub async fn serve(
                                         })
                                         .count();
                                     if alive >= 1 {
-                                        Response::builder()
-                                            .status(200)
-                                            .header("content-type", "text/plain")
-                                            .body(Full::new(Bytes::from_static(b"ready\n")))
-                                            .unwrap()
+                                        crate::http_util::text_response(StatusCode::OK, "ready\n")
                                     } else {
-                                        Response::builder()
-                                            .status(503)
-                                            .header("content-type", "text/plain")
-                                            .body(Full::new(Bytes::from_static(b"joining\n")))
-                                            .unwrap()
+                                        crate::http_util::text_response(
+                                            StatusCode::SERVICE_UNAVAILABLE,
+                                            "joining\n",
+                                        )
                                     }
                                 }
                                 (&Method::POST, "/hydrate") => {
+                                    if let Err(e) = check_admin_auth(req.headers(), admin_token.as_deref()) {
+                                        e
+                                    } else {
                                     let is_async = req
                                         .uri()
                                         .query()
@@ -728,12 +806,10 @@ pub async fn serve(
                                         Ok(c) => c.to_bytes(),
                                         Err(e) => {
                                             return Ok::<_, Infallible>(
-                                                Response::builder()
-                                                    .status(400)
-                                                    .body(Full::new(Bytes::from(format!(
-                                                        "body read: {e}"
-                                                    ))))
-                                                    .unwrap(),
+                                                crate::http_util::error_response(
+                                                    StatusCode::BAD_REQUEST,
+                                                    &format!("body read: {e}"),
+                                                ),
                                             );
                                         }
                                     };
@@ -742,43 +818,43 @@ pub async fn serve(
                                             Ok(r) => r,
                                             Err(e) => {
                                                 return Ok::<_, Infallible>(
-                                                    Response::builder()
-                                                        .status(400)
-                                                        .body(Full::new(Bytes::from(format!(
-                                                            "json: {e}"
-                                                        ))))
-                                                        .unwrap(),
+                                                    crate::http_util::error_response(
+                                                        StatusCode::BAD_REQUEST,
+                                                        &format!("json: {e}"),
+                                                    ),
                                                 );
                                             }
                                         };
                                     if is_async {
                                         let (job_id, state) = hydrate_jobs.create();
-                                        let fetcher_c = fetcher.clone();
-                                        let blobs_c = blobs.clone();
-                                        let mounts_c = mounts.clone();
-                                        let membership_c = membership.clone();
-                                        let me_id_c = me_id.clone();
-                                        let me_url_c = me_url.clone();
-                                        let http_c = hydrate_http.clone();
-                                        let job_id_log = job_id.clone();
-                                        tokio::spawn(async move {
-                                            {
-                                                let mut g = state.lock();
-                                                g.status =
-                                                    crate::hydrate_jobs::JobStatus::Running;
-                                            }
-                                            let res = crate::hydrate::run_coordinator(
-                                                hreq,
-                                                chunk_size,
-                                                fetcher_c,
-                                                blobs_c,
-                                                mounts_c,
-                                                membership_c,
-                                                me_id_c,
-                                                me_url_c,
-                                                http_c,
-                                            )
-                                            .await;
+                                         let fetcher_c = fetcher.clone();
+                                         let blobs_c = blobs.clone();
+                                         let mounts_c = mounts.clone();
+                                         let membership_c = membership.clone();
+                                         let me_id_c = me_id.clone();
+                                         let me_url_c = me_url.clone();
+                                         let http_c = hydrate_http.clone();
+                                         let job_id_log = job_id.clone();
+                                         let admin_token_c = admin_token.clone();
+                                         tokio::spawn(async move {
+                                             {
+                                                 let mut g = state.lock();
+                                                 g.status =
+                                                     crate::hydrate_jobs::JobStatus::Running;
+                                             }
+                                             let res = crate::hydrate::run_coordinator(
+                                                 hreq,
+                                                 chunk_size,
+                                                 fetcher_c,
+                                                 blobs_c,
+                                                 mounts_c,
+                                                 membership_c,
+                                                 me_id_c,
+                                                 me_url_c,
+                                                 http_c,
+                                                 admin_token_c,
+                                             )
+                                             .await;
                                             let mut g = state.lock();
                                             g.finished_at = Some(std::time::Instant::now());
                                             match res {
@@ -803,102 +879,94 @@ pub async fn serve(
                                             &serde_json::json!({"job_id": job_id}),
                                         )
                                         .unwrap();
-                                        Response::builder()
-                                            .status(202)
-                                            .header("content-type", "application/json")
-                                            .body(Full::new(Bytes::from(body)))
-                                            .unwrap()
-                                    } else {
-                                        match crate::hydrate::run_coordinator(
-                                            hreq,
-                                            chunk_size,
-                                            fetcher.clone(),
-                                            blobs.clone(),
-                                            mounts.clone(),
-                                            membership.clone(),
-                                            me_id.clone(),
-                                            me_url.clone(),
-                                            hydrate_http.clone(),
-                                        )
+                                        crate::http_util::json_response(StatusCode::ACCEPTED, body)
+                                     } else {
+                                         match crate::hydrate::run_coordinator(
+                                             hreq,
+                                             chunk_size,
+                                             fetcher.clone(),
+                                             blobs.clone(),
+                                             mounts.clone(),
+                                             membership.clone(),
+                                             me_id.clone(),
+                                             me_url.clone(),
+                                             hydrate_http.clone(),
+                                             admin_token.clone(),
+                                         )
                                         .await
                                         {
                                             Ok(r) => {
                                                 let body = serde_json::to_vec(&r).unwrap();
-                                                Response::builder()
-                                                    .status(200)
-                                                    .header("content-type", "application/json")
-                                                    .body(Full::new(Bytes::from(body)))
-                                                    .unwrap()
+                                                crate::http_util::ok_response(body)
                                             }
-                                            Err(e) => Response::builder()
-                                                .status(500)
-                                                .body(Full::new(Bytes::from(format!("{e}"))))
-                                                .unwrap(),
-                                        }
-                                    }
-                                }
-                                (&Method::GET, p)
+                                            Err(e) => crate::http_util::error_response(
+                                                StatusCode::INTERNAL_SERVER_ERROR,
+                                                &format!("{e}"),
+                                            ),
+                                         }
+                                     }
+                                     }
+                                 }
+                                 (&Method::GET, p)
                                     if p.starts_with("/hydrate/") && p.len() > 9 =>
                                 {
                                     let id = &p[9..];
                                     match hydrate_jobs.view(id) {
                                         Some(v) => {
                                             let body = serde_json::to_vec(&v).unwrap();
-                                            Response::builder()
-                                                .status(200)
-                                                .header("content-type", "application/json")
-                                                .body(Full::new(Bytes::from(body)))
-                                                .unwrap()
+                                            crate::http_util::ok_response(body)
                                         }
-                                        None => Response::builder()
-                                            .status(404)
-                                            .body(Full::new(Bytes::from("unknown job_id")))
-                                            .unwrap(),
+                                        None => crate::http_util::error_response(
+                                            StatusCode::NOT_FOUND,
+                                            "unknown job_id",
+                                        ),
                                     }
                                 }
                                 (&Method::POST, "/clear-cache") => {
+                                    if let Err(e) = check_admin_auth(req.headers(), admin_token.as_deref()) {
+                                        e
+                                    } else {
                                     match crate::clear::run_coordinator(
                                         fetcher.clone(),
                                         membership.clone(),
                                         me_id.clone(),
                                         hydrate_http.clone(),
+                                        admin_token.clone(),
                                     )
                                     .await
                                     {
                                         Ok(r) => {
                                             let body = serde_json::to_vec(&r).unwrap();
-                                            Response::builder()
-                                                .status(200)
-                                                .header("content-type", "application/json")
-                                                .body(Full::new(Bytes::from(body)))
-                                                .unwrap()
+                                            crate::http_util::ok_response(body)
                                         }
-                                        Err(e) => Response::builder()
-                                            .status(500)
-                                            .body(Full::new(Bytes::from(format!("{e}"))))
-                                            .unwrap(),
+                                        Err(e) => crate::http_util::error_response(
+                                            StatusCode::INTERNAL_SERVER_ERROR,
+                                            &format!("{e}"),
+                                        ),
+                                    }
                                     }
                                 }
                                 (&Method::POST, "/clear-cache-shard") => {
+                                    if let Err(e) = check_admin_auth(req.headers(), admin_token.as_deref()) {
+                                        e
+                                    } else {
                                     let r = crate::clear::run_shard(fetcher.clone()).await;
                                     let body = serde_json::to_vec(&r).unwrap();
-                                    Response::builder()
-                                        .status(200)
-                                        .header("content-type", "application/json")
-                                        .body(Full::new(Bytes::from(body)))
-                                        .unwrap()
+                                    crate::http_util::ok_response(body)
+                                    }
                                 }
                                 (&Method::POST, "/hydrate-shard") => {
+                                    if let Err(e) = check_admin_auth(req.headers(), admin_token.as_deref()) {
+                                        e
+                                    } else {
                                     let body = match req.into_body().collect().await {
                                         Ok(c) => c.to_bytes(),
                                         Err(e) => {
                                             return Ok::<_, Infallible>(
-                                                Response::builder()
-                                                    .status(400)
-                                                    .body(Full::new(Bytes::from(format!(
-                                                        "body read: {e}"
-                                                    ))))
-                                                    .unwrap(),
+                                                crate::http_util::error_response(
+                                                    StatusCode::BAD_REQUEST,
+                                                    &format!("body read: {e}"),
+                                                ),
                                             );
                                         }
                                     };
@@ -907,12 +975,10 @@ pub async fn serve(
                                             Ok(r) => r,
                                             Err(e) => {
                                                 return Ok::<_, Infallible>(
-                                                    Response::builder()
-                                                        .status(400)
-                                                        .body(Full::new(Bytes::from(format!(
-                                                            "json: {e}"
-                                                        ))))
-                                                        .unwrap(),
+                                                    crate::http_util::error_response(
+                                                        StatusCode::BAD_REQUEST,
+                                                        &format!("json: {e}"),
+                                                    ),
                                                 );
                                             }
                                         };
@@ -923,23 +989,21 @@ pub async fn serve(
                                     )
                                     .await;
                                     let body = serde_json::to_vec(&r).unwrap();
-                                    Response::builder()
-                                        .status(200)
-                                        .header("content-type", "application/json")
-                                        .body(Full::new(Bytes::from(body)))
-                                        .unwrap()
+                                     crate::http_util::ok_response(body)
+                                    }
                                 }
                                 (&Method::POST, "/hydrate-broadcast-shard") => {
+                                    if let Err(e) = check_admin_auth(req.headers(), admin_token.as_deref()) {
+                                        e
+                                    } else {
                                     let body = match req.into_body().collect().await {
                                         Ok(c) => c.to_bytes(),
                                         Err(e) => {
                                             return Ok::<_, Infallible>(
-                                                Response::builder()
-                                                    .status(400)
-                                                    .body(Full::new(Bytes::from(format!(
-                                                        "body read: {e}"
-                                                    ))))
-                                                    .unwrap(),
+                                                crate::http_util::error_response(
+                                                    StatusCode::BAD_REQUEST,
+                                                    &format!("body read: {e}"),
+                                                ),
                                             );
                                         }
                                     };
@@ -948,12 +1012,10 @@ pub async fn serve(
                                             Ok(r) => r,
                                             Err(e) => {
                                                 return Ok::<_, Infallible>(
-                                                    Response::builder()
-                                                        .status(400)
-                                                        .body(Full::new(Bytes::from(format!(
-                                                            "json: {e}"
-                                                        ))))
-                                                        .unwrap(),
+                                                    crate::http_util::error_response(
+                                                        StatusCode::BAD_REQUEST,
+                                                        &format!("json: {e}"),
+                                                    ),
                                                 );
                                             }
                                         };
@@ -964,23 +1026,21 @@ pub async fn serve(
                                     )
                                     .await;
                                     let body = serde_json::to_vec(&r).unwrap();
-                                    Response::builder()
-                                        .status(200)
-                                        .header("content-type", "application/json")
-                                        .body(Full::new(Bytes::from(body)))
-                                        .unwrap()
+                                    crate::http_util::ok_response(body)
+                                    }
                                 }
                                 (&Method::POST, "/hydrate-ring-step") => {
+                                    if let Err(e) = check_admin_auth(req.headers(), admin_token.as_deref()) {
+                                        e
+                                    } else {
                                     let body = match req.into_body().collect().await {
                                         Ok(c) => c.to_bytes(),
                                         Err(e) => {
                                             return Ok::<_, Infallible>(
-                                                Response::builder()
-                                                    .status(400)
-                                                    .body(Full::new(Bytes::from(format!(
-                                                        "body read: {e}"
-                                                    ))))
-                                                    .unwrap(),
+                                                crate::http_util::error_response(
+                                                    StatusCode::BAD_REQUEST,
+                                                    &format!("body read: {e}"),
+                                                ),
                                             );
                                         }
                                     };
@@ -989,12 +1049,10 @@ pub async fn serve(
                                             Ok(r) => r,
                                             Err(e) => {
                                                 return Ok::<_, Infallible>(
-                                                    Response::builder()
-                                                        .status(400)
-                                                        .body(Full::new(Bytes::from(format!(
-                                                            "json: {e}"
-                                                        ))))
-                                                        .unwrap(),
+                                                    crate::http_util::error_response(
+                                                        StatusCode::BAD_REQUEST,
+                                                        &format!("json: {e}"),
+                                                    ),
                                                 );
                                             }
                                         };
@@ -1005,16 +1063,10 @@ pub async fn serve(
                                     )
                                     .await;
                                     let body = serde_json::to_vec(&r).unwrap();
-                                    Response::builder()
-                                        .status(200)
-                                        .header("content-type", "application/json")
-                                        .body(Full::new(Bytes::from(body)))
-                                        .unwrap()
+                                    crate::http_util::ok_response(body)
+                                    }
                                 }
-                                _ => Response::builder()
-                                    .status(404)
-                                    .body(Full::new(Bytes::new()))
-                                    .unwrap(),
+                                 _ => crate::http_util::empty_response(StatusCode::NOT_FOUND),
                             };
                             Ok::<_, Infallible>(resp)
                         }
@@ -1022,5 +1074,38 @@ pub async fn serve(
                 )
                 .await;
         });
+    }
+}
+
+#[cfg(test)]
+mod auth_tests {
+    use super::check_admin_auth;
+    use hyper::header::AUTHORIZATION;
+    use hyper::HeaderMap;
+
+    #[test]
+    fn no_token_configured_always_ok() {
+        let headers = HeaderMap::new();
+        assert!(check_admin_auth(&headers, None).is_ok());
+    }
+
+    #[test]
+    fn token_configured_missing_header_rejected() {
+        let headers = HeaderMap::new();
+        assert!(check_admin_auth(&headers, Some("secret")).is_err());
+    }
+
+    #[test]
+    fn token_configured_wrong_token_rejected() {
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, "Bearer wrong".parse().unwrap());
+        assert!(check_admin_auth(&headers, Some("secret")).is_err());
+    }
+
+    #[test]
+    fn token_configured_correct_token_ok() {
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, "Bearer secret".parse().unwrap());
+        assert!(check_admin_auth(&headers, Some("secret")).is_ok());
     }
 }

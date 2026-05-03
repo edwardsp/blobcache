@@ -118,18 +118,96 @@ impl BlobClient {
         let extra = vec![("x-ms-range", HeaderValue::from_str(&range_val).unwrap())];
         let max_attempts = self.max_retries.saturating_add(1).max(1);
         let mut attempt = 0u32;
+        let mut bearer_invalidated_once = false;
         loop {
             attempt += 1;
-            let resp = self
-                .send(Method::GET, url.clone(), &extra, None, None)
-                .await?;
+            let t_send = std::time::Instant::now();
+            let resp = match self
+                .send_once(
+                    Method::GET,
+                    url.clone(),
+                    &extra,
+                    None,
+                    None,
+                    &mut bearer_invalidated_once,
+                )
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    let elapsed = t_send.elapsed().as_secs_f64();
+                    if let Some(m) = &self.metrics {
+                        m.blob_request_seconds.observe(elapsed);
+                        if elapsed > m.blob_request_seconds_max.get() {
+                            m.blob_request_seconds_max.set(elapsed);
+                        }
+                    }
+                    let retryable = matches!(
+                        &e,
+                        BcError::Http(re)
+                            if re.is_timeout() || re.is_connect() || re.is_request() || re.is_body()
+                    );
+                    if retryable && attempt < max_attempts {
+                        let delay = backoff_ms(attempt);
+                        if let Some(m) = &self.metrics {
+                            m.blob_request_retries_total
+                                .with_label_values(&["net"])
+                                .inc();
+                            m.blob_retry_sleep_seconds_total
+                                .inc_by(delay as f64 / 1000.0);
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                        continue;
+                    }
+                    if let Some(m) = &self.metrics {
+                        m.blob_request_status_total
+                            .with_label_values(&["err"])
+                            .inc();
+                        m.blob_request_giveups_total.inc();
+                    }
+                    return Err(e);
+                }
+            };
+            let elapsed = t_send.elapsed().as_secs_f64();
+            if let Some(m) = &self.metrics {
+                m.blob_request_seconds.observe(elapsed);
+                if elapsed > m.blob_request_seconds_max.get() {
+                    m.blob_request_seconds_max.set(elapsed);
+                }
+            }
             let status = resp.status();
+            if is_retryable_status(status) && attempt < max_attempts {
+                let delay = retry_delay_ms(&resp, attempt);
+                if let Some(m) = &self.metrics {
+                    m.blob_request_retries_total
+                        .with_label_values(&[status.as_str()])
+                        .inc();
+                    m.blob_retry_sleep_seconds_total
+                        .inc_by(delay as f64 / 1000.0);
+                }
+                drop(resp);
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                continue;
+            }
             if !status.is_success() {
                 let body = resp.text().await.unwrap_or_default();
+                if let Some(m) = &self.metrics {
+                    m.blob_request_status_total
+                        .with_label_values(&[status.as_str()])
+                        .inc();
+                    if is_retryable_status(status) {
+                        m.blob_request_giveups_total.inc();
+                    }
+                }
                 return Err(BcError::Storage {
                     status: status.as_u16(),
                     message: body.chars().take(200).collect(),
                 });
+            }
+            if let Some(m) = &self.metrics {
+                m.blob_request_status_total
+                    .with_label_values(&[status.as_str()])
+                    .inc();
             }
             match resp.bytes().await {
                 Ok(b) => return Ok(b),
@@ -232,31 +310,18 @@ impl BlobClient {
         let mut bearer_invalidated_once = false;
         loop {
             attempt += 1;
-            // Resolve bearer per attempt so we always use a fresh token (the
-            // BearerSource handles its own refresh-with-skew + singleflight).
-            let bearer = match &self.credential {
-                Credential::Bearer(src) => Some(src.token().await?),
-                _ => None,
-            };
-            let content_length = body.as_ref().map(|b| b.len() as u64);
-            let headers = self.build_headers(
-                &url,
-                method.as_str(),
-                content_type,
-                content_length,
-                extra_headers,
-                bearer.as_deref(),
-            )?;
-            let mut req_url = url.clone();
-            if let Credential::Sas { token } = &self.credential {
-                sas::append_sas_token(&mut req_url, token);
-            }
-            let mut req = self.http.request(method.clone(), req_url).headers(headers);
-            if let Some(b) = body.clone() {
-                req = req.body(b);
-            }
             let t_send = std::time::Instant::now();
-            match req.send().await {
+            match self
+                .send_once(
+                    method.clone(),
+                    url.clone(),
+                    extra_headers,
+                    content_type,
+                    body.clone(),
+                    &mut bearer_invalidated_once,
+                )
+                .await
+            {
                 Ok(resp) => {
                     let elapsed = t_send.elapsed().as_secs_f64();
                     if let Some(m) = &self.metrics {
@@ -266,17 +331,6 @@ impl BlobClient {
                         }
                     }
                     let status = resp.status();
-                    // 401 with a bearer credential: token may have rotated
-                    // server-side (key rolled) or our cached one is stale
-                    // despite our skew. Force one refresh and retry once.
-                    if status == StatusCode::UNAUTHORIZED && !bearer_invalidated_once {
-                        if let Credential::Bearer(src) = &self.credential {
-                            src.invalidate();
-                            bearer_invalidated_once = true;
-                            drop(resp);
-                            continue;
-                        }
-                    }
                     if is_retryable_status(status) && attempt < max_attempts {
                         let delay = retry_delay_ms(&resp, attempt);
                         if let Some(m) = &self.metrics {
@@ -300,7 +354,7 @@ impl BlobClient {
                     }
                     return Ok(resp);
                 }
-                Err(e)
+                Err(BcError::Http(e))
                     if attempt < max_attempts
                         && (e.is_timeout() || e.is_connect() || e.is_request() || e.is_body()) =>
                 {
@@ -332,10 +386,61 @@ impl BlobClient {
                             .inc();
                         m.blob_request_giveups_total.inc();
                     }
-                    return Err(e.into());
+                    return Err(e);
                 }
             }
         }
+    }
+
+    async fn send_once(
+        &self,
+        method: Method,
+        url: Url,
+        extra_headers: &[(&'static str, HeaderValue)],
+        content_type: Option<&str>,
+        body: Option<Bytes>,
+        bearer_invalidated_once: &mut bool,
+    ) -> Result<Response> {
+        let bearer = match &self.credential {
+            Credential::Bearer(src) => Some(src.token().await?),
+            _ => None,
+        };
+        let content_length = body.as_ref().map(|b| b.len() as u64);
+        let headers = self.build_headers(
+            &url,
+            method.as_str(),
+            content_type,
+            content_length,
+            extra_headers,
+            bearer.as_deref(),
+        )?;
+        let mut req_url = url.clone();
+        if let Credential::Sas { token } = &self.credential {
+            sas::append_sas_token(&mut req_url, token);
+        }
+        let mut req = self.http.request(method.clone(), req_url).headers(headers);
+        if let Some(b) = body.clone() {
+            req = req.body(b);
+        }
+        let resp = req.send().await?;
+        let status = resp.status();
+        if status == StatusCode::UNAUTHORIZED && !*bearer_invalidated_once {
+            if let Credential::Bearer(src) = &self.credential {
+                src.invalidate();
+                *bearer_invalidated_once = true;
+                drop(resp);
+                return Box::pin(self.send_once(
+                    method,
+                    url,
+                    extra_headers,
+                    content_type,
+                    body,
+                    bearer_invalidated_once,
+                ))
+                .await;
+            }
+        }
+        Ok(resp)
     }
 
     fn build_headers(
@@ -367,7 +472,7 @@ impl BlobClient {
         }
         match &self.credential {
             Credential::SharedKey { account, key } => {
-                let auth = shared_key::sign_request(account, key, method, url, &h, content_length);
+                let auth = shared_key::sign_request(account, key, method, url, &h, content_length)?;
                 h.insert("Authorization", HeaderValue::from_str(&auth).unwrap());
             }
             Credential::Bearer(_) => {

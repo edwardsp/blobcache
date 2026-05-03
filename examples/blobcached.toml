@@ -33,6 +33,9 @@ stampede_wait_ms = 5000
 [stats]
 bind = "0.0.0.0:7773"
 
+# [admin]
+# token = "your-secret"   # optional; when set, /clear-cache* and /hydrate* require Authorization: Bearer <token>
+
 [[mounts]]
 name = "models"
 mountpoint = "/tmp/blobcache-mnt/models"

@@ -15,7 +15,8 @@ use std::path::PathBuf;
 
 use blobcache::cluster::{NodeInfo, NodeState};
 use blobcache::config::{
-    AzureConfig, CacheConfig, ClusterConfig, Config, MountConfig, StatsConfig, TransportConfig,
+    AdminConfig, AzureConfig, CacheConfig, ClusterConfig, Config, MountConfig, StatsConfig,
+    TransportConfig,
 };
 
 /// Build a minimal valid `Config` rooted at `cache_dir`. Single mount, tcp
@@ -59,6 +60,7 @@ pub fn minimal_config(cache_dir: PathBuf) -> Config {
         stats: StatsConfig {
             bind: "127.0.0.1:0".into(),
         },
+        admin: AdminConfig::default(),
         mounts: vec![MountConfig {
             name: "models".into(),
             mountpoint: PathBuf::from("/tmp/blobcache-test"),
@@ -84,5 +86,6 @@ pub fn node(id: &str) -> NodeInfo {
         state: NodeState::Alive,
         incarnation: 1,
         bloom_version: 0,
+        admin_url: None,
     }
 }

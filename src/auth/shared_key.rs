@@ -1,3 +1,4 @@
+use crate::error::{BcError, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use hmac::{Hmac, Mac};
 use reqwest::header::HeaderMap;
@@ -13,7 +14,7 @@ pub fn sign_request(
     url: &Url,
     headers: &HeaderMap,
     content_length: Option<u64>,
-) -> String {
+) -> Result<String> {
     let canonicalized_headers = build_canonicalized_headers(headers);
     let canonicalized_resource = build_canonicalized_resource(account, url);
     let content_length_str = match content_length {
@@ -37,11 +38,14 @@ pub fn sign_request(
         canonicalized_headers,
         canonicalized_resource,
     );
-    let decoded_key = STANDARD.decode(key).expect("invalid base64 storage key");
-    let mut mac = HmacSha256::new_from_slice(&decoded_key).expect("HMAC init failed");
+    let decoded_key = STANDARD
+        .decode(key)
+        .map_err(|e| BcError::Auth(format!("invalid base64 storage key: {e}")))?;
+    let mut mac = HmacSha256::new_from_slice(&decoded_key)
+        .map_err(|e| BcError::Auth(format!("HMAC init failed: {e}")))?;
     mac.update(string_to_sign.as_bytes());
     let signature = STANDARD.encode(mac.finalize().into_bytes());
-    format!("SharedKey {account}:{signature}")
+    Ok(format!("SharedKey {account}:{signature}"))
 }
 
 fn get_header(headers: &HeaderMap, name: &str) -> String {

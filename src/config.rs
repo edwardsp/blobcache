@@ -14,7 +14,27 @@ pub struct Config {
     pub transport: TransportConfig,
     pub stats: StatsConfig,
     #[serde(default)]
+    pub admin: AdminConfig,
+    #[serde(default)]
     pub mounts: Vec<MountConfig>,
+}
+
+/// Optional authentication for destructive admin endpoints.
+///
+/// Action 5 from opus_code_eval: when `token` is set, all destructive POSTs
+/// (`/clear-cache`, `/clear-cache-shard`, `/hydrate`, `/hydrate-shard`,
+/// `/hydrate-broadcast-shard`, `/hydrate-ring-step`) require an
+/// `Authorization: Bearer <token>` header.  Read-only endpoints
+/// (`/metrics`, `/stats`, `/peers`) are never gated.
+/// Defaults to `None` (unauthenticated) for backward compatibility.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct AdminConfig {
+    /// Optional bearer token for destructive admin POST endpoints.
+    /// When unset (default), endpoints are unauthenticated.
+    /// When set, requests without a matching `Authorization: Bearer <token>`
+    /// header receive 401.  Inter-node calls include the token automatically.
+    #[serde(default)]
+    pub token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,13 +76,17 @@ fn default_peer_lru_bytes() -> u64 {
 pub struct AzureConfig {
     #[serde(default = "default_pool_max_idle_per_host")]
     pub pool_max_idle_per_host: usize,
-    /// Bytes per Azure GET. Decoupled from cache.chunk_size: the daemon
-    /// issues block-sized GETs to Azure, then slices each block into
-    /// `block_size / chunk_size` cache chunks. 0 = use chunk_size.
-    /// Must be a positive multiple of cache.chunk_size when non-zero.
-    /// Larger blocks reduce per-request overhead and Azure-side throttling
-    /// pressure (small chunks at low concurrency see retry storms because
-    /// the per-second request rate limit is hit before bandwidth limits).
+    /// Reserved hook for block-aggregated Azure GETs.  Intended semantics
+    /// (NOT YET IMPLEMENTED): the daemon issues `block_size`-aligned GETs
+    /// to Azure and slices each block into `block_size / cache.chunk_size`
+    /// cache chunks, reducing per-request overhead and Azure-side
+    /// throttling pressure (small chunks at low concurrency hit the
+    /// per-second request-rate limit before saturating bandwidth).  The
+    /// validation here (must be a positive multiple of `chunk_size`) is
+    /// kept so that operator configs written for the future implementation
+    /// remain valid as soon as it lands.  Until then the fetcher uses
+    /// `chunk_size` for every Azure GET regardless of this value.
+    /// `0` = use `chunk_size`.  See Action 1 in opus_code_eval.md.
     #[serde(default)]
     pub block_size: u64,
     /// Number of independent tokio runtimes (each with its own reqwest

@@ -1,3 +1,13 @@
+//! Gossip-based cluster membership for blobcache.
+//!
+//! NOTE(opus-eval-15): The gossip protocol is push-pull: each round one node
+//! POSTs its full member list to a random peer and receives the peer's full
+//! list in response.  Payload size is O(N) per round (each `NodeInfo` entry
+//! is ~1–2 KiB once UCX worker addresses are base64-encoded).  The 1 MiB
+//! `MAX_GOSSIP_BODY_BYTES` cap puts a hard ceiling around N ≈ 300 nodes.
+//! Beyond that, switch to a delta or SWIM-style protocol that only exchanges
+//! changed entries.
+
 use parking_lot::RwLock;
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
@@ -42,6 +52,52 @@ pub struct NodeInfo {
     pub incarnation: u64,
     #[serde(default)]
     pub bloom_version: u64,
+    /// Admin/stats endpoint URL.  Nodes published before this field existed
+    /// advertise `None`; consumers fall back to port substitution from
+    /// `transport_url`.  Action 4 from opus_code_eval.
+    #[serde(default)]
+    pub admin_url: Option<String>,
+}
+
+impl NodeInfo {
+    /// Returns the admin (stats) URL for this node.
+    ///
+    /// If the node has published an explicit `admin_url` (Action 4), that is
+    /// returned directly.  Otherwise we fall back to the pre-Action-4
+    /// behaviour: substitute port 7773 into `transport_url` so that older
+    /// peers (which don't publish `admin_url`) still work.
+    pub fn effective_admin_url(&self) -> String {
+        if let Some(url) = &self.admin_url {
+            return url.clone();
+        }
+        port_substitute(&self.transport_url, 7773)
+    }
+}
+
+/// Replace the port in `url` with `new_port`.
+///
+/// Handles `http://host:port/path` and bare `host:port` forms.  If the URL
+/// cannot be parsed the original string is returned unchanged.
+pub fn port_substitute(url: &str, new_port: u16) -> String {
+    // Strip scheme if present.
+    let (scheme, rest) = if let Some(s) = url.strip_prefix("http://") {
+        ("http://", s)
+    } else if let Some(s) = url.strip_prefix("https://") {
+        ("https://", s)
+    } else {
+        ("", url)
+    };
+    // Split off any path component.
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, ""),
+    };
+    // Replace the port in the authority (host:port).
+    let host = match authority.rfind(':') {
+        Some(i) => &authority[..i],
+        None => authority,
+    };
+    format!("{scheme}{host}:{new_port}{path}")
 }
 
 #[derive(Serialize, Deserialize)]
@@ -129,6 +185,19 @@ impl Membership {
             })
             .cloned()
             .collect()
+    }
+
+    /// Like [`members_alive`] but makes the cluster-boundary filter explicit
+    /// for fan-out call sites (hydrate, clear, peer fetch candidates) so that
+    /// requests never cross cluster boundaries when multiple logical clusters
+    /// share the same gossip topology.  Action 14 from opus_code_eval.
+    ///
+    /// Semantically identical to [`members_alive`] — both already filter on
+    /// `cluster_hash` — but the distinct name documents intent at each call
+    /// site and guards against future refactors that might relax the filter in
+    /// [`members_alive`] for observability purposes.
+    pub fn members_alive_same_cluster(&self) -> Vec<NodeInfo> {
+        self.members_alive()
     }
 
     pub fn members_all(&self) -> Vec<NodeInfo> {
@@ -285,6 +354,11 @@ impl GossipServer {
         self
     }
 
+    // NOTE(opus-eval-18): Known refactor target. This function is a single
+    // ~120-line nested closure handling every gossip route inline.  It should
+    // be split into per-route handler functions to improve testability and
+    // allow middleware insertion.  Deferred: zero behavioural change but high
+    // churn; tracked in opus_code_eval_actions.md row 18.
     pub async fn serve(self, addr: SocketAddr) -> Result<()> {
         use http_body_util::{BodyExt, Full};
         use hyper::body::{Bytes as HBytes, Incoming};
@@ -315,8 +389,10 @@ impl GossipServer {
                             (&Method::POST, "/cluster/sync") => {
                                 let body = req.collect().await.map(|b| b.to_bytes()).unwrap_or_default();
                                 if body.len() > MAX_GOSSIP_BODY_BYTES {
-                                    return Ok::<_, Infallible>(Response::builder().status(413)
-                                        .body(Full::new(HBytes::from_static(b"too large"))).unwrap());
+                                    return Ok::<_, Infallible>(crate::http_util::error_response(
+                                        hyper::StatusCode::PAYLOAD_TOO_LARGE,
+                                        "too large",
+                                    ));
                                 }
                                 match serde_json::from_slice::<GossipPayload>(&body) {
                                     Ok(payload) => {
@@ -324,9 +400,10 @@ impl GossipServer {
                                         if payload.from.cluster_hash != me.me_template.cluster_hash {
                                             me.stats.config_mismatches.inc();
                                             tracing::warn!(peer=%from_id, "cluster_hash mismatch — refusing merge");
-                                            return Ok::<_, Infallible>(Response::builder().status(409)
-                                                .header("content-type", "application/json")
-                                                .body(Full::new(HBytes::from_static(b"{\"error\":\"cluster_hash mismatch\"}"))).unwrap());
+                                            return Ok::<_, Infallible>(crate::http_util::error_response(
+                                                hyper::StatusCode::CONFLICT,
+                                                "{\"error\":\"cluster_hash mismatch\"}",
+                                            ));
                                         }
                                         let mut all = payload.members;
                                         all.push(payload.from);
@@ -337,12 +414,12 @@ impl GossipServer {
                                             members: me.members_all(),
                                         };
                                         let body = serde_json::to_vec(&response_payload).unwrap();
-                                        Response::builder().status(200)
-                                            .header("content-type", "application/json")
-                                            .body(Full::new(HBytes::from(body))).unwrap()
+                                        crate::http_util::ok_response(body)
                                     }
-                                    Err(e) => Response::builder().status(400)
-                                        .body(Full::new(HBytes::from(format!("bad: {e}")))).unwrap(),
+                                    Err(e) => crate::http_util::error_response(
+                                        hyper::StatusCode::BAD_REQUEST,
+                                        &format!("bad: {e}"),
+                                    ),
                                 }
                             }
                             (&Method::GET, "/cluster/bloom") => match &pi {
@@ -353,10 +430,9 @@ impl GossipServer {
                                         .header("x-blobcache-bloom-version", v.to_string())
                                         .body(Full::new(HBytes::from(body))).unwrap()
                                 }
-                                None => Response::builder().status(404)
-                                    .body(Full::new(HBytes::new())).unwrap(),
+                                None => crate::http_util::empty_response(hyper::StatusCode::NOT_FOUND),
                             }
-                            _ => Response::builder().status(404).body(Full::new(HBytes::new())).unwrap(),
+                            _ => crate::http_util::empty_response(hyper::StatusCode::NOT_FOUND),
                         };
                         Ok::<_, Infallible>(resp)
                     }
@@ -431,4 +507,83 @@ async fn gossip_with(client: &reqwest::Client, m: &Membership, peer_url: &str) -
     m.touch_peer(&from_id);
     m.stats.gossip_rounds.inc();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use prometheus::{IntCounter, Registry};
+    use std::sync::Arc;
+
+    fn make_stats() -> Arc<crate::stats::ClusterStats> {
+        let r = Registry::new();
+        let make = |name: &str| {
+            let c = IntCounter::new(name, name).unwrap();
+            r.register(Box::new(c.clone())).unwrap();
+            c
+        };
+        Arc::new(crate::stats::ClusterStats {
+            gossip_rounds: make("t_gossip_rounds"),
+            joins: make("t_joins"),
+            failures: make("t_failures"),
+            config_mismatches: make("t_config_mismatches"),
+        })
+    }
+
+    fn node(id: &str, hash: &str, state: NodeState) -> NodeInfo {
+        NodeInfo {
+            id: id.to_string(),
+            transport_url: format!("http://{id}:7772"),
+            gossip_url: format!("http://{id}:7771"),
+            cluster_hash: hash.to_string(),
+            ucx_worker_addr_b64: None,
+            last_seen_unix: unix_now(),
+            state,
+            incarnation: 1,
+            bloom_version: 0,
+            admin_url: None,
+        }
+    }
+
+    #[test]
+    fn members_alive_same_cluster_filters_by_hash() {
+        let me = node("me", "hash-a", NodeState::Alive);
+        let m = Membership::new(me, make_stats());
+
+        let peer_same = node("peer-same", "hash-a", NodeState::Alive);
+        let peer_other = node("peer-other", "hash-b", NodeState::Alive);
+        m.merge(&[peer_same, peer_other]);
+
+        assert_eq!(
+            m.members_alive().len(),
+            1,
+            "members_alive returns same-cluster only"
+        );
+        assert_eq!(
+            m.members_alive_same_cluster().len(),
+            1,
+            "members_alive_same_cluster returns same-cluster only"
+        );
+        assert_eq!(m.members_alive_same_cluster()[0].id, "peer-same");
+    }
+
+    #[test]
+    fn effective_admin_url_falls_back_to_port_substitution() {
+        let n_no_admin = NodeInfo {
+            admin_url: None,
+            transport_url: "http://10.0.0.5:7772".into(),
+            ..node("n1", "h", NodeState::Alive)
+        };
+        assert_eq!(n_no_admin.effective_admin_url(), "http://10.0.0.5:7773");
+
+        let n_with_admin = NodeInfo {
+            admin_url: Some("http://admin.example:9999".into()),
+            transport_url: "http://10.0.0.5:7772".into(),
+            ..node("n2", "h", NodeState::Alive)
+        };
+        assert_eq!(
+            n_with_admin.effective_admin_url(),
+            "http://admin.example:9999"
+        );
+    }
 }

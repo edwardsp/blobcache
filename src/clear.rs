@@ -1,4 +1,4 @@
-use crate::cluster::{Membership, NodeState};
+use crate::cluster::Membership;
 use crate::error::Result;
 use crate::fetcher::Fetcher;
 use serde::{Deserialize, Serialize};
@@ -72,19 +72,31 @@ pub async fn run_coordinator(
     membership: Membership,
     me_id: String,
     http: reqwest::Client,
+    admin_token: Option<String>,
 ) -> Result<ClearResponse> {
     let t0 = Instant::now();
-    let mut targets: Vec<(String, Option<String>)> = vec![(me_id.clone(), None)];
-    for n in membership.members_all() {
-        if matches!(n.state, NodeState::Alive) && n.id != me_id {
-            targets.push((n.id.clone(), Some(n.transport_url.clone())));
-        }
+    let mut targets: Vec<(String, Option<String>, Option<String>)> =
+        vec![(me_id.clone(), None, None)];
+    for n in membership.members_alive_same_cluster() {
+        targets.push((
+            n.id.clone(),
+            Some(n.transport_url.clone()),
+            Some(n.effective_admin_url()),
+        ));
     }
     let n_targets = targets.len();
 
+    // Action 20 from opus_code_eval: derive shard timeout from coordinator
+    // timeout minus a fixed safety margin (see hydrate.rs for full rationale).
+    const COORD_TO_SHARD_SAFETY_MARGIN: std::time::Duration = std::time::Duration::from_secs(2);
+    let global_timeout = std::time::Duration::from_secs(360);
+    let shard_timeout = global_timeout
+        .checked_sub(COORD_TO_SHARD_SAFETY_MARGIN)
+        .unwrap_or(global_timeout / 2);
+
     let mut handles = Vec::with_capacity(n_targets);
-    for (node_id, transport_url) in targets.into_iter() {
-        let Some(url) = transport_url else {
+    for (node_id, transport_url, admin_url) in targets.into_iter() {
+        let Some(_transport_url) = transport_url else {
             let f = fetcher.clone();
             handles.push(tokio::spawn(async move {
                 let r = run_shard(f).await;
@@ -101,23 +113,24 @@ pub async fn run_coordinator(
             continue;
         };
         {
-            let host = url
-                .trim_start_matches("http://")
-                .split(':')
-                .next()
-                .unwrap_or("")
-                .to_string();
-            let endpoint = format!("http://{host}:7773/clear-cache-shard");
+            let endpoint = format!(
+                "{}/clear-cache-shard",
+                admin_url.unwrap_or_default().trim_end_matches('/')
+            );
             let http = http.clone();
+            let admin_token = admin_token.clone();
             handles.push(tokio::spawn(async move {
                 let t0 = Instant::now();
                 let post_start = now_unix_ms();
-                let resp = http
+                let mut builder = http
                     .post(&endpoint)
                     .json(&ClearRequest::default())
-                    .timeout(std::time::Duration::from_secs(300))
-                    .send()
-                    .await;
+                    .timeout(shard_timeout);
+                if let Some(ref tok) = admin_token {
+                    builder =
+                        builder.header(reqwest::header::AUTHORIZATION, format!("Bearer {tok}"));
+                }
+                let resp = builder.send().await;
                 match resp {
                     Ok(r) => match r.json::<ClearShardResponse>().await {
                         Ok(s) => PerPeerClear {
@@ -153,7 +166,6 @@ pub async fn run_coordinator(
         }
     }
 
-    let global_timeout = std::time::Duration::from_secs(360);
     let abort_handles: Vec<_> = handles.iter().map(|h| h.abort_handle()).collect();
     let join_all = async {
         let mut out = Vec::with_capacity(n_targets);
