@@ -1150,6 +1150,21 @@ impl Fetcher {
 
         self.maybe_trigger_prefetch(mount, blob_path, offset, end, file_size);
 
+        // Single-chunk fast path: zero-copy return, no BytesMut alloc.
+        // Dominant FUSE-read shape (kernel splits at chunk boundaries via
+        // FUSE max_read). Avoids ~2x memory-bandwidth touch on the hot path.
+        if first_chunk == last_chunk {
+            let o = first_chunk;
+            let chunk_len = cs.min(file_size - o);
+            let take_start = offset - o;
+            let take_end = end - o;
+            let sub_len = take_end - take_start;
+            let _permit = self.acquire_chunk_permit().await?;
+            return self
+                .fetch_chunk_range(mount, blob_path, o, take_start, sub_len, chunk_len, rid)
+                .await;
+        }
+
         let mut tasks = Vec::new();
         let mut o = first_chunk;
         while o <= last_chunk {
@@ -1180,8 +1195,17 @@ impl Fetcher {
                 None => break,
             };
         }
+        // Multi-chunk path: pre-size capacity, skip zero-init. The disjoint
+        // [take_start, take_end) windows above tile [offset, end) exactly, so
+        // every byte gets written by one assemble_chunk_into copy below.
         let total_len = (end - offset) as usize;
-        let mut buf = BytesMut::zeroed(total_len);
+        let mut buf = BytesMut::with_capacity(total_len);
+        // SAFETY: capacity == total_len; the per-chunk copies below fill
+        // every byte in 0..total_len before freeze() publishes the slice.
+        // Chunks are disjoint and their union is exactly [offset, end).
+        unsafe {
+            buf.set_len(total_len);
+        }
         for t in tasks {
             let (co, data) = t
                 .await
@@ -1477,5 +1501,24 @@ mod assemble_chunk_tests {
         let mut buf = BytesMut::zeroed(req_len);
         assemble_chunk_into(&mut buf, req_off, 0, &vec![0xEE; req_len]);
         assert!(buf.iter().all(|&b| b == 0xEE));
+    }
+
+    #[test]
+    fn uninit_buf_tiled_by_disjoint_chunks_matches_zeroed_buf() {
+        let req_off = CS - 1024;
+        let req_len = 2048;
+
+        let mut zeroed = BytesMut::zeroed(req_len);
+        assemble_chunk_into(&mut zeroed, req_off, 0, &vec![0x11; 1024]);
+        assemble_chunk_into(&mut zeroed, req_off, CS, &vec![0x22; 1024]);
+
+        let mut uninit = BytesMut::with_capacity(req_len);
+        unsafe {
+            uninit.set_len(req_len);
+        }
+        assemble_chunk_into(&mut uninit, req_off, 0, &vec![0x11; 1024]);
+        assemble_chunk_into(&mut uninit, req_off, CS, &vec![0x22; 1024]);
+
+        assert_eq!(zeroed.freeze(), uninit.freeze());
     }
 }
