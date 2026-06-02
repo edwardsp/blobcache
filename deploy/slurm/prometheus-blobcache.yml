@@ -1,0 +1,15 @@
+# Append to /opt/prometheus/prometheus.yml on every compute node, then SIGHUP:
+#     sudo kill -HUP $(pgrep -x prometheus)
+#
+# On azcluster the per-node Prometheus already runs on 127.0.0.1:9090 with
+# AAD-MI remote_write to Azure Monitor Workspace. The dashboard expects a
+# `node` label, so also add it to external_labels in the same file:
+#
+#   global:
+#     external_labels:
+#       node: <hostname>          # add this line under any existing labels
+#
+scrape_configs:
+  - job_name: blobcache
+    static_configs:
+      - targets: ["127.0.0.1:7773"]
