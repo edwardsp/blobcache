@@ -1,0 +1,53 @@
+{
+  "cold": {
+    "run_id": "cold-79",
+    "nodes": "64",
+    "node_csvs": 64,
+    "train_start_s": 13.9,
+    "train_done_s": 747.6,
+    "total_fuse_read_GiB": 2904.7,
+    "local_GiB": 2409.1,
+    "peer_GiB": 245.9,
+    "blob_GiB": 249.7,
+    "local_pct": 82.9,
+    "peer_pct": 8.5,
+    "blob_pct": 8.6,
+    "peak_bandwidth_GiBps": 59.09,
+    "peak_iops": 1953363.0,
+    "total_read_ops_M": 86.27
+  },
+  "wsharded": {
+    "run_id": "wsharded-66",
+    "nodes": "64",
+    "node_csvs": 64,
+    "train_start_s": 13.8,
+    "train_done_s": 734.3,
+    "total_fuse_read_GiB": 2898.9,
+    "local_GiB": 2653.1,
+    "peer_GiB": 245.8,
+    "blob_GiB": 0.0,
+    "local_pct": 91.5,
+    "peer_pct": 8.5,
+    "blob_pct": 0.0,
+    "peak_bandwidth_GiBps": 59.42,
+    "peak_iops": 1964772.0,
+    "total_read_ops_M": 85.35
+  },
+  "wreplicated": {
+    "run_id": "wreplicated-67",
+    "nodes": "64",
+    "node_csvs": 64,
+    "train_start_s": 13.9,
+    "train_done_s": 735.1,
+    "total_fuse_read_GiB": 2903.6,
+    "local_GiB": 2903.6,
+    "peer_GiB": 0.0,
+    "blob_GiB": 0.0,
+    "local_pct": 100.0,
+    "peer_pct": 0.0,
+    "blob_pct": 0.0,
+    "peak_bandwidth_GiBps": 58.67,
+    "peak_iops": 1969716.0,
+    "total_read_ops_M": 88.97
+  }
+}

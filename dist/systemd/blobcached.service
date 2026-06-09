@@ -1,0 +1,24 @@
+[Unit]
+Description=blobcache daemon (Azure Blob FUSE cache)
+Documentation=https://github.com/edwardsp/blobcache/blob/main/docs/slurm.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Drop AZURE_CLIENT_ID (UAI client id), RUST_LOG, UCX_TLS, etc. into
+# /etc/default/blobcached. The file is optional; absent is fine when
+# the daemon picks a system-assigned identity from IMDS.
+EnvironmentFile=-/etc/default/blobcached
+Environment=RUST_LOG=info,blobcache=info
+ExecStartPre=/bin/mkdir -p /mnt/nvme/blobcache-cache
+ExecStart=/opt/blobcache/blobcached --config /etc/blobcached.toml
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=1048576
+# FUSE needs /etc/fuse.conf to contain `user_allow_other` so the mount
+# is visible to job processes running as non-root.
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

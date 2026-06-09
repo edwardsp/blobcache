@@ -1,0 +1,64 @@
+# blobcached config used for the Open-Sora v2 x blobcache 64-node benchmark
+# (see ../../docs/examples/open-sora-pexels.md).
+#
+# Two mounts are exposed under /blobcache/:
+#   pexels  - the Open-Sora Pexels video dataset (~258 GiB) streamed for training
+#   osv2    - the Open-Sora v2 (11B) checkpoints (DiT + Hunyuan VAE + T5 + CLIP)
+#
+# Tested on NDv5 H200 nodes (8x H200, NVMe RAID-0 at /mnt/nvme, ConnectX-7 NDR
+# InfiniBand), Managed Identity on the per-cluster storage account. Substitute
+# the placeholders marked <...> below. See examples/blobcached-azcluster.toml for
+# the annotated base config this derives from.
+#
+# blobcached does not unmount FUSE on stop, so a plain `systemctl restart` after
+# editing this file crash-loops on "File exists (os error 17)". Redeploy with the
+# clean-unmount sequence in docs/slurm.md (Troubleshooting: stale FUSE mounts).
+
+[cache]
+dir = "/mnt/nvme/blobcache-cache"
+max_bytes = 1099511627776        # 1 TiB (size to ~80-90% of NVMe RAID capacity)
+chunk_size = 4194304             # 4 MiB; MUST match across the cluster (part of cluster_hash)
+
+[azure]
+pool_max_idle_per_host = 512
+workers = 4                      # 4 blob-fetch runtimes (lifts the ~28 Gbps/runtime ceiling)
+main_worker_threads = 8
+block_size = 0                   # 0 => use cache.chunk_size
+
+[cluster]
+bind = "0.0.0.0:7771"
+seeds = ["http://<first-compute-hostname>:7771"]   # any one alive node as gossip seed
+
+[transport]
+bind = "0.0.0.0:7772"
+chunk_concurrency = 32
+peer_concurrency = 8
+prefetch_depth = 16
+prefetch_threshold = 3
+prefetch_concurrency = 32
+bloom_bits = 8388608
+bloom_rebuild_secs = 30
+bloom_pull_secs = 5
+peer_max_candidates = 4
+peer_max_yes_attempts = 2
+peer_max_maybe_attempts = 2
+stampede_wait_ms = 5000
+
+[stats]
+bind = "0.0.0.0:7773"
+
+# Open-Sora Pexels dataset (~258 GiB) streamed for the training / read harness.
+[[mounts]]
+name = "pexels"
+mountpoint = "/blobcache/pexels"
+account = "<storage-account>"
+container = "<container>"
+prefix = "<path/to/pexels-dataset>"
+
+# Open-Sora v2 (11B) checkpoints: DiT + Hunyuan VAE + T5 + CLIP.
+[[mounts]]
+name = "osv2"
+mountpoint = "/blobcache/osv2"
+account = "<storage-account>"
+container = "<container>"
+prefix = "<path/to/opensora-v2>"

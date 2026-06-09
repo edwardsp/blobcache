@@ -1,0 +1,61 @@
+# Example blobcached config for an azcluster Slurm cluster
+# (https://github.com/edwardsp/azcluster).
+#
+# Tested on:
+#   16 x Standard_ND96isr_H200_v5, Ubuntu 24.04, NVMe RAID-0 at /mnt/nvme,
+#   ConnectX-7 (mlx5_ib0) NDR fabric, Managed Identity on the per-cluster
+#   storage account.
+#
+# Substitute the placeholders marked <...> below.
+
+# node_id is optional; defaults to `hostname`. Across a Slurm cluster the
+# hostnames are already unique (paul-h200-gpu-0002, -0003, ...), so leaving
+# this unset is the right default.
+
+[cache]
+dir = "/mnt/nvme/blobcache-cache"
+# Size the cache to ~80-90% of your NVMe RAID capacity, leaving headroom
+# for Slurm scratch. 1.5 TiB shown here was chosen to hold a 642 GiB
+# DeepSeek-R1 weight set plus working set with room to grow.
+max_bytes = 1649267441664        # 1.5 TiB
+chunk_size = 4194304             # 4 MiB; MUST match across the cluster (part of cluster_hash)
+
+[azure]
+pool_max_idle_per_host = 512
+workers = 4                      # 4 independent tokio runtimes for blob GETs (see BENCHMARKS.md v2.9)
+main_worker_threads = 8          # FUSE/gossip/peer-server/stats runtime
+block_size = 0                   # 0 => use cache.chunk_size
+
+[cluster]
+bind = "0.0.0.0:7771"
+# Point every node at the *first* compute node as the gossip seed. Any
+# alive node is sufficient; once joined, push-pull discovers the rest.
+seeds = ["http://<first-compute-hostname>:7771"]
+
+[transport]
+bind = "0.0.0.0:7772"
+chunk_concurrency = 32
+peer_concurrency = 8
+prefetch_depth = 16
+prefetch_threshold = 3
+prefetch_concurrency = 32
+bloom_bits = 8388608
+bloom_rebuild_secs = 30
+bloom_pull_secs = 5
+peer_max_candidates = 4
+peer_max_yes_attempts = 2
+peer_max_maybe_attempts = 2
+stampede_wait_ms = 5000
+
+[stats]
+bind = "0.0.0.0:7773"
+
+# One [[mounts]] block per blob path you want exposed under /blobcache/.
+# `account` is the storage account short name (NOT the full FQDN);
+# `prefix` lets you scope a single container to one directory.
+[[mounts]]
+name = "deepseek"
+mountpoint = "/blobcache/deepseek"
+account = "<storage-account>"
+container = "<container>"
+prefix = "<path/to/model/dir>"

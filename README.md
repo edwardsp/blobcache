@@ -216,6 +216,19 @@ kubectl -n blobcache cp blobcached.aarch64 <pod>:/opt/blobcache/blobcached
 kubectl -n blobcache cp blobcached.toml    <pod>:/opt/blobcache/blobcached.toml
 ```
 
+## Deploy on Slurm (azcluster)
+
+On an Azure Slurm cluster `blobcached` runs as a per-node systemd service rather
+than a DaemonSet. [docs/slurm.md](docs/slurm.md) is the end-to-end install guide
+(build → stage → fanout install → verify → observability), with
+[examples/blobcached-azcluster.toml](examples/blobcached-azcluster.toml) as the
+annotated base config.
+
+For a real workload on top of it, [docs/examples/open-sora-pexels.md](docs/examples/open-sora-pexels.md)
+is a 64-node / 512-GPU Open-Sora v2 training + read-benchmark case study that
+measures cold vs sharded vs replicated data strategies through blobcache; the
+runnable scripts are in [examples/open-sora/](examples/open-sora/).
+
 ## Storage account public-access toggle
 
 The example storage account uses `defaultAction: Deny` with the AKS subnet allowed.
@@ -278,7 +291,12 @@ deploy/
   blobcached.yaml   # NVMe RAID DS + blobcached DS
   storage-access.sh # ARM toggle for the storage account's public access
 examples/
-  blobcached.toml   # sample config
+  blobcached.toml            # sample config (local / AKS)
+  blobcached-azcluster.toml  # sample config (azcluster Slurm)
+  open-sora/                 # 512-GPU Open-Sora v2 benchmark scripts + payloads
+docs/
+  slurm.md                   # deploy on an Azure Slurm cluster (azcluster)
+  examples/                  # worked case studies (Open-Sora v2 x blobcache)
 ```
 
 ## Known limitations
