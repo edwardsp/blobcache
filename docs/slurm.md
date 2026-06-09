@@ -163,7 +163,7 @@ synchronised job starts), use the cluster-wide hydrate coordinator:
 ```sh
 curl -sf -X POST http://<any-node>:7773/hydrate \
     -H 'content-type: application/json' \
-    -d '{"mount":"deepseek","prefix":""}' | jq
+    -d '{"mount":"deepseek","path":""}' | jq
 ```
 
 This shards the blob list across all alive peers (Phase A) and runs
@@ -217,6 +217,14 @@ peer transport runs over InfiniBand instead of TCP/IB — see
 [BENCHMARKS.md](../BENCHMARKS.md) v2.3 onwards. Multi-stream aggregates
 scale to ~11.75 GiB/s per fetcher node.
 
+> **A full worked example.** For an end-to-end workload on top of this
+> deployment — 64 nodes / 512 GPUs running Open-Sora v2 training plus a
+> DataLoader read-benchmark, comparing cold vs sharded vs replicated data
+> strategies through blobcache — see the case study in
+> [`examples/open-sora-pexels.md`](examples/open-sora-pexels.md). The runnable
+> scripts and hydrate payloads live in
+> [`../examples/open-sora/`](../examples/open-sora/).
+
 ## 8. Teardown
 
 ```sh
@@ -237,6 +245,31 @@ srun -N16 --ntasks-per-node=1 bash -c '
 | Reads return EIO | Check the daemon's journal: `journalctl -u blobcached -e -n 200`. Common: blob 403 (UAI lacks Storage Blob Data Reader on the account). |
 | `fusermount: option allow_other only allowed if 'user_allow_other' is set` | `/etc/fuse.conf` missing the directive; the installer adds it but a custom image may have removed it. |
 | Dashboard has no data, AMW does | `node` label missing from `external_labels` (see step 6.2). |
+| `systemctl restart blobcached` crash-loops on `File exists (os error 17)` after a config change | The daemon does not unmount its FUSE mounts on stop, so the old mountpoints block the re-mount. Clear them first — see *Redeploying after a config change* below. |
+
+### Redeploying after a config change
+
+`blobcached` mounts each `[[mounts]]` entry on startup but does **not** unmount on
+`stop`/`SIGTERM`, so editing `/etc/blobcached.toml` and running `systemctl restart`
+leaves the previous FUSE mounts in place and the daemon crash-loops trying to
+re-mount over them (`File exists (os error 17)`). Stop, clear the stale mounts, then
+start — fan it out with `srun`:
+
+```sh
+srun -N16 --ntasks-per-node=1 bash -c '
+  sudo systemctl stop blobcached
+  for M in <mount1> <mount2>; do
+    sudo umount -l "/blobcache/$M" 2>/dev/null \
+      || sudo fusermount3 -uz "/blobcache/$M" 2>/dev/null || true
+  done
+  sudo systemctl reset-failed blobcached
+  sudo systemctl start blobcached
+'
+```
+
+`reset-failed` clears the crash-loop backoff so the unit starts cleanly. A plain
+reboot also works (mounts are not persisted), but the sequence above avoids draining
+the node.
 
 ## 10. Not in scope
 

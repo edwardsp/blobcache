@@ -1,0 +1,50 @@
+{
+  "cold": {
+    "run_id": "cold-79",
+    "nodes": "64",
+    "n": 64,
+    "blob_GiB": 249.713,
+    "peer_GiB": 245.906,
+    "local_GiB": 2409.079,
+    "fuse_read_GiB": 2904.698,
+    "remote_GiB": 495.619,
+    "cache_hits_M": 86.889,
+    "misses_M": 0.254,
+    "fuse_reads_M": 86.27,
+    "train_s": 733.699
+  },
+  "wsharded": {
+    "run_id": "wsharded-66",
+    "nodes": "64",
+    "n": 64,
+    "blob_GiB": 0.0,
+    "peer_GiB": 245.79,
+    "local_GiB": 2653.136,
+    "fuse_read_GiB": 2898.927,
+    "remote_GiB": 245.79,
+    "cache_hits_M": 86.014,
+    "misses_M": 0.11,
+    "fuse_reads_M": 85.352,
+    "train_s": 720.456
+  },
+  "wreplicated": {
+    "run_id": "wreplicated-67",
+    "nodes": "64",
+    "n": 64,
+    "blob_GiB": 0.0,
+    "peer_GiB": 0.016,
+    "local_GiB": 2903.603,
+    "fuse_read_GiB": 2903.618,
+    "remote_GiB": 0.016,
+    "cache_hits_M": 89.617,
+    "misses_M": 0.0,
+    "fuse_reads_M": 88.968,
+    "train_s": 721.152
+  },
+  "comparison": {
+    "blob_egress_avoided_GiB": 249.7,
+    "cold_blob_GiB": 249.7,
+    "replicated_local_pct": 100.0,
+    "train_speedup_pct": 1.7
+  }
+}
