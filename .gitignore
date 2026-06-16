@@ -27,3 +27,6 @@ benchmarks/out
 docs/INTEGRATION_PLAN.md
 
 night-progress.md
+
+# Playwright MCP browser cache/artifacts
+.playwright-mcp/
