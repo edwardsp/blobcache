@@ -143,6 +143,10 @@ A SHA-256 over `chunk_size` and the sorted mount list is exchanged with
 every gossip round; peers with mismatched hashes are rejected at merge time
 (`blobcache_cluster_config_mismatches_total`).
 
+For the complete list of configuration options — every key, its type and
+default, the startup validation rules, and exactly which keys participate in
+the cluster hash — see **[docs/config.md](docs/config.md)**.
+
 ## Run
 
 ```sh
@@ -295,6 +299,7 @@ examples/
   blobcached-azcluster.toml  # sample config (azcluster Slurm)
   open-sora/                 # 512-GPU Open-Sora v2 benchmark scripts + payloads
 docs/
+  config.md                  # full blobcached.toml configuration reference
   slurm.md                   # deploy on an Azure Slurm cluster (azcluster)
   examples/                  # worked case studies (Open-Sora v2 x blobcache)
 ```
