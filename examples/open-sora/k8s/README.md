@@ -6,9 +6,9 @@ methodology and reference numbers. Provision the cluster with
 [azcluster](https://github.com/edwardsp/azcluster) (`deploy --target aks`, ND H200 pool,
 ACStor + NVIDIA network/GPU operators).
 
-> **Status: untested first draft.** Depends on the `os-train` image (PR #12) building
-> and on `pyshim` being baked into it. Treat the manifest + steps below as the design,
-> to be iterated on a live cluster.
+> **Status: iterated on a live cluster.** The `os-train` image (with `pyshim`) is
+> built by `docker/os-train` CI. The manifest + steps below are the design; the live
+> hydrate/rendezvous ordering and ACStor sizing are validated on a real run.
 
 ## Topology
 
@@ -46,7 +46,6 @@ peer-fetches over IB exactly as in the Slurm run.
 
 ## Open items before a faithful run
 
-- `pyshim` (the author's `/shared/blobcache-deploy/pyshim`) must be baked into the image.
 - `pexels_meta.csv` location on AKS (default assumes it ships in the pexels blob at
   `/blobcache/pexels/pexels_meta.csv`; override `PEXELS_META_CSV` otherwise).
 - ACStor `cache` PVC sized at 2 TiB/pod — tune to the node's NVMe RAID capacity.

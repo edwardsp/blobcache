@@ -17,8 +17,10 @@
 #       --dry-run=client -o yaml | kubectl apply -f -
 #   envsubst < os-train-aks.yaml | kubectl apply -f -
 #
-# NOTE (untested): first end-to-end draft. The os-train image (PR #12) must build,
-# and pyshim must be baked, before this runs faithfully.
+#   The os-train image (ghcr.io/edwardsp/blobcache/os-train) bakes the tensornvme
+#   pyshim. Hydrate orchestration + metrics counters below follow the Slurm
+#   run_all.sh / os-train.sbatch contract; live hydrate/rendezvous ordering is
+#   iterated on a real cluster.
 ---
 apiVersion: v1
 kind: Service
