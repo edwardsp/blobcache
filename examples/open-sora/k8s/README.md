@@ -49,4 +49,26 @@ peer-fetches over IB exactly as in the Slurm run.
 - `pexels_meta.csv` location on AKS (default assumes it ships in the pexels blob at
   `/blobcache/pexels/pexels_meta.csv`; override `PEXELS_META_CSV` otherwise).
 - ACStor `cache` PVC sized at 2 TiB/pod — tune to the node's NVMe RAID capacity.
-- Hydrate barrier + rank-0 rendezvous ordering need validation on a live cluster.
+
+## Validated results (ND H200 v5, mexicocentral)
+
+Live-validated at **64 and 128 nodes**. The 64-node cold run matches the Slurm reference
+within 1% (cold blob egress 248.2 GiB vs 249.7; peer-over-IB 248.4 GiB vs 245.9). Blobcache
+cold-read throughput scales near-linearly 64→128 nodes (peak **111.7 → 198.0 GiB/s**, IOPS
+**1.70M → 3.00M**) while **cold blob egress stays flat** (~248 → ~226 GiB) — the extra demand
+and the 2× weights broadcast are absorbed peer-to-peer over InfiniBand.
+
+## Operational notes (learned on live runs)
+
+- **NCCL env is required** (baked into the manifest): IB needs `rdma-core` in the image
+  *and* `NCCL_NVLS_ENABLE=0` (NVLS multicast hangs on H200 in a non-privileged container) +
+  `NCCL_IB_HCA=^mlx5_8` (exclude the RoCE device). Without these NCCL either falls back to
+  TCP or the first collective hangs.
+- **memlock**: ColossalAI CPU-Adam offload pins ~88 GB host memory; the container default
+  (64 KB) stalls it, so the os-train container takes the `SYS_RESOURCE` cap and runs
+  `ulimit -l unlimited`.
+- **Stragglers at large scale**: a single node with collapsed cold-read throughput starves
+  its dataloader and deadlocks the synchronous job. At 128 nodes one node read at ~1 MiB/s;
+  `kubectl cordon` it and raise blobcached concurrency (`[azure] workers`,
+  `[transport] *_concurrency`) for 128+ node runs. See
+  [blobcache#14](https://github.com/edwardsp/blobcache/issues/14).
