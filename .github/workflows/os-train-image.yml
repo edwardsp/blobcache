@@ -1,0 +1,83 @@
+name: os-train-image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docker/os-train/**"
+      - "examples/open-sora/blobcache_stage1.py"
+      - ".github/workflows/os-train-image.yml"
+  pull_request:
+    paths:
+      - "docker/os-train/**"
+      - ".github/workflows/os-train-image.yml"
+  workflow_dispatch:
+    inputs:
+      flash_attn:
+        description: "flash-attention variant (2 = prebuilt FA2, 3 = Hopper source build)"
+        default: "2"
+      opensora_ref:
+        description: "Open-Sora git ref to build (sha/tag/branch)"
+        default: "main"
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  # PRs only lint the Dockerfile — the full ~25 GB CUDA image is too large/slow to
+  # build on a standard PR runner. The real build+push runs on main / dispatch.
+  lint:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: docker/os-train/Dockerfile
+          failure-threshold: error
+
+  image:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force || true
+          df -h /
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}/os-train
+          tags: |
+            type=ref,event=branch
+            type=sha
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/os-train/Dockerfile
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            FLASH_ATTN=${{ github.event.inputs.flash_attn || '2' }}
+            OPENSORA_REF=${{ github.event.inputs.opensora_ref || 'main' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=os-train
+          cache-to: type=gha,scope=os-train,mode=max
