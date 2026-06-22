@@ -28,10 +28,15 @@ ENV DEBIAN_FRONTEND=noninteractive
 # System libs: git/ninja for the source builds, and the GL/X stubs OpenCV +
 # decord/av pull in. opencv-python is swapped for opencv-python-headless so the
 # image needs no X server (the GUI build segfaults on import in a headless pod).
+# rdma-core (libibverbs/librdmacm/ibverbs-providers) is REQUIRED so NCCL can drive
+# the InfiniBand HCAs for multi-node training — without it NCCL logs "Failed to
+# open libibverbs.so" and silently falls back to NET/Socket (TCP over eth0), which
+# collapses cross-node all-reduce bandwidth. The pytorch base image ships none of it.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
        ca-certificates curl git ninja-build \
        libglib2.0-0 libgl1 libxcb1 libsm6 libxext6 libxrender1 \
+       libibverbs1 librdmacm1 ibverbs-providers ibverbs-utils \
     && rm -rf /var/lib/apt/lists/* \
     && pip uninstall -y opencv-python opencv-contrib-python 2>/dev/null || true \
     && pip install --no-cache-dir packaging ninja opencv-python-headless
