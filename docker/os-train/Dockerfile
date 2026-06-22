@@ -48,13 +48,12 @@ RUN git clone --filter=blob:none https://github.com/hpcaitech/Open-Sora /opt/Ope
     && cd /opt/Open-Sora && git checkout "${OPENSORA_REF}" \
     && pip install --no-cache-dir -v .
 
-# flash-attention 2, compiled from source against the DEVEL toolkit (matches the
-# reference build: FORCE_BUILD bypasses the prebuilt wheel, MAX_JOBS caps parallel
-# nvcc jobs so the build does not OOM). The blobcache I/O path is attention-impl
-# independent, but building it the same way keeps the step-time comparable.
-ARG FLASH_ATTN_MAX_JOBS=32
-RUN MAX_JOBS=${FLASH_ATTN_MAX_JOBS} FLASH_ATTENTION_FORCE_BUILD=TRUE \
-      pip install --no-cache-dir flash-attn --no-build-isolation
+# flash-attention 2: prefer the prebuilt wheel matching torch 2.4 / cu121 / cp310.
+# The Slurm reference compiled from source (FORCE_BUILD) only because it ran on a
+# 1.8 TB-RAM H200 node; a source compile with high MAX_JOBS OOM-kills a 16 GB CI
+# runner. The blobcache I/O path is attention-impl independent, so the prebuilt
+# wheel is equivalent here. MAX_JOBS=2 caps memory if pip ever falls back to source.
+RUN MAX_JOBS=2 pip install --no-cache-dir flash-attn --no-build-isolation
 
 # Smoke-import the whole stack at build time so a broken image fails the build, not
 # the 64-node job (mirrors the reference build's TRAIN_IMPORT_OK check).
