@@ -6,16 +6,30 @@ runs an enroot squashfs (`os-train.sqsh`) and mounts the Open-Sora repo + config
 shared NFS. Kubernetes has no shared NFS, so this image bakes everything *except* the
 weights and dataset, which are streamed at runtime through the blobcache FUSE mount.
 
+It mirrors the proven Slurm build recipe (`os-train-build.sbatch`) step for step, so
+the Kubernetes image matches the reference run's dependency stack.
+
 ## What's in it
 
-- CUDA 12.4 + Python 3.10 + **torch 2.4.0 / torchvision 0.19.0**
-- **Open-Sora v2** (`hpcaitech/Open-Sora`) source + `pip install -v .` → ColossalAI,
-  mmengine, liger-kernel, av, accelerate, ftfy, omegaconf
-- **xformers 0.0.27.post2** + **flash-attention** (FA2 default, FA3/Hopper optional)
+- base **`pytorch/pytorch:2.4.0-cuda12.1-cudnn9-devel`** — python 3.10, **torch
+  2.4.0 / torchvision (cu121)**, cuDNN 9, nvcc (so flash-attn compiles in-image and
+  torch is never rebuilt)
+- **Open-Sora v2** (`hpcaitech/Open-Sora`, default ref
+  `7ad6a96a135feb81f755c84fb391818718f6beb2`) source + `pip install -v .` →
+  ColossalAI, mmengine, liger-kernel, av, accelerate, ftfy, omegaconf
+- **xformers 0.0.27.post2** (cu121 index) + **flash-attn 2** (compiled from source,
+  `FLASH_ATTENTION_FORCE_BUILD=TRUE`, `MAX_JOBS=32`)
+- `opencv-python-headless` (swapped in for `opencv-python` — the GUI build segfaults
+  on import in a headless pod)
 - the benchmark train config `blobcache_stage1.py` (baked into
   `configs/diffusion/train/`)
+- the `tensornvme` import shim (`pyshim/`, see below)
 - `entrypoint.sh` — the Kubernetes torchrun launcher (per-node rank from the
   StatefulSet pod ordinal)
+
+A `python -c "import colossalai, flash_attn, xformers; from
+opensora.datasets.read_video import read_video"` smoke-import runs at build time, so a
+broken image fails the build rather than the 64-node job.
 
 **Not** baked (streamed via `/blobcache`): the 11B checkpoints (`/blobcache/osv2/...`)
 and the Pexels dataset (`/blobcache/pexels/...`).
@@ -23,29 +37,27 @@ and the Pexels dataset (`/blobcache/pexels/...`).
 ## Build
 
 ```bash
-# default: FA2 (reliable, fast, sufficient — the blobcache I/O path is attention-impl independent)
 docker build -f docker/os-train/Dockerfile -t ghcr.io/edwardsp/blobcache/os-train:dev .
 
-# perf-faithful FA3 (Hopper) to match the H200 reference step-time (longer source build)
-docker build --build-arg FLASH_ATTN=3 -f docker/os-train/Dockerfile -t ...:fa3 .
-
-# pin Open-Sora for reproducibility
-docker build --build-arg OPENSORA_REF=<sha> ...
+# pin Open-Sora to a different commit
+docker build --build-arg OPENSORA_REF=<sha> -f docker/os-train/Dockerfile -t ...:<tag> .
 ```
 
 CI: [`.github/workflows/os-train-image.yml`](../../.github/workflows/os-train-image.yml)
 builds on changes under `docker/os-train/**` and pushes to
-`ghcr.io/edwardsp/blobcache/os-train`. `workflow_dispatch` accepts `flash_attn` (2|3)
-and `opensora_ref` inputs.
+`ghcr.io/edwardsp/blobcache/os-train`. `workflow_dispatch` accepts an `opensora_ref`
+input.
 
-## `pyshim` (action required)
+## `pyshim`
 
-`os-train.sbatch` runs with `PYTHONPATH=/shared/blobcache-deploy/pyshim` — the
-benchmark author's shim, which is **not** in this repo. Drop its module(s) under
-[`pyshim/`](pyshim/) and they are baked to `/opt/pyshim` and prepended to
-`PYTHONPATH` at runtime (the entrypoint skips it if the dir is empty). If the run
-depends on the shim (e.g. a dataloader/IO patch), the training will not match the
-reference until the real `pyshim` is added here.
+`opensora/utils/ckpt.py` eagerly runs `from tensornvme.async_file_io import
+AsyncFileWriter` at import time, but `tensornvme` (async NVMe checkpoint IO) is not
+installed in the image. The benchmark runs with `epochs=1` and `ckpt_every=100000`,
+so the async writer is never instantiated — [`pyshim/`](pyshim/) is a stub
+`tensornvme` package that satisfies the import (and raises if a save is ever actually
+attempted). It is baked to `/opt/pyshim` and prepended to `PYTHONPATH` by the
+entrypoint. This reproduces the reference run, which used the same shim via
+`PYTHONPATH=/shared/blobcache-deploy/pyshim`.
 
 ## Runtime contract (set by the Kubernetes manifest)
 

@@ -13,12 +13,9 @@ on:
       - ".github/workflows/os-train-image.yml"
   workflow_dispatch:
     inputs:
-      flash_attn:
-        description: "flash-attention variant (2 = prebuilt FA2, 3 = Hopper source build)"
-        default: "2"
       opensora_ref:
         description: "Open-Sora git ref to build (sha/tag/branch)"
-        default: "main"
+        default: "7ad6a96a135feb81f755c84fb391818718f6beb2"
 
 permissions:
   contents: read
@@ -75,8 +72,7 @@ jobs:
           platforms: linux/amd64
           push: true
           build-args: |
-            FLASH_ATTN=${{ github.event.inputs.flash_attn || '2' }}
-            OPENSORA_REF=${{ github.event.inputs.opensora_ref || 'main' }}
+            OPENSORA_REF=${{ github.event.inputs.opensora_ref || '7ad6a96a135feb81f755c84fb391818718f6beb2' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=os-train
