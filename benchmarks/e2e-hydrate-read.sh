@@ -1,13 +1,26 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
-# blobcache end-to-end hydrate + dual-read benchmark.
+# blobcache end-to-end hydrate + triple-read benchmark.
 #
-# Wipes nothing (caller's responsibility - see deploy/wipe-caches.sh).
-# Drives the coordinator's /hydrate endpoint then runs two parallel
-# read passes across all blobcached pods. Pass 1 is peer-fetch warm-up
-# (each pod has only its hydrate-shard locally); pass 2 should be
-# fully cache-resident and is the steady-state target case.
+# Wipes nothing on entry (caller's responsibility - see deploy/wipe-caches.sh).
+# Drives the coordinator's /hydrate endpoint then runs three parallel
+# read passes across all blobcached pods.
+#
+#   PASS1  - cold-after-hydrate: each pod has only its hydrate-shard
+#            locally, so reads of the full prefix peer-fetch the rest.
+#   PASS2  - warm: every pod is fully cache-resident; this is the
+#            steady-state target case.
+#   PASS3  - degraded recovery: BEFORE the read, exactly one pod's local
+#            cache is wiped via POST /clear-cache-shard. That endpoint
+#            drains in-flight inserts, removes every chunk file, resets
+#            singleflight + peer-LRU + inflight-write maps, and rebuilds
+#            the local bloom so peers stop routing to it. This simulates
+#            a node failing and being replaced with empty NVMe (matches
+#            real-world StatefulSet/DaemonSet recovery on this cluster
+#            because cache lives on hostPath /mnt/nvme — pod restart
+#            alone does NOT clear it). The wiped pod must then peer-fetch
+#            its entire share from the other N-1 nodes.
 #
 # Wall-clock arithmetic uses awk (no `bc` dependency in the daemon
 # image). All output is appended to $LOG (default /tmp/e2e.log).
@@ -18,9 +31,14 @@ set -uo pipefail
 #   PATH_PREFIX        - blob path prefix     (REQUIRED, e.g. nvidia_DeepSeek-R1-0528-NVFP4-v2/)
 #   READ_GLOB          - per-pod read pattern (default: *.safetensors)
 # Optional:
-#   LOG                - log file             (default: /tmp/e2e.log)
-#   HYDRATE_TIMEOUT_S  - curl --max-time      (default: 3700)
-#   READ_TIMEOUT_S     - kubectl exec timeout (default: 3600)
+#   LOG                - log file                          (default: /tmp/e2e.log)
+#   HYDRATE_TIMEOUT_S  - curl --max-time for hydrate       (default: 3700)
+#   READ_TIMEOUT_S     - kubectl exec timeout for reads    (default: 3600)
+#   SKIP_PASS3         - set to 1 to skip the wipe+pass3 stage (default: unset)
+#   WIPE_POD_INDEX     - 0-indexed line in podnodes.txt of the pod to
+#                        wipe before PASS3. Default 1 (i.e. the SECOND
+#                        pod) so we never wipe the coordinator (line 0).
+#   WIPE_TIMEOUT_S     - curl --max-time for /clear-cache-shard (default: 120)
 
 NS=${NS:-blobcache}
 MOUNT=${MOUNT:-models}
@@ -30,6 +48,9 @@ LOG=${LOG:-/tmp/e2e.log}
 HYDRATE_TIMEOUT_S=${HYDRATE_TIMEOUT_S:-3700}
 READ_TIMEOUT_S=${READ_TIMEOUT_S:-3600}
 HYDRATE_MODE=${HYDRATE_MODE:-default}
+SKIP_PASS3=${SKIP_PASS3:-}
+WIPE_POD_INDEX=${WIPE_POD_INDEX:-1}
+WIPE_TIMEOUT_S=${WIPE_TIMEOUT_S:-120}
 
 exec >"$LOG" 2>&1
 
@@ -108,6 +129,39 @@ echo \"files=\$COUNT bytes=\$TOTAL wall_s=\$WALL\"
 
 run_pass PASS1 /tmp/pass1.tsv
 run_pass PASS2 /tmp/pass2.tsv
+
+if [ -z "$SKIP_PASS3" ]; then
+  WIPE_POD=$(awk -v i="$WIPE_POD_INDEX" 'NR==i+1{print $1}' /tmp/podnodes.txt)
+  WIPE_NODE=$(awk -v i="$WIPE_POD_INDEX" 'NR==i+1{print $2}' /tmp/podnodes.txt)
+  if [ -z "$WIPE_POD" ]; then
+    echo "=== PASS3_SKIPPED reason=no_pod_at_index_${WIPE_POD_INDEX} ==="
+  else
+    echo
+    echo "=== WIPE_START=$(date -u +%FT%TZ) pod=$WIPE_POD node=$WIPE_NODE ==="
+    WIPE_T0=$(date +%s.%N)
+    kubectl --request-timeout="${WIPE_TIMEOUT_S}s" -n "$NS" exec "$WIPE_POD" -- \
+      curl -sS --max-time "$WIPE_TIMEOUT_S" -X POST "http://127.0.0.1:7773/clear-cache-shard" \
+        -H 'content-type: application/json' -d '{}' \
+      >/tmp/wipe.json 2>/tmp/wipe.err
+    WIPE_RC=$?
+    WIPE_T1=$(date +%s.%N)
+    WIPE_WALL=$(fdiff "$WIPE_T1" "$WIPE_T0")
+    echo "=== WIPE_END=$(date -u +%FT%TZ) rc=$WIPE_RC wall=${WIPE_WALL}s ==="
+    echo "--- wipe response ---"
+    cat /tmp/wipe.json; echo
+    echo "--- wipe err ---"
+    cat /tmp/wipe.err
+
+    POST_BYTES=$(kubectl --request-timeout=10s -n "$NS" exec "$WIPE_POD" -- \
+      curl -sS --max-time 5 http://127.0.0.1:7773/metrics 2>/dev/null \
+      | awk '$1=="blobcache_cache_bytes"{print $2; exit}')
+    echo "--- post-wipe blobcache_cache_bytes on $WIPE_POD = ${POST_BYTES:-unknown} ---"
+
+    run_pass PASS3 /tmp/pass3.tsv
+  fi
+else
+  echo "=== PASS3_SKIPPED reason=SKIP_PASS3_set ==="
+fi
 
 echo
 echo "=========================================="
